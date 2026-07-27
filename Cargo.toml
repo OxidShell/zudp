@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 description = "Zero-overhead UDP protocol with optional reliability, fragmentation, and relay support"
 license = "MIT"
+repository = "https://github.com/OxidShell/zudp"
+homepage = "https://github.com/OxidShell/zudp"
+documentation = "https://docs.rs/zudp"
+readme = "README.md"
+keywords = ["udp", "networking", "gamedev", "relay", "protocol"]
+categories = ["network-programming", "game-development", "asynchronous"]
 
 [features]
 default = ["bitcode"]
