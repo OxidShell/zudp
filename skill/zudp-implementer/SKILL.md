@@ -71,6 +71,8 @@ Relay/v4  (0x06): [inner]   [port:u16]  [ip:4B]  [0x00]                         
 Relay/v6  (0x06): [inner]   [port:u16]  [ip:16B] [0x01]                          + [0x06]
 Probe     (0x07): [app_id:u64] [proto_ver:u16]                                    + [0x07]
 Beacon    (0x08): [meta]   [data_port:u16] [proto_ver:u16] [app_id:u64]           + [0x08]
+Handshake (0x09): [noise_msg]                                                     + [0x09]  ← security feature
+Secure    (0x0A): [ciphertext] [nonce:u64]                                        + [0x0A]  ← security feature
 ```
 
 **Parsing is always from the tail.**  To decode a datagram:
@@ -225,6 +227,12 @@ Do not mark the implementation done until every item passes.
 - [ ] Two advertisers: scanner receives two distinct peers.
 - [ ] Mismatched `app_id`: scanner does not surface the peer.
 
+### Security / Noise XX (if implemented)
+- [ ] Noise XX handshake completes (3 messages exchanged): initiator → msg1, responder → msg2, initiator → msg3.
+- [ ] After handshake, send a reliable message; it arrives decrypted on the other side.
+- [ ] NACK retransmit re-encrypts with a **fresh nonce** (no nonce reuse).
+- [ ] Replay detection: receiving the same `(nonce, ciphertext)` a second time is rejected.
+
 ---
 
 ## Pitfalls to avoid
@@ -245,3 +253,8 @@ Do not mark the implementation done until every item passes.
   a permission error on most OSes if SO_BROADCAST is not set.
 - **Discovery: proto_ver mismatch.** Always validate `proto_ver == 1`.  Ignore frames with any
   other value; do not log an error for them (future versions will use higher values).
+- **Nonce reuse in Secure frames.** Never reuse a nonce with the same key.  NACK retransmits must
+  re-encrypt the original plaintext with a fresh nonce, not re-send the old ciphertext.
+- **Using `TransportState` instead of `StatelessTransportState`.** `TransportState` tracks nonces
+  internally and increments them sequentially.  UDP packets arrive out-of-order, so this breaks.
+  Always use `into_stateless_transport_mode()` for ZUDP.

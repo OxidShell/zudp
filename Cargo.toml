@@ -17,6 +17,7 @@ default = ["bitcode"]
 bitcode = ["dep:bitcode"]
 serde = ["dep:serde", "dep:postcard"]
 discovery = []
+security = ["dep:snow"]
 
 [dependencies]
 tokio = { version = "1", features = ["net", "sync", "rt-multi-thread", "macros", "time", "io-util", "signal"] }
@@ -24,6 +25,7 @@ bytes = "1"
 bitcode = { version = "0.6", features = ["derive"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 postcard = { version = "1", features = ["alloc"], optional = true }
+snow = { version = "0.9", features = ["default-resolver"], optional = true }
 tracing = "0.1"
 socket2 = { version = "0.5", features = ["all"] }
 parking_lot = "0.12"
@@ -53,6 +55,11 @@ required-features = ["discovery"]
 name = "discovery_scan"
 path = "examples/discovery_scan.rs"
 required-features = ["discovery"]
+
+[[example]]
+name = "secure_ping_pong"
+path = "examples/secure_ping_pong.rs"
+required-features = ["security"]
 
 [[example]]
 name = "server"

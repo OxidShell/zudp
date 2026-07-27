@@ -37,6 +37,8 @@ All multi-byte integers are **big-endian**.
 | `0x06` | Relay | 8 B (IPv4) / 20 B (IPv6) |
 | `0x07` | Probe | 11 B |
 | `0x08` | Beacon | 13 B + meta |
+| `0x09` | Handshake | variable (32–96 B) |
+| `0x0A` | Secure | 9 B + AEAD tag (16 B) |
 
 ---
 
@@ -133,6 +135,38 @@ Relay forwarding request. The sending node wraps an inner frame and addresses it
 - The destination sees `from == relay_addr`, not the originator's address. Return traffic must also be routed through the relay if the originator is behind NAT.
 - Reliable frames can be relayed, but NACK-triggered retransmission is end-to-end: the originator retransmits to the relay, which forwards again.
 
+### Handshake — `0x09` *(feature: `security`)*
+
+One message in a Noise XX key exchange. Three messages are exchanged before the connection is encrypted.
+
+```
+[noise_message bytes] [0x09]
+```
+
+Message sizes for `Noise_XX_25519_ChaChaPoly_BLAKE2s`:
+
+| Message | Direction | Size |
+|---|---|---|
+| msg1 | initiator → responder | 32 B |
+| msg2 | responder → initiator | 80 B |
+| msg3 | initiator → responder | 48 B |
+
+After all three messages the handshake is complete. Both sides call `into_stateless_transport_mode()` and all subsequent data frames are wrapped in `Secure` frames.
+
+### Secure — `0x0A` *(feature: `security`)*
+
+A Noise-encrypted data frame. The `ciphertext` is the output of `ChaCha20-Poly1305` AEAD applied to any plain inner frame (Stream, Fragment, Datagram).
+
+```
+[ciphertext bytes] [nonce: u64] [0x0A]
+```
+
+- `nonce`: per-peer send-side counter, strictly increasing per sender. Provided explicitly because UDP packets may arrive out of order — `StatelessTransportState` takes the nonce as a parameter rather than tracking it internally.
+- The AEAD tag (16 B) is appended to the ciphertext by the cipher; it is not a separate field.
+- The decrypting side validates the tag before delivering the plaintext.
+- NACK retransmits re-encrypt the original plaintext with a **fresh nonce** to avoid nonce reuse. The old nonce must not be reused even if the ciphertext is identical.
+- Anti-replay: a 64-bit sliding window (`highest` + bitmask) rejects nonces already seen within the last 64 slots of the highest received nonce. Nonces more than 64 behind the window are rejected unconditionally.
+
 ### Probe — `0x07` *(feature: `discovery`)*
 
 LAN discovery broadcast. Sent to the broadcast address `255.255.255.255` on the discovery port. Any node that is advertising the same `app_id` and `proto_ver` must reply with a Beacon.
@@ -166,7 +200,7 @@ Stream and Fragment frames share a single per-peer send-side sequence counter, s
 
 ### Send buffer
 
-The sender keeps a `BTreeMap<seq, (encoded_frame, sent_at)>` per peer. Entries are inserted on send and pruned when older than `sent_prune_age` (default 10 s). The entire encoded wire frame is stored, so retransmission is a direct re-send with no re-encoding.
+The sender keeps a `BTreeMap<seq, (plain_frame, sent_at)>` per peer. Entries are inserted on send and pruned when older than `sent_prune_age` (default 10 s). The **plain** (pre-encryption) wire frame is stored, so NACK retransmits can re-encrypt with a fresh nonce (nonce reuse is forbidden).
 
 ### Receive reorder buffer
 
@@ -237,6 +271,68 @@ Dropping the `AdvertiseHandle` aborts the task immediately.
 ### Socket isolation
 
 Each `Discovery::advertise`, `scan_stream`, and `scan_once` call binds its own socket. Because `SO_REUSEPORT` is set, multiple sockets on the same machine can coexist on the same discovery port without interfering.
+
+---
+
+## Security *(feature: `security`)*
+
+### Noise pattern
+
+`Noise_XX_25519_ChaChaPoly_BLAKE2s` — mutual authentication, X25519 DH, ChaCha20-Poly1305 AEAD, BLAKE2s hash. The same pattern used by WireGuard.
+
+- XX means both endpoints exchange their static public keys and authenticate each other.
+- No pre-shared knowledge required — no certificate authorities, no PSK.
+- After the 3-message handshake both sides derive independent send/recv symmetric keys.
+
+### Handshake flow
+
+```
+Initiator                              Responder
+  │                                       │
+  │──── Handshake(msg1) ─────────────────▶│  write_message(&[], buf)
+  │                                       │  read_message(msg1)
+  │                                       │  write_message(&[], buf)
+  │◀─── Handshake(msg2) ─────────────────│
+  │                                       │
+  │  read_message(msg2)                   │
+  │  write_message(&[], buf)              │
+  │──── Handshake(msg3) ─────────────────▶│
+  │                                       │  read_message(msg3)
+  │  into_stateless_transport_mode()      │  into_stateless_transport_mode()
+  │──── Secure(nonce, cipher) ───────────▶│  (all data henceforth encrypted)
+```
+
+The initiator is always the node that called `Zudp::connect()`. The responder is the node that called `Zudp::listen()`. The engine drives the handshake automatically.
+
+### Encrypted send path
+
+1. Encode the inner frame (Stream / Fragment) as usual.
+2. Store the **plain** encoded frame in the send buffer (for NACK retransmits).
+3. Encrypt with `channel.encrypt(plain)` → `(nonce, ciphertext)`.
+4. Send `Frame::Secure { nonce, ciphertext }`.
+
+### Encrypted receive path
+
+1. Receive `Frame::Secure { nonce, ciphertext }`.
+2. Check anti-replay window; reject if nonce already seen or too old.
+3. Decrypt with `channel.decrypt(nonce, ciphertext)`.
+4. Decode the inner frame and dispatch normally (through the reliability layer).
+
+### What is and is not encrypted
+
+| Frame | Encrypted |
+|---|---|
+| Stream | yes (wrapped in Secure when channel is open) |
+| Fragment | yes |
+| Ping / Pong | no (keepalives are unencrypted) |
+| Nack | no (only contains sequence numbers, no payload) |
+| Datagram (unreliable) | no |
+| Handshake | no (by definition, sent before the channel exists) |
+| Relay / Probe / Beacon | no |
+
+### Nonce exhaustion
+
+The send nonce is a monotonically increasing `u64` starting from 0. At a rate of one million messages per second it takes ~585 000 years to exhaust. No special handling is needed.
 
 ---
 

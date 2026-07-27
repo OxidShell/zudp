@@ -1,3 +1,5 @@
+#[cfg(feature = "security")]
+use std::sync::OnceLock;
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
@@ -7,6 +9,9 @@ use std::{
 
 use bytes::Bytes;
 use parking_lot::Mutex;
+
+#[cfg(feature = "security")]
+use crate::security::SecureChannel;
 
 // ── Send-side ────────────────────────────────────────────────────────────────
 
@@ -23,6 +28,12 @@ pub struct PeerState {
     pub sent: Mutex<BTreeMap<u64, SentPacket>>,
     pub last_sent: Mutex<Instant>,
     pub last_seen: Mutex<Instant>,
+    /// In-progress Noise XX handshake state; `None` once the channel is established.
+    #[cfg(feature = "security")]
+    pub handshake: Mutex<Option<snow::HandshakeState>>,
+    /// Established Noise transport channel; set exactly once after handshake completes.
+    #[cfg(feature = "security")]
+    pub channel: OnceLock<SecureChannel>,
 }
 
 impl PeerState {
@@ -35,6 +46,10 @@ impl PeerState {
             sent: Mutex::new(BTreeMap::new()),
             last_sent: Mutex::new(now),
             last_seen: Mutex::new(now),
+            #[cfg(feature = "security")]
+            handshake: Mutex::new(None),
+            #[cfg(feature = "security")]
+            channel: OnceLock::new(),
         }
     }
 

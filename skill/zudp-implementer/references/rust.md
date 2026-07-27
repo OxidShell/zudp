@@ -10,8 +10,10 @@ implementing the wire protocol; that is in `SKILL.md` and `PROTOCOL.md`.
 
 ```toml
 [dependencies]
-zudp = "0.1"                                         # bitcode codec (default)
-zudp = { version = "0.1", features = ["discovery"] } # + LAN peer discovery
+zudp = "0.1"                                                        # bitcode codec (default)
+zudp = { version = "0.1", features = ["security"] }                 # + Noise XX encryption
+zudp = { version = "0.1", features = ["discovery"] }                # + LAN peer discovery
+zudp = { version = "0.1", features = ["security", "discovery"] }    # both
 zudp = { version = "0.1", default-features = false, features = ["serde"] } # postcard codec
 ```
 
@@ -100,6 +102,7 @@ Zudp::default()
     .mtu(1400)                               // fragmentation threshold in bytes (default: 1400)
     .keepalive_interval(Duration::from_secs(5))  // idle ping interval (default: 5 s)
     .relay(relay_addr)                       // route all packets through a relay node
+    .security(Keypair::generate())           // enable Noise XX encryption (feature = "security")
     .listen::<Msg>()                         // → ZudpSocket<M>
     // or
     .connect::<Msg>(peer_addr)              // → ZudpConn<M>
@@ -176,6 +179,47 @@ let mut relay = Zudp::default().port(7800).listen::<Msg>().await?;
 
 The server sees `from == relay_addr`, not the original client address.
 NACK retransmission still works end-to-end (client retransmits to relay; relay re-forwards).
+
+---
+
+## Security (`features = ["security"]`)
+
+End-to-end encryption using the Noise XX protocol pattern (`Noise_XX_25519_ChaChaPoly_BLAKE2s`).
+The same cryptography as WireGuard: X25519 key exchange, ChaCha20-Poly1305 AEAD, BLAKE2s hash.
+Mutual authentication — both endpoints verify each other.
+
+```rust
+use zudp::{Keypair, Zudp};
+
+// Generate and persist a keypair.
+let server_kp = Keypair::generate();
+let client_kp = Keypair::generate();
+
+// Server — .security() enables encryption for all incoming connections.
+let mut socket = Zudp::default()
+    .port(7700)
+    .security(server_kp)
+    .listen::<Msg>()
+    .await?;
+
+// Client — handshake (3 Noise messages) happens automatically inside connect().
+let mut conn = Zudp::default()
+    .port(0)
+    .security(client_kp)
+    .connect::<Msg>(server_addr)
+    .await?;
+
+// send/recv API is identical — encryption is transparent.
+conn.send(Msg::Ping).await?;
+let reply = conn.recv().await?;
+```
+
+Key points:
+- Call `Keypair::generate()` once per node, persist the keypair (e.g. to disk), and reuse it.
+- The handshake is driven automatically by the engine; no user code is required.
+- Reliable frames (Stream, Fragment) are encrypted. Keepalives and NACKs are not.
+- NACK retransmits re-encrypt with a fresh nonce — nonce reuse is never possible.
+- The `Error::Security(snow::Error)` variant is added when this feature is enabled.
 
 ---
 

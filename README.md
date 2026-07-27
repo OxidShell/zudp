@@ -1,11 +1,13 @@
 # zudp
 
-Minimal UDP protocol for real-time applications. NACK-based reliability, automatic fragmentation, relay/NAT traversal, and optional LAN discovery.
+Minimal UDP protocol for real-time applications. NACK-based reliability, automatic fragmentation, relay/NAT traversal, optional end-to-end encryption, and optional LAN discovery.
 
 ```toml
 [dependencies]
-zudp = "0.1"                                    # bitcode codec, no discovery
-zudp = { version = "0.1", features = ["discovery"] }  # + LAN peer discovery
+zudp = "0.1"                                               # bitcode codec
+zudp = { version = "0.1", features = ["security"] }        # + Noise XX encryption
+zudp = { version = "0.1", features = ["discovery"] }       # + LAN peer discovery
+zudp = { version = "0.1", features = ["security", "discovery"] }  # both
 ```
 
 ## Quick start
@@ -32,15 +34,47 @@ let reply = conn.recv().await?;
 
 ```rust
 Zudp::default()
-    .port(7700)            // 0 = OS-assigned
-    .bind_ip(ip)           // default: 0.0.0.0
-    .reliable(true)        // NACK retransmission on/off
-    .mtu(1400)             // fragmentation threshold in bytes
+    .port(7700)                              // 0 = OS-assigned
+    .bind_ip(ip)                             // default: 0.0.0.0
+    .reliable(true)                          // NACK retransmission on/off
+    .mtu(1400)                               // fragmentation threshold in bytes
     .keepalive_interval(Duration::from_secs(5))
-    .relay(relay_addr)     // wrap every packet in a relay header
-    .listen::<Msg>()       // ZudpSocket<Msg>  — multi-peer
-    .connect::<Msg>(peer)  // ZudpConn<Msg>    — single-peer
+    .relay(relay_addr)                       // wrap every packet in a relay header
+    .security(Keypair::generate())           // enable Noise XX encryption
+    .listen::<Msg>()                         // ZudpSocket<Msg>  — multi-peer
+    .connect::<Msg>(peer)                    // ZudpConn<Msg>    — single-peer
 ```
+
+## End-to-end encryption
+
+Requires `features = ["security"]`. Uses Noise XX with X25519 DH, ChaCha20-Poly1305 AEAD, and BLAKE2s — the same cryptography as WireGuard. Mutual authentication: both sides verify each other's public key.
+
+```rust
+use zudp::{Keypair, Zudp};
+
+// Generate a keypair once and persist it (e.g. to disk).
+let keypair = Keypair::generate();
+
+// Server — listen with security enabled.
+let mut socket = Zudp::default()
+    .port(7700)
+    .security(keypair.clone())
+    .listen::<Msg>()
+    .await?;
+
+// Client — connect; Noise XX handshake happens automatically.
+let mut conn = Zudp::default()
+    .port(0)
+    .security(Keypair::generate())
+    .connect::<Msg>(server_addr)
+    .await?;
+
+// Send/recv API is identical — encryption is transparent.
+conn.send(Msg::Ping).await?;
+let reply = conn.recv().await?;
+```
+
+The three Noise handshake messages are exchanged before any data flows. Reliable frames (Stream, Fragment) are encrypted; keepalive Ping/Pong and Nack frames are not. NACK retransmits re-encrypt with a fresh nonce to prevent nonce reuse.
 
 ## LAN discovery
 

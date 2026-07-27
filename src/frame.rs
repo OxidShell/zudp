@@ -34,6 +34,10 @@ const TYPE_FRAGMENT: u8 = 0x05;
 const TYPE_RELAY: u8 = 0x06;
 const TYPE_PROBE: u8 = 0x07;
 const TYPE_BEACON: u8 = 0x08;
+#[cfg(feature = "security")]
+const TYPE_HANDSHAKE: u8 = 0x09;
+#[cfg(feature = "security")]
+const TYPE_SECURE: u8 = 0x0A;
 
 const ADDR_V4: u8 = 0x00;
 const ADDR_V6: u8 = 0x01;
@@ -63,11 +67,23 @@ pub enum Frame {
     /// LAN discovery broadcast — asks nodes with matching `app_id` and `proto_ver` to reply.
     Probe { app_id: u64, proto_ver: u16 },
     /// LAN discovery reply — unicast answer to a `Probe`, carrying the node's data port and metadata.
-    Beacon { app_id: u64, proto_ver: u16, data_port: u16, meta: Bytes },
+    Beacon {
+        app_id: u64,
+        proto_ver: u16,
+        data_port: u16,
+        meta: Bytes,
+    },
+    /// One Noise XX handshake message (msg1, msg2, or msg3).
+    #[cfg(feature = "security")]
+    Handshake { payload: Bytes },
+    /// Noise-encrypted data frame; `nonce` is the per-send AEAD counter.
+    #[cfg(feature = "security")]
+    Secure { nonce: u64, ciphertext: Bytes },
 }
 
 impl Frame {
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn encode(self) -> Bytes {
         match self {
             Frame::Datagram(payload) => {
@@ -141,7 +157,12 @@ impl Frame {
                 buf.put_u8(TYPE_PROBE);
                 buf.freeze()
             }
-            Frame::Beacon { app_id, proto_ver, data_port, meta } => {
+            Frame::Beacon {
+                app_id,
+                proto_ver,
+                data_port,
+                meta,
+            } => {
                 let mut buf = BytesMut::with_capacity(meta.len() + 13);
                 buf.extend_from_slice(&meta);
                 buf.put_u16(data_port);
@@ -150,9 +171,25 @@ impl Frame {
                 buf.put_u8(TYPE_BEACON);
                 buf.freeze()
             }
+            #[cfg(feature = "security")]
+            Frame::Handshake { payload } => {
+                let mut buf = BytesMut::with_capacity(payload.len() + 1);
+                buf.extend_from_slice(&payload);
+                buf.put_u8(TYPE_HANDSHAKE);
+                buf.freeze()
+            }
+            #[cfg(feature = "security")]
+            Frame::Secure { nonce, ciphertext } => {
+                let mut buf = BytesMut::with_capacity(ciphertext.len() + 9);
+                buf.extend_from_slice(&ciphertext);
+                buf.put_u64(nonce);
+                buf.put_u8(TYPE_SECURE);
+                buf.freeze()
+            }
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn decode(mut data: BytesMut) -> Result<Self, Error> {
         let frame_type = pop_u8(&mut data).ok_or(Error::FrameEmpty)?;
 
@@ -160,9 +197,14 @@ impl Frame {
             TYPE_DATAGRAM => Ok(Frame::Datagram(data.freeze())),
 
             TYPE_STREAM => {
-                let seq = pop_u64(&mut data)
-                    .ok_or(Error::FrameTruncated { frame: "stream", field: "seq" })?;
-                Ok(Frame::Stream { seq, payload: data.freeze() })
+                let seq = pop_u64(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "stream",
+                    field: "seq",
+                })?;
+                Ok(Frame::Stream {
+                    seq,
+                    payload: data.freeze(),
+                })
             }
 
             TYPE_NACK => {
@@ -177,69 +219,132 @@ impl Frame {
             }
 
             TYPE_PING => {
-                let echo = pop_u64(&mut data)
-                    .ok_or(Error::FrameTruncated { frame: "ping", field: "echo" })?;
+                let echo = pop_u64(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "ping",
+                    field: "echo",
+                })?;
                 Ok(Frame::Ping { echo })
             }
 
             TYPE_PONG => {
-                let echo = pop_u64(&mut data)
-                    .ok_or(Error::FrameTruncated { frame: "pong", field: "echo" })?;
+                let echo = pop_u64(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "pong",
+                    field: "echo",
+                })?;
                 Ok(Frame::Pong { echo })
             }
 
             TYPE_FRAGMENT => {
                 // layout (reading tail-first): seq(8) frag_idx(2) frag_total(2) msg_id(4)
-                let seq = pop_u64(&mut data)
-                    .ok_or(Error::FrameTruncated { frame: "fragment", field: "seq" })?;
-                let frag_idx = pop_u16(&mut data)
-                    .ok_or(Error::FrameTruncated { frame: "fragment", field: "frag_idx" })?;
-                let frag_total = pop_u16(&mut data)
-                    .ok_or(Error::FrameTruncated { frame: "fragment", field: "frag_total" })?;
-                let msg_id = pop_u32(&mut data)
-                    .ok_or(Error::FrameTruncated { frame: "fragment", field: "msg_id" })?;
-                Ok(Frame::Fragment { msg_id, frag_idx, frag_total, seq, payload: data.freeze() })
+                let seq = pop_u64(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "fragment",
+                    field: "seq",
+                })?;
+                let frag_idx = pop_u16(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "fragment",
+                    field: "frag_idx",
+                })?;
+                let frag_total = pop_u16(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "fragment",
+                    field: "frag_total",
+                })?;
+                let msg_id = pop_u32(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "fragment",
+                    field: "msg_id",
+                })?;
+                Ok(Frame::Fragment {
+                    msg_id,
+                    frag_idx,
+                    frag_total,
+                    seq,
+                    payload: data.freeze(),
+                })
             }
 
             TYPE_RELAY => {
-                let addr_tag = pop_u8(&mut data)
-                    .ok_or(Error::FrameTruncated { frame: "relay", field: "addr_tag" })?;
+                let addr_tag = pop_u8(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "relay",
+                    field: "addr_tag",
+                })?;
                 let dest = match addr_tag {
                     ADDR_V4 => {
-                        let ip = pop_bytes::<4>(&mut data)
-                            .ok_or(Error::FrameTruncated { frame: "relay", field: "ipv4_addr" })?;
-                        let port = pop_u16(&mut data)
-                            .ok_or(Error::FrameTruncated { frame: "relay", field: "port" })?;
+                        let ip = pop_bytes::<4>(&mut data).ok_or(Error::FrameTruncated {
+                            frame: "relay",
+                            field: "ipv4_addr",
+                        })?;
+                        let port = pop_u16(&mut data).ok_or(Error::FrameTruncated {
+                            frame: "relay",
+                            field: "port",
+                        })?;
                         SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port)
                     }
                     ADDR_V6 => {
-                        let ip = pop_bytes::<16>(&mut data)
-                            .ok_or(Error::FrameTruncated { frame: "relay", field: "ipv6_addr" })?;
-                        let port = pop_u16(&mut data)
-                            .ok_or(Error::FrameTruncated { frame: "relay", field: "port" })?;
+                        let ip = pop_bytes::<16>(&mut data).ok_or(Error::FrameTruncated {
+                            frame: "relay",
+                            field: "ipv6_addr",
+                        })?;
+                        let port = pop_u16(&mut data).ok_or(Error::FrameTruncated {
+                            frame: "relay",
+                            field: "port",
+                        })?;
                         SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), port)
                     }
                     tag => return Err(Error::UnknownAddrTag { tag }),
                 };
-                Ok(Frame::Relay { dest, inner: data.freeze() })
+                Ok(Frame::Relay {
+                    dest,
+                    inner: data.freeze(),
+                })
             }
 
             TYPE_PROBE => {
-                let proto_ver = pop_u16(&mut data)
-                    .ok_or(Error::FrameTruncated { frame: "probe", field: "proto_ver" })?;
-                let app_id = pop_u64(&mut data)
-                    .ok_or(Error::FrameTruncated { frame: "probe", field: "app_id" })?;
+                let proto_ver = pop_u16(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "probe",
+                    field: "proto_ver",
+                })?;
+                let app_id = pop_u64(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "probe",
+                    field: "app_id",
+                })?;
                 Ok(Frame::Probe { app_id, proto_ver })
             }
 
             TYPE_BEACON => {
-                let app_id = pop_u64(&mut data)
-                    .ok_or(Error::FrameTruncated { frame: "beacon", field: "app_id" })?;
-                let proto_ver = pop_u16(&mut data)
-                    .ok_or(Error::FrameTruncated { frame: "beacon", field: "proto_ver" })?;
-                let data_port = pop_u16(&mut data)
-                    .ok_or(Error::FrameTruncated { frame: "beacon", field: "data_port" })?;
-                Ok(Frame::Beacon { app_id, proto_ver, data_port, meta: data.freeze() })
+                let app_id = pop_u64(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "beacon",
+                    field: "app_id",
+                })?;
+                let proto_ver = pop_u16(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "beacon",
+                    field: "proto_ver",
+                })?;
+                let data_port = pop_u16(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "beacon",
+                    field: "data_port",
+                })?;
+                Ok(Frame::Beacon {
+                    app_id,
+                    proto_ver,
+                    data_port,
+                    meta: data.freeze(),
+                })
+            }
+
+            #[cfg(feature = "security")]
+            TYPE_HANDSHAKE => Ok(Frame::Handshake {
+                payload: data.freeze(),
+            }),
+
+            #[cfg(feature = "security")]
+            TYPE_SECURE => {
+                let nonce = pop_u64(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "secure",
+                    field: "nonce",
+                })?;
+                Ok(Frame::Secure {
+                    nonce,
+                    ciphertext: data.freeze(),
+                })
             }
 
             tag => Err(Error::UnknownFrameType { tag }),
@@ -395,9 +500,10 @@ mod tests {
 
     #[test]
     fn probe_roundtrip() {
-        let Frame::Probe { app_id, proto_ver } =
-            roundtrip(Frame::Probe { app_id: 0xdead_beef_cafe_babe, proto_ver: 1 })
-        else {
+        let Frame::Probe { app_id, proto_ver } = roundtrip(Frame::Probe {
+            app_id: 0xdead_beef_cafe_babe,
+            proto_ver: 1,
+        }) else {
             panic!("wrong variant");
         };
         assert_eq!(app_id, 0xdead_beef_cafe_babe);
@@ -407,13 +513,17 @@ mod tests {
     #[test]
     fn beacon_roundtrip() {
         let meta = Bytes::from_static(b"hello discovery");
-        let Frame::Beacon { app_id, proto_ver, data_port, meta: out_meta } =
-            roundtrip(Frame::Beacon {
-                app_id: 0xdead_beef_cafe_babe,
-                proto_ver: 1,
-                data_port: 7700,
-                meta: meta.clone(),
-            })
+        let Frame::Beacon {
+            app_id,
+            proto_ver,
+            data_port,
+            meta: out_meta,
+        } = roundtrip(Frame::Beacon {
+            app_id: 0xdead_beef_cafe_babe,
+            proto_ver: 1,
+            data_port: 7700,
+            meta: meta.clone(),
+        })
         else {
             panic!("wrong variant");
         };
@@ -439,5 +549,35 @@ mod tests {
         };
         assert_eq!(out_dest, dest);
         assert_eq!(out_inner, inner);
+    }
+
+    #[cfg(feature = "security")]
+    #[test]
+    fn handshake_roundtrip() {
+        let payload = Bytes::from_static(b"noise handshake msg");
+        let Frame::Handshake { payload: out } = roundtrip(Frame::Handshake {
+            payload: payload.clone(),
+        }) else {
+            panic!("wrong variant");
+        };
+        assert_eq!(out, payload);
+    }
+
+    #[cfg(feature = "security")]
+    #[test]
+    fn secure_roundtrip() {
+        let ciphertext = Bytes::from_static(b"encrypted data with aead tag xxxx");
+        let Frame::Secure {
+            nonce,
+            ciphertext: out,
+        } = roundtrip(Frame::Secure {
+            nonce: 0xdead_beef_0000_0001,
+            ciphertext: ciphertext.clone(),
+        })
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(nonce, 0xdead_beef_0000_0001);
+        assert_eq!(out, ciphertext);
     }
 }

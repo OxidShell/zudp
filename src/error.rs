@@ -11,12 +11,10 @@ pub enum Error {
 
     // ── bitcode-only ─────────────────────────────────────────────────────────
     // encode is infallible (bitcode::encode returns Vec<u8>), so no Encode here.
-
     #[cfg(all(feature = "bitcode", not(feature = "serde")))]
     Decode(bitcode::Error),
 
     // ── serde-only ───────────────────────────────────────────────────────────
-
     #[cfg(all(feature = "serde", not(feature = "bitcode")))]
     Encode(postcard::Error),
 
@@ -25,34 +23,47 @@ pub enum Error {
 
     // ── both active or neither (custom codec) ─────────────────────────────
     // Preserves the source error without stringly-typing it.
-
     #[cfg(not(any(
         all(feature = "bitcode", not(feature = "serde")),
-        all(feature = "serde",   not(feature = "bitcode")),
+        all(feature = "serde", not(feature = "bitcode")),
     )))]
     Encode(Box<dyn std::error::Error + Send + Sync + 'static>),
 
     #[cfg(not(any(
         all(feature = "bitcode", not(feature = "serde")),
-        all(feature = "serde",   not(feature = "bitcode")),
+        all(feature = "serde", not(feature = "bitcode")),
     )))]
     Decode(Box<dyn std::error::Error + Send + Sync + 'static>),
 
     // ── protocol errors ───────────────────────────────────────────────────────
-
     ChannelClosed,
-    MessageTooLarge { got: usize, max: usize },
+    MessageTooLarge {
+        got: usize,
+        max: usize,
+    },
     UnknownRelay(SocketAddr),
     /// Packet had no bytes — frame type byte is missing.
     FrameEmpty,
     /// Packet was cut short: a required field was absent.
-    FrameTruncated { frame: &'static str, field: &'static str },
+    FrameTruncated {
+        frame: &'static str,
+        field: &'static str,
+    },
     /// Nack body length is not a multiple of 8.
-    NackInvalidLength { len: usize },
+    NackInvalidLength {
+        len: usize,
+    },
     /// Relay address-family tag was neither 0x00 (v4) nor 0x01 (v6).
-    UnknownAddrTag { tag: u8 },
+    UnknownAddrTag {
+        tag: u8,
+    },
     /// Frame type byte did not match any known variant.
-    UnknownFrameType { tag: u8 },
+    UnknownFrameType {
+        tag: u8,
+    },
+    /// Noise protocol error (handshake or AEAD failure).
+    #[cfg(feature = "security")]
+    Security(snow::Error),
 }
 
 impl fmt::Display for Error {
@@ -70,12 +81,12 @@ impl fmt::Display for Error {
 
             #[cfg(not(any(
                 all(feature = "bitcode", not(feature = "serde")),
-                all(feature = "serde",   not(feature = "bitcode")),
+                all(feature = "serde", not(feature = "bitcode")),
             )))]
             Self::Encode(e) => write!(f, "encode: {e}"),
             #[cfg(not(any(
                 all(feature = "bitcode", not(feature = "serde")),
-                all(feature = "serde",   not(feature = "bitcode")),
+                all(feature = "serde", not(feature = "bitcode")),
             )))]
             Self::Decode(e) => write!(f, "decode: {e}"),
 
@@ -97,6 +108,8 @@ impl fmt::Display for Error {
             Self::UnknownFrameType { tag } => {
                 write!(f, "frame parse: unknown frame type 0x{tag:02x}")
             }
+            #[cfg(feature = "security")]
+            Self::Security(e) => write!(f, "security: {e}"),
         }
     }
 }
@@ -116,15 +129,17 @@ impl std::error::Error for Error {
 
             #[cfg(not(any(
                 all(feature = "bitcode", not(feature = "serde")),
-                all(feature = "serde",   not(feature = "bitcode")),
+                all(feature = "serde", not(feature = "bitcode")),
             )))]
             Self::Encode(e) => Some(e.as_ref()),
             #[cfg(not(any(
                 all(feature = "bitcode", not(feature = "serde")),
-                all(feature = "serde",   not(feature = "bitcode")),
+                all(feature = "serde", not(feature = "bitcode")),
             )))]
             Self::Decode(e) => Some(e.as_ref()),
 
+            #[cfg(feature = "security")]
+            Self::Security(e) => Some(e),
             _ => None,
         }
     }
@@ -133,5 +148,12 @@ impl std::error::Error for Error {
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
+    }
+}
+
+#[cfg(feature = "security")]
+impl From<snow::Error> for Error {
+    fn from(e: snow::Error) -> Self {
+        Self::Security(e)
     }
 }

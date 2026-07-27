@@ -17,6 +17,9 @@ pub(crate) struct EngineInner {
     pub socket: RawSocket,
     pub peers: RwLock<HashMap<SocketAddr, Arc<PeerState>>>,
     pub config: Arc<Config>,
+    /// Noise keypair for the `security` feature; `None` when security is disabled.
+    #[cfg(feature = "security")]
+    pub keypair: Option<crate::security::Keypair>,
 }
 
 impl EngineInner {
@@ -35,10 +38,6 @@ impl EngineInner {
 }
 
 /// Spawn the engine background task and return the inbound receiver.
-///
-/// The engine reads from the socket, dispatches frames, retransmits on NACK,
-/// and sends keepalives.  All send I/O from `ZudpSocket`/`ZudpConn` bypasses
-/// the engine and hits the socket directly.
 pub(crate) fn spawn(inner: Arc<EngineInner>) -> mpsc::UnboundedReceiver<(Bytes, SocketAddr)> {
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
     tokio::spawn(run(inner, inbound_tx));
@@ -46,7 +45,6 @@ pub(crate) fn spawn(inner: Arc<EngineInner>) -> mpsc::UnboundedReceiver<(Bytes, 
 }
 
 async fn run(inner: Arc<EngineInner>, inbound_tx: mpsc::UnboundedSender<(Bytes, SocketAddr)>) {
-    // Per-peer receive state is local to this task — no lock needed.
     let mut recv_states: HashMap<SocketAddr, (RecvState, FragAssembler)> = HashMap::new();
     let keepalive_interval = inner.config.keepalive_interval;
     let sent_prune_age = inner.config.sent_prune_age;
@@ -55,7 +53,7 @@ async fn run(inner: Arc<EngineInner>, inbound_tx: mpsc::UnboundedSender<(Bytes, 
 
     loop {
         tokio::select! {
-            biased; // check recv first to minimise latency
+            biased;
 
             result = inner.socket.recv_from() => {
                 match result {
@@ -93,12 +91,57 @@ async fn handle_incoming(
         }
     };
 
-    // Bump last-seen for any peer we already know (clone Arc, release lock immediately).
     let known_peer = inner.peers.read().get(&from).cloned();
-    if let Some(peer) = known_peer {
+    if let Some(peer) = &known_peer {
         peer.mark_seen();
     }
 
+    #[cfg(feature = "security")]
+    {
+        match frame {
+            Frame::Handshake { payload } => {
+                handle_handshake(payload, from, inner).await;
+            }
+            Frame::Secure { nonce, ciphertext } => {
+                let Some(peer) = known_peer else {
+                    tracing::warn!(target: "zudp::engine", peer = %from, "secure frame from unknown peer");
+                    return;
+                };
+                let Some(channel) = peer.channel.get() else {
+                    tracing::warn!(target: "zudp::engine", peer = %from, "secure frame but no channel yet");
+                    return;
+                };
+                let plain = match channel.decrypt(nonce, &ciphertext) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(target: "zudp::engine", peer = %from, "decrypt failed: {e}");
+                        return;
+                    }
+                };
+                let inner_frame = match Frame::decode(BytesMut::from(plain.as_slice())) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!(target: "zudp::engine", peer = %from, "inner frame decode failed: {e}");
+                        return;
+                    }
+                };
+                dispatch_frame(inner_frame, from, inner, inbound_tx, recv_states).await;
+            }
+            frame => dispatch_frame(frame, from, inner, inbound_tx, recv_states).await,
+        }
+    }
+
+    #[cfg(not(feature = "security"))]
+    dispatch_frame(frame, from, inner, inbound_tx, recv_states).await;
+}
+
+async fn dispatch_frame(
+    frame: Frame,
+    from: SocketAddr,
+    inner: &Arc<EngineInner>,
+    inbound_tx: &mpsc::UnboundedSender<(Bytes, SocketAddr)>,
+    recv_states: &mut HashMap<SocketAddr, (RecvState, FragAssembler)>,
+) {
     match frame {
         Frame::Datagram(payload) => {
             let _ = inbound_tx.send((payload, from));
@@ -119,13 +162,13 @@ async fn handle_incoming(
         }
 
         Frame::Nack(seqs) => {
-            // Clone the Arc before releasing the lock so no guard crosses an await.
             let peer_opt = inner.peers.read().get(&from).cloned();
             if let Some(peer) = peer_opt {
                 let to_retransmit = peer.frames_for_retransmit(&seqs);
-                for (seq, frame) in to_retransmit {
+                for (seq, plain_frame) in to_retransmit {
+                    let wire = encrypt_or_plain(&peer, &plain_frame);
                     tracing::debug!(target: "zudp::engine", peer = %from, seq, "retransmit on NACK");
-                    if let Err(e) = inner.socket.send_to(&frame, from).await {
+                    if let Err(e) = inner.socket.send_to(&wire, from).await {
                         tracing::warn!(target: "zudp::engine", peer = %from, "retransmit failed: {e}");
                     }
                 }
@@ -178,15 +221,40 @@ async fn handle_incoming(
             dest,
             inner: payload,
         } => {
-            // This node is acting as a relay — forward the inner bytes verbatim.
             if let Err(e) = inner.socket.send_to(&payload, dest).await {
                 tracing::warn!(target: "zudp::engine", %dest, "relay forward failed: {e}");
             }
         }
 
-        // last_seen already bumped above; nothing more to do for these.
         Frame::Pong { .. } | Frame::Probe { .. } | Frame::Beacon { .. } => {}
+
+        // Handshake and Secure are handled before dispatch_frame is called.
+        #[cfg(feature = "security")]
+        Frame::Handshake { .. } | Frame::Secure { .. } => {}
     }
+}
+
+/// If the peer has an established Noise channel, re-encrypt the plain frame; otherwise send as-is.
+///
+/// Used for NACK-triggered retransmits: each retransmit gets a fresh nonce to avoid reuse.
+#[allow(unused_variables)]
+fn encrypt_or_plain(peer: &PeerState, plain: &Bytes) -> Bytes {
+    #[cfg(feature = "security")]
+    if let Some(channel) = peer.channel.get() {
+        match channel.encrypt(plain) {
+            Ok((nonce, ct)) => {
+                return Frame::Secure {
+                    nonce,
+                    ciphertext: Bytes::from(ct),
+                }
+                .encode();
+            }
+            Err(e) => {
+                tracing::warn!(target: "zudp::engine", "retransmit encrypt failed: {e}");
+            }
+        }
+    }
+    plain.clone()
 }
 
 async fn send_nack_if_needed(nack_seqs: Vec<u64>, to: SocketAddr, inner: &Arc<EngineInner>) {
@@ -214,7 +282,6 @@ async fn run_background(
     let peers: Vec<Arc<PeerState>> = inner.peers.read().values().cloned().collect();
 
     for peer in peers {
-        // Keepalive: send Ping if idle.
         if peer.secs_since_sent() >= keepalive_threshold {
             let ping = Frame::Ping { echo: now_millis }.encode();
             if let Err(e) = inner.socket.send_to(&ping, peer.addr).await {
@@ -222,12 +289,109 @@ async fn run_background(
             }
             tracing::trace!(target: "zudp::engine", peer = %peer.addr, "sent keepalive ping");
         }
-        // Prune sent buffer to avoid unbounded growth.
         peer.prune_sent(sent_prune_age);
     }
 
-    // Prune stale fragment assemblies (sender may have died mid-message).
     for (_, frag_assembler) in recv_states.values_mut() {
         frag_assembler.prune(sent_prune_age);
+    }
+}
+
+/// Drive a Noise XX handshake step on behalf of the engine.
+///
+/// - If no handshake exists for `from` yet, creates a responder state (server role).
+/// - If a handshake already exists (initiator stored it before sending msg1), reads the
+///   incoming message and, if it's the initiator's turn, writes the next message.
+/// - When both sides finish all three messages, transitions to `StatelessTransportState`.
+#[cfg(feature = "security")]
+async fn handle_handshake(payload: Bytes, from: SocketAddr, inner: &Arc<EngineInner>) {
+    use crate::security::{SecureChannel, build_responder};
+
+    let Some(kp) = inner.keypair.as_ref() else {
+        tracing::debug!(target: "zudp::engine", peer = %from, "handshake ignored — security not configured");
+        return;
+    };
+
+    let peer = inner.get_or_create_peer(from);
+
+    // Initialise as responder if this peer's handshake hasn't started yet.
+    {
+        let mut guard = peer.handshake.lock();
+        if guard.is_none() {
+            match build_responder(kp) {
+                Ok(hs) => *guard = Some(hs),
+                Err(e) => {
+                    tracing::error!(target: "zudp::engine", peer = %from, "build_responder: {e}");
+                    return;
+                }
+            }
+        }
+    }
+
+    // Process the incoming message; determine if we need to reply and/or finish.
+    let outcome = {
+        let mut guard = peer.handshake.lock();
+        let hs = guard.as_mut().expect("initialised above");
+
+        let mut rbuf = vec![0u8; 1024];
+        if let Err(e) = hs.read_message(&payload, &mut rbuf) {
+            tracing::warn!(target: "zudp::engine", peer = %from, "handshake read: {e}");
+            return;
+        }
+
+        // After reading, check if the handshake is done (responder finishes on msg3).
+        let finished_after_read = hs.is_handshake_finished();
+
+        if finished_after_read {
+            // Take the state before releasing the guard.
+            let hs_owned = guard.take().unwrap();
+            (None::<Bytes>, Some(hs_owned))
+        } else {
+            // Still our turn to write (msg2 for responder, msg3 for initiator).
+            let mut wbuf = vec![0u8; 1024];
+            let n = match hs.write_message(&[], &mut wbuf) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(target: "zudp::engine", peer = %from, "handshake write: {e}");
+                    return;
+                }
+            };
+            wbuf.truncate(n);
+            let reply = Bytes::from(wbuf);
+
+            // After writing, check again (initiator finishes on msg3 write).
+            let finished_after_write = hs.is_handshake_finished();
+            let hs_owned = if finished_after_write {
+                guard.take()
+            } else {
+                None
+            };
+
+            (Some(reply), hs_owned)
+        }
+    }; // handshake lock released
+
+    let (reply, finished_hs) = outcome;
+
+    if let Some(reply_bytes) = reply {
+        let wire = Frame::Handshake {
+            payload: reply_bytes,
+        }
+        .encode();
+        if let Err(e) = inner.socket.send_to(&wire, from).await {
+            tracing::warn!(target: "zudp::engine", peer = %from, "handshake send: {e}");
+        }
+    }
+
+    if let Some(hs) = finished_hs {
+        match hs.into_stateless_transport_mode() {
+            Ok(transport) => {
+                let _ = peer.channel.set(SecureChannel::new(transport));
+                tracing::info!(target: "zudp::engine", peer = %from, "Noise XX handshake complete");
+            }
+            Err(e) => {
+                tracing::error!(target: "zudp::engine", peer = %from, "into_transport_mode: {e}");
+            }
+        }
     }
 }
