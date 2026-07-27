@@ -1,20 +1,55 @@
 use std::{fmt, net::SocketAddr};
 
+// cfg shorthand: "exactly one codec active"
+// bitcode-only: all(feature = "bitcode", not(feature = "serde"))
+// serde-only:   all(feature = "serde",   not(feature = "bitcode"))
+// both/neither: the complement — handled by the fallback Box variants
+
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
+
+    // ── bitcode-only ─────────────────────────────────────────────────────────
+    // encode is infallible (bitcode::encode returns Vec<u8>), so no Encode here.
+
+    #[cfg(all(feature = "bitcode", not(feature = "serde")))]
+    Decode(bitcode::Error),
+
+    // ── serde-only ───────────────────────────────────────────────────────────
+
+    #[cfg(all(feature = "serde", not(feature = "bitcode")))]
+    Encode(postcard::Error),
+
+    #[cfg(all(feature = "serde", not(feature = "bitcode")))]
+    Decode(postcard::Error),
+
+    // ── both active or neither (custom codec) ─────────────────────────────
+    // Preserves the source error without stringly-typing it.
+
+    #[cfg(not(any(
+        all(feature = "bitcode", not(feature = "serde")),
+        all(feature = "serde",   not(feature = "bitcode")),
+    )))]
     Encode(Box<dyn std::error::Error + Send + Sync + 'static>),
+
+    #[cfg(not(any(
+        all(feature = "bitcode", not(feature = "serde")),
+        all(feature = "serde",   not(feature = "bitcode")),
+    )))]
     Decode(Box<dyn std::error::Error + Send + Sync + 'static>),
+
+    // ── protocol errors ───────────────────────────────────────────────────────
+
     ChannelClosed,
     MessageTooLarge { got: usize, max: usize },
     UnknownRelay(SocketAddr),
-    /// Packet had no bytes at all — frame type byte is missing.
+    /// Packet had no bytes — frame type byte is missing.
     FrameEmpty,
-    /// Packet was cut short: a required field was not present.
+    /// Packet was cut short: a required field was absent.
     FrameTruncated { frame: &'static str, field: &'static str },
     /// Nack body length is not a multiple of 8.
     NackInvalidLength { len: usize },
-    /// Relay address-family tag was not 0x00 (v4) or 0x01 (v6).
+    /// Relay address-family tag was neither 0x00 (v4) nor 0x01 (v6).
     UnknownAddrTag { tag: u8 },
     /// Frame type byte did not match any known variant.
     UnknownFrameType { tag: u8 },
@@ -24,8 +59,26 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(e) => write!(f, "I/O: {e}"),
-            Self::Encode(e) => write!(f, "encode: {e}"),
+
+            #[cfg(all(feature = "bitcode", not(feature = "serde")))]
             Self::Decode(e) => write!(f, "decode: {e}"),
+
+            #[cfg(all(feature = "serde", not(feature = "bitcode")))]
+            Self::Encode(e) => write!(f, "encode: {e}"),
+            #[cfg(all(feature = "serde", not(feature = "bitcode")))]
+            Self::Decode(e) => write!(f, "decode: {e}"),
+
+            #[cfg(not(any(
+                all(feature = "bitcode", not(feature = "serde")),
+                all(feature = "serde",   not(feature = "bitcode")),
+            )))]
+            Self::Encode(e) => write!(f, "encode: {e}"),
+            #[cfg(not(any(
+                all(feature = "bitcode", not(feature = "serde")),
+                all(feature = "serde",   not(feature = "bitcode")),
+            )))]
+            Self::Decode(e) => write!(f, "decode: {e}"),
+
             Self::ChannelClosed => f.write_str("channel closed — engine stopped"),
             Self::MessageTooLarge { got, max } => {
                 write!(f, "message needs {got} fragments, max is {max}")
@@ -52,7 +105,26 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(e) => Some(e),
-            Self::Encode(e) | Self::Decode(e) => Some(e.as_ref()),
+
+            #[cfg(all(feature = "bitcode", not(feature = "serde")))]
+            Self::Decode(e) => Some(e),
+
+            #[cfg(all(feature = "serde", not(feature = "bitcode")))]
+            Self::Encode(e) => Some(e),
+            #[cfg(all(feature = "serde", not(feature = "bitcode")))]
+            Self::Decode(e) => Some(e),
+
+            #[cfg(not(any(
+                all(feature = "bitcode", not(feature = "serde")),
+                all(feature = "serde",   not(feature = "bitcode")),
+            )))]
+            Self::Encode(e) => Some(e.as_ref()),
+            #[cfg(not(any(
+                all(feature = "bitcode", not(feature = "serde")),
+                all(feature = "serde",   not(feature = "bitcode")),
+            )))]
+            Self::Decode(e) => Some(e.as_ref()),
+
             _ => None,
         }
     }
