@@ -129,26 +129,20 @@ impl Frame {
     }
 
     pub fn decode(mut data: BytesMut) -> Result<Self, Error> {
-        let frame_type =
-            pop_u8(&mut data).ok_or_else(|| Error::InvalidFrame("empty packet".into()))?;
+        let frame_type = pop_u8(&mut data).ok_or(Error::FrameEmpty)?;
 
         match frame_type {
             TYPE_DATAGRAM => Ok(Frame::Datagram(data.freeze())),
 
             TYPE_STREAM => {
                 let seq = pop_u64(&mut data)
-                    .ok_or_else(|| Error::InvalidFrame("stream: missing seq".into()))?;
-                Ok(Frame::Stream {
-                    seq,
-                    payload: data.freeze(),
-                })
+                    .ok_or(Error::FrameTruncated { frame: "stream", field: "seq" })?;
+                Ok(Frame::Stream { seq, payload: data.freeze() })
             }
 
             TYPE_NACK => {
                 if !data.len().is_multiple_of(8) {
-                    return Err(Error::InvalidFrame(
-                        "nack: length not a multiple of 8".into(),
-                    ));
+                    return Err(Error::NackInvalidLength { len: data.len() });
                 }
                 let seqs = data
                     .chunks(8)
@@ -159,66 +153,53 @@ impl Frame {
 
             TYPE_PING => {
                 let echo = pop_u64(&mut data)
-                    .ok_or_else(|| Error::InvalidFrame("ping: missing echo".into()))?;
+                    .ok_or(Error::FrameTruncated { frame: "ping", field: "echo" })?;
                 Ok(Frame::Ping { echo })
             }
 
             TYPE_PONG => {
                 let echo = pop_u64(&mut data)
-                    .ok_or_else(|| Error::InvalidFrame("pong: missing echo".into()))?;
+                    .ok_or(Error::FrameTruncated { frame: "pong", field: "echo" })?;
                 Ok(Frame::Pong { echo })
             }
 
             TYPE_FRAGMENT => {
                 // layout (reading tail-first): seq(8) frag_idx(2) frag_total(2) msg_id(4)
                 let seq = pop_u64(&mut data)
-                    .ok_or_else(|| Error::InvalidFrame("fragment: missing seq".into()))?;
+                    .ok_or(Error::FrameTruncated { frame: "fragment", field: "seq" })?;
                 let frag_idx = pop_u16(&mut data)
-                    .ok_or_else(|| Error::InvalidFrame("fragment: missing frag_idx".into()))?;
+                    .ok_or(Error::FrameTruncated { frame: "fragment", field: "frag_idx" })?;
                 let frag_total = pop_u16(&mut data)
-                    .ok_or_else(|| Error::InvalidFrame("fragment: missing frag_total".into()))?;
+                    .ok_or(Error::FrameTruncated { frame: "fragment", field: "frag_total" })?;
                 let msg_id = pop_u32(&mut data)
-                    .ok_or_else(|| Error::InvalidFrame("fragment: missing msg_id".into()))?;
-                Ok(Frame::Fragment {
-                    msg_id,
-                    frag_idx,
-                    frag_total,
-                    seq,
-                    payload: data.freeze(),
-                })
+                    .ok_or(Error::FrameTruncated { frame: "fragment", field: "msg_id" })?;
+                Ok(Frame::Fragment { msg_id, frag_idx, frag_total, seq, payload: data.freeze() })
             }
 
             TYPE_RELAY => {
                 let addr_tag = pop_u8(&mut data)
-                    .ok_or_else(|| Error::InvalidFrame("relay: missing addr tag".into()))?;
+                    .ok_or(Error::FrameTruncated { frame: "relay", field: "addr_tag" })?;
                 let dest = match addr_tag {
                     ADDR_V4 => {
                         let ip = pop_bytes::<4>(&mut data)
-                            .ok_or_else(|| Error::InvalidFrame("relay: missing IPv4".into()))?;
+                            .ok_or(Error::FrameTruncated { frame: "relay", field: "ipv4_addr" })?;
                         let port = pop_u16(&mut data)
-                            .ok_or_else(|| Error::InvalidFrame("relay: missing port".into()))?;
+                            .ok_or(Error::FrameTruncated { frame: "relay", field: "port" })?;
                         SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port)
                     }
                     ADDR_V6 => {
                         let ip = pop_bytes::<16>(&mut data)
-                            .ok_or_else(|| Error::InvalidFrame("relay: missing IPv6".into()))?;
+                            .ok_or(Error::FrameTruncated { frame: "relay", field: "ipv6_addr" })?;
                         let port = pop_u16(&mut data)
-                            .ok_or_else(|| Error::InvalidFrame("relay: missing port".into()))?;
+                            .ok_or(Error::FrameTruncated { frame: "relay", field: "port" })?;
                         SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), port)
                     }
-                    t => {
-                        return Err(Error::InvalidFrame(format!(
-                            "relay: unknown addr tag 0x{t:02x}"
-                        )));
-                    }
+                    tag => return Err(Error::UnknownAddrTag { tag }),
                 };
-                Ok(Frame::Relay {
-                    dest,
-                    inner: data.freeze(),
-                })
+                Ok(Frame::Relay { dest, inner: data.freeze() })
             }
 
-            t => Err(Error::InvalidFrame(format!("unknown frame type 0x{t:02x}"))),
+            tag => Err(Error::UnknownFrameType { tag }),
         }
     }
 }

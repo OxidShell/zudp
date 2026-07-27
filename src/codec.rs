@@ -22,20 +22,20 @@ impl<T: bitcode::Encode + Send + 'static> Encode for T {
 #[cfg(all(feature = "bitcode", not(feature = "serde")))]
 impl<T: for<'de> bitcode::Decode<'de> + Send + 'static> Decode for T {
     fn decode_from_bytes(bytes: &[u8]) -> Result<Self, crate::Error> {
-        bitcode::decode(bytes).map_err(|e| crate::Error::Decode(e.to_string()))
+        bitcode::decode(bytes).map_err(|e| crate::Error::Decode(Box::new(e)))
     }
 }
 
 #[cfg(feature = "serde")]
 impl<T: serde::Serialize + Send + 'static> Encode for T {
     fn encode_to_bytes(&self) -> Result<Vec<u8>, crate::Error> {
-        postcard::to_allocvec(self).map_err(|e| crate::Error::Encode(e.to_string()))
+        postcard::to_allocvec(self).map_err(|e| crate::Error::Encode(Box::new(e)))
     }
 }
 
 #[cfg(feature = "serde")]
 impl<T: serde::de::DeserializeOwned + Send + 'static> Decode for T {
     fn decode_from_bytes(bytes: &[u8]) -> Result<Self, crate::Error> {
-        postcard::from_bytes(bytes).map_err(|e| crate::Error::Decode(e.to_string()))
+        postcard::from_bytes(bytes).map_err(|e| crate::Error::Decode(Box::new(e)))
     }
 }

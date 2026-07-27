@@ -16,7 +16,6 @@ bytes = "1"
 bitcode = { version = "0.6", features = ["derive"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 postcard = { version = "1", features = ["alloc"], optional = true }
-thiserror = "2"
 tracing = "0.1"
 socket2 = { version = "0.5", features = ["all"] }
 parking_lot = "0.12"
@@ -30,5 +29,9 @@ name = "ping_pong"
 path = "examples/ping_pong.rs"
 
 [[example]]
-name = "advanced"
-path = "examples/advanced.rs"
+name = "fragmentation"
+path = "examples/fragmentation.rs"
+
+[[example]]
+name = "relay"
+path = "examples/relay.rs"
