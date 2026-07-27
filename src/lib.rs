@@ -6,10 +6,9 @@
 //! ## Quick start
 //!
 //! ```rust,no_run
-//! use zudp::Zudp;
-//! use bitcode::{Decode, Encode};
+//! use zudp::{Zudp, Encode, Decode};
 //!
-//! #[derive(Encode, Decode)]
+//! #[derive(bitcode::Encode, bitcode::Decode)]
 //! enum Msg { Ping, Pong, Data(Vec<u8>) }
 //!
 //! #[tokio::main]
@@ -26,6 +25,7 @@
 //! }
 //! ```
 
+mod codec;
 mod engine;
 mod error;
 mod frag;
@@ -33,6 +33,7 @@ mod frame;
 mod peer;
 mod socket;
 
+pub use codec::{Decode, Encode};
 pub use error::Error;
 
 use std::{
@@ -55,18 +56,9 @@ use frame::Frame;
 use peer::PeerState;
 use socket::RawSocket;
 
-// ── Message trait ─────────────────────────────────────────────────────────────
-
-/// Any type that can be sent and received over ZUDP.
-///
-/// Implemented automatically for all types that satisfy the bounds —
-/// just `#[derive(bitcode::Encode, bitcode::Decode)]` on your enum or struct.
-pub trait Message: bitcode::Encode + for<'de> bitcode::Decode<'de> + Send + 'static {}
-impl<T> Message for T where T: bitcode::Encode + for<'de> bitcode::Decode<'de> + Send + 'static {}
-
 // ── Config ────────────────────────────────────────────────────────────────────
 
-/// Protocol configuration, built via [`Zudp`] or [`ZudpBuilder`].
+/// Protocol configuration, built via [`Zudp`].
 #[derive(Clone)]
 pub struct Config {
     pub(crate) port: u16,
@@ -106,8 +98,7 @@ impl Default for Config {
 ///
 /// ```rust,no_run
 /// # use zudp::{Zudp, ZudpSocket};
-/// # use bitcode::{Encode, Decode};
-/// # #[derive(Encode, Decode)] enum Msg { Hi }
+/// # #[derive(bitcode::Encode, bitcode::Decode)] enum Msg { Hi }
 /// # async fn f() -> Result<(), zudp::Error> {
 /// // turbofish on the terminal call
 /// let socket = Zudp::default().port(1234).listen::<Msg>().await?;
@@ -171,7 +162,7 @@ impl Zudp {
     ///
     /// # Errors
     /// Returns `Err` if the OS refuses to bind the requested address/port.
-    pub async fn listen<M: Message>(self) -> Result<ZudpSocket<M>, Error> {
+    pub async fn listen<M>(self) -> Result<ZudpSocket<M>, Error> {
         ZudpSocket::new(self.config).await
     }
 
@@ -182,7 +173,7 @@ impl Zudp {
     ///
     /// # Errors
     /// Returns `Err` if the OS refuses to bind the requested address/port.
-    pub async fn connect<M: Message>(self, peer: SocketAddr) -> Result<ZudpConn<M>, Error> {
+    pub async fn connect<M>(self, peer: SocketAddr) -> Result<ZudpConn<M>, Error> {
         let socket = ZudpSocket::new(self.config).await?;
         Ok(ZudpConn { socket, peer })
     }
@@ -229,14 +220,13 @@ impl Inner {
     ///
     /// If `reliable` is `true` and the protocol config has reliability enabled,
     /// the frame is tracked for NACK-triggered retransmission.
-    async fn send_msg<M: Message>(
+    async fn send_msg<M: Encode>(
         &self,
         msg: &M,
         dest: SocketAddr,
         reliable: bool,
     ) -> Result<(), Error> {
-        let encoded = bitcode::encode(msg);
-        let payload = Bytes::from(encoded);
+        let payload = Bytes::from(msg.encode_to_bytes()?);
 
         let actual_dest = self.config.relay_addr.unwrap_or(dest);
         let wrap_relay = self.config.relay_addr.is_some();
@@ -337,14 +327,14 @@ impl Inner {
 
 /// A ZUDP socket that sends and receives messages from any remote peer.
 ///
-/// Created by [`ZudpBuilder::listen`].
+/// Created by [`Zudp::listen`].
 pub struct ZudpSocket<M> {
     inner: Arc<Inner>,
     rx: mpsc::UnboundedReceiver<(Bytes, SocketAddr)>,
     _phantom: PhantomData<fn() -> M>,
 }
 
-impl<M: Message> ZudpSocket<M> {
+impl<M> ZudpSocket<M> {
     async fn new(config: Config) -> Result<Self, Error> {
         let (inner, rx) = Inner::new(config).await?;
         Ok(Self {
@@ -370,7 +360,10 @@ impl<M: Message> ZudpSocket<M> {
     ///
     /// # Errors
     /// Returns `Err` on I/O failure or if the message is too large to fragment.
-    pub async fn send(&self, msg: M, peer: SocketAddr) -> Result<(), Error> {
+    pub async fn send(&self, msg: M, peer: SocketAddr) -> Result<(), Error>
+    where
+        M: Encode,
+    {
         self.inner.send_msg(&msg, peer, true).await
     }
 
@@ -380,7 +373,10 @@ impl<M: Message> ZudpSocket<M> {
     ///
     /// # Errors
     /// Returns `Err` on I/O failure.
-    pub async fn send_unreliable(&self, msg: M, peer: SocketAddr) -> Result<(), Error> {
+    pub async fn send_unreliable(&self, msg: M, peer: SocketAddr) -> Result<(), Error>
+    where
+        M: Encode,
+    {
         self.inner.send_msg(&msg, peer, false).await
     }
 
@@ -388,10 +384,13 @@ impl<M: Message> ZudpSocket<M> {
     ///
     /// # Errors
     /// Returns `Err(Error::ChannelClosed)` if the engine task has stopped.
-    pub async fn recv(&mut self) -> Result<(M, SocketAddr), Error> {
+    pub async fn recv(&mut self) -> Result<(M, SocketAddr), Error>
+    where
+        M: Decode,
+    {
         loop {
             let (bytes, from) = self.rx.recv().await.ok_or(Error::ChannelClosed)?;
-            match bitcode::decode::<M>(&bytes) {
+            match M::decode_from_bytes(&bytes) {
                 Ok(msg) => return Ok((msg, from)),
                 Err(e) => {
                     tracing::warn!(target: "zudp", peer = %from, "decode failed: {e}");
@@ -405,14 +404,14 @@ impl<M: Message> ZudpSocket<M> {
 
 /// A ZUDP socket bound to a single remote peer.
 ///
-/// Created by [`ZudpBuilder::connect`].
+/// Created by [`Zudp::connect`].
 /// `send()` and `recv()` target `peer` exclusively.
 pub struct ZudpConn<M> {
     socket: ZudpSocket<M>,
     peer: SocketAddr,
 }
 
-impl<M: Message> ZudpConn<M> {
+impl<M> ZudpConn<M> {
     /// Remote peer address.
     #[must_use]
     pub fn peer(&self) -> SocketAddr {
@@ -432,7 +431,10 @@ impl<M: Message> ZudpConn<M> {
     ///
     /// # Errors
     /// Returns `Err` on I/O failure or if the message is too large to fragment.
-    pub async fn send(&self, msg: M) -> Result<(), Error> {
+    pub async fn send(&self, msg: M) -> Result<(), Error>
+    where
+        M: Encode,
+    {
         self.socket.send(msg, self.peer).await
     }
 
@@ -440,7 +442,10 @@ impl<M: Message> ZudpConn<M> {
     ///
     /// # Errors
     /// Returns `Err` on I/O failure.
-    pub async fn send_unreliable(&self, msg: M) -> Result<(), Error> {
+    pub async fn send_unreliable(&self, msg: M) -> Result<(), Error>
+    where
+        M: Encode,
+    {
         self.socket.send_unreliable(msg, self.peer).await
     }
 
@@ -450,7 +455,10 @@ impl<M: Message> ZudpConn<M> {
     ///
     /// # Errors
     /// Returns `Err(Error::ChannelClosed)` if the engine task has stopped.
-    pub async fn recv(&mut self) -> Result<M, Error> {
+    pub async fn recv(&mut self) -> Result<M, Error>
+    where
+        M: Decode,
+    {
         loop {
             let (msg, from) = self.socket.recv().await?;
             if from == self.peer {

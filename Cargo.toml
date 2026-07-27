@@ -5,10 +5,17 @@ edition = "2024"
 description = "Zero-overhead UDP protocol with optional reliability, fragmentation, and relay support"
 license = "MIT"
 
+[features]
+default = ["bitcode"]
+bitcode = ["dep:bitcode"]
+serde = ["dep:serde", "dep:postcard"]
+
 [dependencies]
 tokio = { version = "1", features = ["net", "sync", "rt-multi-thread", "macros", "time"] }
 bytes = "1"
-bitcode = { version = "0.6", features = ["derive"] }
+bitcode = { version = "0.6", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+postcard = { version = "1", features = ["alloc"], optional = true }
 thiserror = "2"
 tracing = "0.1"
 socket2 = { version = "0.5", features = ["all"] }
