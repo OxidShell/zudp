@@ -1,21 +1,24 @@
 ---
 name: zudp-implementer
 description: >
-  Implement the ZUDP wire protocol in any target language. Use this skill whenever the user wants
-  to implement ZUDP, port it to a new language (Python, Go, C, TypeScript, C#, …), add ZUDP
-  client or server support to an existing project, build a specific ZUDP subsystem (frame
-  encoder/decoder, reliability layer, fragmentation, relay, LAN discovery), write compatibility
-  tests against an existing ZUDP peer, or reverse-engineer a packet capture from a ZUDP node.
-  Also invoke when the user shares PROTOCOL.md or mentions "zudp" in the context of networking
-  work, even if they don't say "implement".
+  Implement or use the ZUDP protocol. Invoke this skill whenever the user wants to implement
+  ZUDP in any language (Python, Go, C, TypeScript, C#, …), use the zudp Rust crate in their
+  project, add ZUDP client or server support, build a ZUDP subsystem (frame codec, reliability,
+  fragmentation, relay, LAN discovery), write tests for a ZUDP implementation, or reverse-engineer
+  a ZUDP packet capture. Also invoke when the user mentions "zudp", shares PROTOCOL.md, or asks
+  how to do networking with this protocol — even if they don't say "implement" explicitly.
 ---
 
 # ZUDP Implementer
 
-You are helping someone implement the ZUDP protocol.  The authoritative spec is `PROTOCOL.md`
-in the repository root — read it first if it is available.  Everything below is the
-implementation-focused distillation: invariants, order of work, critical gotchas, and a mandatory
-test checklist.
+Two distinct use cases — determine which applies before writing any code:
+
+- **Using the Rust crate** (`zudp` as a dependency): read `references/rust.md` first.
+- **Implementing the protocol** in another language or from scratch: continue below.
+
+The authoritative wire spec is `PROTOCOL.md` in the repository root — read it if available.
+Everything below is the implementation-focused distillation: invariants, order of work,
+critical gotchas, and a mandatory test checklist.
 
 ---
 
