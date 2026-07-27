@@ -17,9 +17,8 @@ async fn main() -> anyhow::Result<()> {
     // Spawn server
     let server_task = tokio::spawn(async {
         let mut server = Zudp::default()
-            .messages::<Msg>()
             .port(7700)
-            .listen()
+            .listen::<Msg>()
             .await
             .expect("server bind failed");
 
@@ -39,11 +38,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let peer: SocketAddr = "127.0.0.1:7700".parse()?;
-    let mut client = Zudp::default()
-        .messages::<Msg>()
-        .port(0)
-        .connect(peer)
-        .await?;
+    let mut client = Zudp::default().port(0).connect::<Msg>(peer).await?;
 
     println!("client bound on {}", client.local_addr()?);
     client.send(Msg::Ping).await?;

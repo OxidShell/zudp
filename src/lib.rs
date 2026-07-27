@@ -14,12 +14,12 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     // Multi-peer socket
-//!     let mut socket = Zudp::default().messages::<Msg>().port(5000).listen().await?;
+//!     // Multi-peer socket — type on the terminal call
+//!     let mut socket = Zudp::default().port(5000).listen::<Msg>().await?;
 //!     let (msg, from) = socket.recv().await?;
 //!
 //!     // Single-peer connection
-//!     let mut conn = Zudp::default().messages::<Msg>().port(0).connect("1.2.3.4:5000".parse()?).await?;
+//!     let mut conn = Zudp::default().port(0).connect::<Msg>("1.2.3.4:5000".parse()?).await?;
 //!     conn.send(Msg::Ping).await?;
 //!     let reply = conn.recv().await?;
 //!     Ok(())
@@ -97,27 +97,23 @@ impl Default for Config {
     }
 }
 
-// ── Type-erased builder (no message type yet) ─────────────────────────────────
+// ── Builder ───────────────────────────────────────────────────────────────────
 
 /// Entry point for constructing a ZUDP socket.
 ///
-/// Call `.messages::<YourType>()` to attach a message type and transition
-/// to [`ZudpBuilder`], which has the terminal `.listen()` / `.connect()` methods.
-///
-/// You can also set configuration options in any order before or after attaching
-/// the message type.
+/// Chain configuration methods, then call `.listen::<M>()` or `.connect::<M>(peer)`.
+/// The message type `M` can also be inferred from a variable annotation:
 ///
 /// ```rust,no_run
-/// # use zudp::Zudp;
+/// # use zudp::{Zudp, ZudpSocket};
 /// # use bitcode::{Encode, Decode};
 /// # #[derive(Encode, Decode)] enum Msg { Hi }
 /// # async fn f() -> Result<(), zudp::Error> {
-/// let socket = Zudp::default()
-///     .port(1234)
-///     .reliable(true)
-///     .messages::<Msg>()
-///     .listen()
-///     .await?;
+/// // turbofish on the terminal call
+/// let socket = Zudp::default().port(1234).listen::<Msg>().await?;
+///
+/// // or inferred from the type annotation
+/// let socket: ZudpSocket<Msg> = Zudp::default().port(1234).listen().await?;
 /// # Ok(()) }
 /// ```
 #[derive(Clone, Default)]
@@ -171,68 +167,11 @@ impl Zudp {
         self
     }
 
-    /// Attach a message type and transition to [`ZudpBuilder<M>`].
-    #[must_use]
-    pub fn messages<M: Message>(self) -> ZudpBuilder<M> {
-        ZudpBuilder {
-            config: self.config,
-            _phantom: PhantomData,
-        }
-    }
-}
-
-// ── Typed builder ─────────────────────────────────────────────────────────────
-
-/// A [`Zudp`] builder with a concrete message type attached.
-///
-/// Call `.listen()` for a multi-peer socket or `.connect(peer)` for a single-peer connection.
-pub struct ZudpBuilder<M> {
-    config: Config,
-    _phantom: PhantomData<fn() -> M>,
-}
-
-impl<M: Message> ZudpBuilder<M> {
-    #[must_use]
-    pub fn port(mut self, port: u16) -> Self {
-        self.config.port = port;
-        self
-    }
-
-    #[must_use]
-    pub fn bind_ip(mut self, ip: IpAddr) -> Self {
-        self.config.bind_ip = ip;
-        self
-    }
-
-    #[must_use]
-    pub fn reliable(mut self, enabled: bool) -> Self {
-        self.config.reliable = enabled;
-        self
-    }
-
-    #[must_use]
-    pub fn keepalive_interval(mut self, interval: Duration) -> Self {
-        self.config.keepalive_interval = interval;
-        self
-    }
-
-    #[must_use]
-    pub fn mtu(mut self, bytes: usize) -> Self {
-        self.config.mtu = bytes;
-        self
-    }
-
-    #[must_use]
-    pub fn relay(mut self, relay_addr: SocketAddr) -> Self {
-        self.config.relay_addr = Some(relay_addr);
-        self
-    }
-
     /// Bind and start listening for packets from any peer.
     ///
     /// # Errors
     /// Returns `Err` if the OS refuses to bind the requested address/port.
-    pub async fn listen(self) -> Result<ZudpSocket<M>, Error> {
+    pub async fn listen<M: Message>(self) -> Result<ZudpSocket<M>, Error> {
         ZudpSocket::new(self.config).await
     }
 
@@ -243,7 +182,7 @@ impl<M: Message> ZudpBuilder<M> {
     ///
     /// # Errors
     /// Returns `Err` if the OS refuses to bind the requested address/port.
-    pub async fn connect(self, peer: SocketAddr) -> Result<ZudpConn<M>, Error> {
+    pub async fn connect<M: Message>(self, peer: SocketAddr) -> Result<ZudpConn<M>, Error> {
         let socket = ZudpSocket::new(self.config).await?;
         Ok(ZudpConn { socket, peer })
     }
