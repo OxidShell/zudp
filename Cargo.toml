@@ -8,6 +8,7 @@ repository = "https://github.com/OxidShell/zudp"
 homepage = "https://github.com/OxidShell/zudp"
 documentation = "https://docs.rs/zudp"
 readme = "README.md"
+exclude = ["skill/"]
 keywords = ["udp", "networking", "gamedev", "relay", "protocol"]
 categories = ["network-programming", "game-development", "asynchronous"]
 
