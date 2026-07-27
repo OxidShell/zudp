@@ -21,3 +21,7 @@ tracing-subscriber = "0.3"
 [[example]]
 name = "ping_pong"
 path = "examples/ping_pong.rs"
+
+[[example]]
+name = "advanced"
+path = "examples/advanced.rs"
