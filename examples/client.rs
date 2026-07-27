@@ -42,7 +42,10 @@ async fn main() -> anyhow::Result<()> {
 
     for seq in 1..=count {
         let sent_at = now_us();
-        conn.send(Msg::Ping { sent_at_us: sent_at }).await?;
+        conn.send(Msg::Ping {
+            sent_at_us: sent_at,
+        })
+        .await?;
 
         match tokio::time::timeout(Duration::from_secs(2), conn.recv()).await {
             Err(_) => println!("#{seq:>3}  timeout"),

@@ -12,7 +12,7 @@ use bytes::{Bytes, BytesMut};
 use parking_lot::RwLock;
 use tokio::{net::UdpSocket, task::AbortHandle, time};
 
-use crate::{frame::Frame, Decode, Encode, Error};
+use crate::{Decode, Encode, Error, frame::Frame};
 
 const PROTO_VER: u16 = 1;
 
@@ -270,8 +270,16 @@ impl Discovery {
         let meta = Arc::new(RwLock::new(cfg.meta));
         let meta_arc = meta.clone();
 
-        let jh = tokio::spawn(run_advertise(socket, cfg.app_id.raw(), cfg.data_port, meta_arc));
-        Ok(AdvertiseHandle { meta, abort: jh.abort_handle() })
+        let jh = tokio::spawn(run_advertise(
+            socket,
+            cfg.app_id.raw(),
+            cfg.data_port,
+            meta_arc,
+        ));
+        Ok(AdvertiseHandle {
+            meta,
+            abort: jh.abort_handle(),
+        })
     }
 
     /// Open a continuous scan for peers with a matching app ID.
@@ -281,16 +289,21 @@ impl Discovery {
     ///
     /// # Errors
     /// Returns `Err` if binding or the initial probe broadcast fails.
-    pub async fn scan_stream<M>(config: impl Into<DiscoveryConfig<()>>) -> Result<ScanStream<M>, Error>
+    pub async fn scan_stream<M>(
+        config: impl Into<DiscoveryConfig<()>>,
+    ) -> Result<ScanStream<M>, Error>
     where
         M: Decode,
     {
         let cfg = config.into();
         let socket = Arc::new(bind_discovery_socket(cfg.discovery_port)?);
-        let broadcast_addr =
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), cfg.discovery_port);
+        let broadcast_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), cfg.discovery_port);
 
-        let probe = Frame::Probe { app_id: cfg.app_id.raw(), proto_ver: PROTO_VER }.encode();
+        let probe = Frame::Probe {
+            app_id: cfg.app_id.raw(),
+            proto_ver: PROTO_VER,
+        }
+        .encode();
         socket.send_to(&probe, broadcast_addr).await?;
 
         let mut ticker = time::interval(cfg.probe_interval);
@@ -320,11 +333,14 @@ impl Discovery {
     {
         let cfg = config.into();
         let socket = bind_discovery_socket(cfg.discovery_port)?;
-        let broadcast_addr =
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), cfg.discovery_port);
+        let broadcast_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), cfg.discovery_port);
         let app_id = cfg.app_id.raw();
 
-        let probe = Frame::Probe { app_id, proto_ver: PROTO_VER }.encode();
+        let probe = Frame::Probe {
+            app_id,
+            proto_ver: PROTO_VER,
+        }
+        .encode();
         socket.send_to(&probe, broadcast_addr).await?;
 
         let mut peers = Vec::new();
@@ -339,13 +355,23 @@ impl Discovery {
             match time::timeout(remaining, recv_frame(&socket)).await {
                 Err(_elapsed) => break,
                 Ok(Err(e)) => return Err(e),
-                Ok(Ok((Frame::Beacon { app_id: bid, proto_ver, data_port, meta }, from)))
-                    if bid == app_id && proto_ver == PROTO_VER =>
-                {
+                Ok(Ok((
+                    Frame::Beacon {
+                        app_id: bid,
+                        proto_ver,
+                        data_port,
+                        meta,
+                    },
+                    from,
+                ))) if bid == app_id && proto_ver == PROTO_VER => {
                     let data_addr = SocketAddr::new(from.ip(), data_port);
                     if seen.insert(data_addr) {
                         let meta = M::decode_from_bytes(&meta)?;
-                        peers.push(DiscoveredPeer { from, data_addr, meta });
+                        peers.push(DiscoveredPeer {
+                            from,
+                            data_addr,
+                            meta,
+                        });
                     }
                 }
                 Ok(Ok(_)) => {}
@@ -396,7 +422,11 @@ async fn run_advertise<M: Encode + Send + Sync + 'static>(
             }
         };
 
-        let Frame::Probe { app_id: pid, proto_ver } = frame else {
+        let Frame::Probe {
+            app_id: pid,
+            proto_ver,
+        } = frame
+        else {
             continue;
         };
         if pid != app_id || proto_ver != PROTO_VER {
@@ -411,8 +441,13 @@ async fn run_advertise<M: Encode + Send + Sync + 'static>(
             }
         };
 
-        let beacon =
-            Frame::Beacon { app_id, proto_ver: PROTO_VER, data_port, meta: meta_bytes }.encode();
+        let beacon = Frame::Beacon {
+            app_id,
+            proto_ver: PROTO_VER,
+            data_port,
+            meta: meta_bytes,
+        }
+        .encode();
 
         if let Err(e) = socket.send_to(&beacon, from).await {
             tracing::warn!(target: "zudp::discovery", %from, "beacon send failed: {e}");

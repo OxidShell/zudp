@@ -43,7 +43,10 @@ impl FragAssembler {
             started_at: Instant::now(),
         });
 
-        if assembly.pieces[frag_idx as usize].replace(payload).is_none() {
+        if assembly.pieces[frag_idx as usize]
+            .replace(payload)
+            .is_none()
+        {
             assembly.received += 1;
         }
 

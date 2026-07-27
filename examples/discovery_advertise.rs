@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use bitcode::{Decode, Encode};
-use zudp::{DiscoveryConfig, Discovery};
+use zudp::{Discovery, DiscoveryConfig};
 
 #[derive(Debug, Clone, Encode, Decode)]
 struct GameInfo {
@@ -26,7 +26,10 @@ async fn main() -> anyhow::Result<()> {
 
     let handle = Discovery::advertise(cfg)?;
 
-    println!("advertising '{}' on data port 7700 — run discovery_scan to find this node", info.name);
+    println!(
+        "advertising '{}' on data port 7700 — run discovery_scan to find this node",
+        info.name
+    );
     println!("press Ctrl-C to stop");
 
     // Hot-swap the metadata after 5 seconds to show set_meta works.

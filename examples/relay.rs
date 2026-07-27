@@ -25,15 +25,21 @@ async fn main() {
         .init();
 
     let relay_handle = tokio::spawn(async {
-        let _relay: ZudpSocket<Msg> =
-            Zudp::default().port(7800).listen().await.expect("relay bind");
+        let _relay: ZudpSocket<Msg> = Zudp::default()
+            .port(7800)
+            .listen()
+            .await
+            .expect("relay bind");
         println!("relay: listening on 127.0.0.1:7800");
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     });
 
     let server_task = tokio::spawn(async {
-        let mut server: ZudpSocket<Msg> =
-            Zudp::default().port(7801).listen().await.expect("server bind");
+        let mut server: ZudpSocket<Msg> = Zudp::default()
+            .port(7801)
+            .listen()
+            .await
+            .expect("server bind");
 
         let (msg, apparent_from) = server.recv().await.expect("recv");
         println!(

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use bitcode::{Decode, Encode};
-use zudp::{DiscoveryConfig, Discovery};
+use zudp::{Discovery, DiscoveryConfig};
 
 #[derive(Debug, Clone, Encode, Decode)]
 struct GameInfo {

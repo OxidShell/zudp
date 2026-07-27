@@ -19,12 +19,19 @@ async fn main() {
         .init();
 
     let server_task = tokio::spawn(async {
-        let mut server: ZudpSocket<Msg> =
-            Zudp::default().port(7701).listen().await.expect("server bind");
+        let mut server: ZudpSocket<Msg> = Zudp::default()
+            .port(7701)
+            .listen()
+            .await
+            .expect("server bind");
 
         let (msg, from) = server.recv().await.expect("recv");
         let Msg::LargeData(data) = msg;
-        println!("server: received {} bytes from {} — reassembly OK", data.len(), from);
+        println!(
+            "server: received {} bytes from {} — reassembly OK",
+            data.len(),
+            from
+        );
         assert_eq!(data.len(), 50_000);
         assert!(data.iter().all(|&b| b == 0xAB));
     });
@@ -32,12 +39,21 @@ async fn main() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let server: SocketAddr = "127.0.0.1:7701".parse().unwrap();
-    let client = Zudp::default().port(0).connect::<Msg>(server).await.unwrap();
+    let client = Zudp::default()
+        .port(0)
+        .connect::<Msg>(server)
+        .await
+        .unwrap();
 
     let payload = vec![0xABu8; 50_000];
     let mtu = 1400usize;
     let frags = payload.len().div_ceil(mtu);
-    println!("client: sending {} bytes → {} fragments of {} bytes", payload.len(), frags, mtu);
+    println!(
+        "client: sending {} bytes → {} fragments of {} bytes",
+        payload.len(),
+        frags,
+        mtu
+    );
     client.send(Msg::LargeData(payload)).await.unwrap();
 
     server_task.await.unwrap();
