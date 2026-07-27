@@ -53,3 +53,11 @@ required-features = ["discovery"]
 name = "discovery_scan"
 path = "examples/discovery_scan.rs"
 required-features = ["discovery"]
+
+[[example]]
+name = "server"
+path = "examples/server.rs"
+
+[[example]]
+name = "client"
+path = "examples/client.rs"
