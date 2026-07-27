@@ -265,18 +265,20 @@ impl Inner {
             };
             self.engine.socket.send_to(&wire, actual_dest).await?;
             peer.record_sent(seq, frame);
-        } else {
+        } else if wrap_relay {
             let frame = Frame::Datagram(payload).encode();
-            let wire = if wrap_relay {
-                Frame::Relay {
-                    dest: peer_addr,
-                    inner: frame,
-                }
-                .encode()
-            } else {
-                frame
-            };
+            let wire = Frame::Relay { dest: peer_addr, inner: frame }.encode();
             self.engine.socket.send_to(&wire, actual_dest).await?;
+        } else {
+            // Scatter-gather: send payload + 1-byte type tag without copying payload.
+            let type_tag = [frame::TYPE_DATAGRAM];
+            self.engine
+                .socket
+                .send_to_vectored(
+                    &[std::io::IoSlice::new(&payload), std::io::IoSlice::new(&type_tag)],
+                    actual_dest,
+                )
+                .await?;
         }
         Ok(())
     }

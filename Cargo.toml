@@ -17,7 +17,7 @@ bitcode = ["dep:bitcode"]
 serde = ["dep:serde", "dep:postcard"]
 
 [dependencies]
-tokio = { version = "1", features = ["net", "sync", "rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["net", "sync", "rt-multi-thread", "macros", "time", "io-util"] }
 bytes = "1"
 bitcode = { version = "0.6", features = ["derive"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }

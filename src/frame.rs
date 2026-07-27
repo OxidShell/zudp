@@ -22,7 +22,7 @@ pub const MAX_NACK_SEQS: usize = 128;
 /// ```
 ///
 /// The frame type byte is always last, making parsing O(1) from the tail.
-const TYPE_DATAGRAM: u8 = 0x00;
+pub(crate) const TYPE_DATAGRAM: u8 = 0x00;
 const TYPE_STREAM: u8 = 0x01;
 const TYPE_NACK: u8 = 0x02;
 const TYPE_PING: u8 = 0x03;

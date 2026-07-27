@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use bytes::BytesMut;
-use tokio::net::UdpSocket;
+use tokio::{io::Interest, net::UdpSocket};
 
 const RECV_BUF_LEN: usize = 65_536;
 
@@ -44,10 +44,32 @@ impl RawSocket {
         Ok(())
     }
 
+    /// Send scatter-gather buffers to `addr` in a single syscall (no payload copy).
+    pub async fn send_to_vectored(
+        &self,
+        bufs: &[std::io::IoSlice<'_>],
+        addr: SocketAddr,
+    ) -> Result<(), crate::Error> {
+        let sock_addr = socket2::SockAddr::from(addr);
+        loop {
+            self.inner.writable().await?;
+            match self.inner.try_io(Interest::WRITABLE, || {
+                socket2::SockRef::from(&*self.inner).send_to_vectored(bufs, &sock_addr)
+            }) {
+                Ok(_) => return Ok(()),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Receive into a fresh buffer without zero-initialising it first.
+    ///
+    /// `recv_buf_from` uses `ReadBuf` internally, which writes only into uninit
+    /// spare capacity and marks exactly the received bytes as initialised.
     pub async fn recv_from(&self) -> Result<(BytesMut, SocketAddr), crate::Error> {
-        let mut buf = BytesMut::zeroed(RECV_BUF_LEN);
-        let (len, addr) = self.inner.recv_from(&mut buf).await?;
-        buf.truncate(len);
+        let mut buf = BytesMut::with_capacity(RECV_BUF_LEN);
+        let (_, addr) = self.inner.recv_buf_from(&mut buf).await?;
         Ok((buf, addr))
     }
 
