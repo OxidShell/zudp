@@ -139,10 +139,6 @@ async fn handle_incoming(
             }
         }
 
-        Frame::Pong { .. } => {
-            // last_seen already updated above; nothing more to do.
-        }
-
         Frame::Fragment {
             msg_id,
             frag_idx,
@@ -187,6 +183,9 @@ async fn handle_incoming(
                 tracing::warn!(target: "zudp::engine", %dest, "relay forward failed: {e}");
             }
         }
+
+        // last_seen already bumped above; nothing more to do for these.
+        Frame::Pong { .. } | Frame::Probe { .. } | Frame::Beacon { .. } => {}
     }
 }
 

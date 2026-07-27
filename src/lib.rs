@@ -26,6 +26,8 @@
 //! ```
 
 mod codec;
+#[cfg(feature = "discovery")]
+mod discovery;
 mod engine;
 mod error;
 mod frag;
@@ -34,6 +36,8 @@ mod peer;
 mod socket;
 
 pub use codec::{Decode, Encode};
+#[cfg(feature = "discovery")]
+pub use discovery::{AdvertiseHandle, AppId, DiscoveredPeer, DiscoveryConfig, Discovery, ScanStream, DISCOVERY_PORT};
 pub use error::Error;
 
 use std::{

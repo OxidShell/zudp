@@ -19,6 +19,9 @@ pub const MAX_NACK_SEQS: usize = 128;
 ///                      [frag_idx: u16 BE][seq: u64 BE][0x05]           (17 bytes)
 /// Relay(v4) : [inner][port: u16 BE][ip: 4 bytes][0x00][0x06]          (8 bytes)
 /// Relay(v6) : [inner][port: u16 BE][ip: 16 bytes][0x01][0x06]         (20 bytes)
+/// Probe     : [app_id: u64 BE][proto_ver: u16 BE][0x07]                (11 bytes)
+/// Beacon    : [meta bytes][data_port: u16 BE][proto_ver: u16 BE]
+///                         [app_id: u64 BE][0x08]                       (13 + meta bytes)
 /// ```
 ///
 /// The frame type byte is always last, making parsing O(1) from the tail.
@@ -29,6 +32,8 @@ const TYPE_PING: u8 = 0x03;
 const TYPE_PONG: u8 = 0x04;
 const TYPE_FRAGMENT: u8 = 0x05;
 const TYPE_RELAY: u8 = 0x06;
+const TYPE_PROBE: u8 = 0x07;
+const TYPE_BEACON: u8 = 0x08;
 
 const ADDR_V4: u8 = 0x00;
 const ADDR_V6: u8 = 0x01;
@@ -55,6 +60,10 @@ pub enum Frame {
     },
     /// Relay request: forward `inner` to `dest` unchanged.
     Relay { dest: SocketAddr, inner: Bytes },
+    /// LAN discovery broadcast — asks nodes with matching `app_id` and `proto_ver` to reply.
+    Probe { app_id: u64, proto_ver: u16 },
+    /// LAN discovery reply — unicast answer to a `Probe`, carrying the node's data port and metadata.
+    Beacon { app_id: u64, proto_ver: u16, data_port: u16, meta: Bytes },
 }
 
 impl Frame {
@@ -123,6 +132,22 @@ impl Frame {
                 buf.extend_from_slice(&ip_bytes);
                 buf.put_u8(addr_tag);
                 buf.put_u8(TYPE_RELAY);
+                buf.freeze()
+            }
+            Frame::Probe { app_id, proto_ver } => {
+                let mut buf = BytesMut::with_capacity(11);
+                buf.put_u64(app_id);
+                buf.put_u16(proto_ver);
+                buf.put_u8(TYPE_PROBE);
+                buf.freeze()
+            }
+            Frame::Beacon { app_id, proto_ver, data_port, meta } => {
+                let mut buf = BytesMut::with_capacity(meta.len() + 13);
+                buf.extend_from_slice(&meta);
+                buf.put_u16(data_port);
+                buf.put_u16(proto_ver);
+                buf.put_u64(app_id);
+                buf.put_u8(TYPE_BEACON);
                 buf.freeze()
             }
         }
@@ -197,6 +222,24 @@ impl Frame {
                     tag => return Err(Error::UnknownAddrTag { tag }),
                 };
                 Ok(Frame::Relay { dest, inner: data.freeze() })
+            }
+
+            TYPE_PROBE => {
+                let proto_ver = pop_u16(&mut data)
+                    .ok_or(Error::FrameTruncated { frame: "probe", field: "proto_ver" })?;
+                let app_id = pop_u64(&mut data)
+                    .ok_or(Error::FrameTruncated { frame: "probe", field: "app_id" })?;
+                Ok(Frame::Probe { app_id, proto_ver })
+            }
+
+            TYPE_BEACON => {
+                let app_id = pop_u64(&mut data)
+                    .ok_or(Error::FrameTruncated { frame: "beacon", field: "app_id" })?;
+                let proto_ver = pop_u16(&mut data)
+                    .ok_or(Error::FrameTruncated { frame: "beacon", field: "proto_ver" })?;
+                let data_port = pop_u16(&mut data)
+                    .ok_or(Error::FrameTruncated { frame: "beacon", field: "data_port" })?;
+                Ok(Frame::Beacon { app_id, proto_ver, data_port, meta: data.freeze() })
             }
 
             tag => Err(Error::UnknownFrameType { tag }),
@@ -348,6 +391,36 @@ mod tests {
         };
         assert_eq!(out_dest, dest);
         assert_eq!(out_inner, inner);
+    }
+
+    #[test]
+    fn probe_roundtrip() {
+        let Frame::Probe { app_id, proto_ver } =
+            roundtrip(Frame::Probe { app_id: 0xdead_beef_cafe_babe, proto_ver: 1 })
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(app_id, 0xdead_beef_cafe_babe);
+        assert_eq!(proto_ver, 1);
+    }
+
+    #[test]
+    fn beacon_roundtrip() {
+        let meta = Bytes::from_static(b"hello discovery");
+        let Frame::Beacon { app_id, proto_ver, data_port, meta: out_meta } =
+            roundtrip(Frame::Beacon {
+                app_id: 0xdead_beef_cafe_babe,
+                proto_ver: 1,
+                data_port: 7700,
+                meta: meta.clone(),
+            })
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(app_id, 0xdead_beef_cafe_babe);
+        assert_eq!(proto_ver, 1);
+        assert_eq!(data_port, 7700);
+        assert_eq!(out_meta, meta);
     }
 
     #[test]
