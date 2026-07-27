@@ -1,0 +1,23 @@
+[package]
+name = "zudp"
+version = "0.1.0"
+edition = "2024"
+description = "Zero-overhead UDP protocol with optional reliability, fragmentation, and relay support"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "sync", "rt-multi-thread", "macros", "time"] }
+bytes = "1"
+bitcode = { version = "0.6", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+socket2 = { version = "0.5", features = ["all"] }
+parking_lot = "0.12"
+
+[dev-dependencies]
+anyhow = "1"
+tracing-subscriber = "0.3"
+
+[[example]]
+name = "ping_pong"
+path = "examples/ping_pong.rs"
