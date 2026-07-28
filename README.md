@@ -172,19 +172,6 @@ When the local interface changes (WiFi → mobile, DHCP renew, VPN toggle), ZUDP
 
 Works for client→server topologies where the server has a public IP.  P2P connections where both peers are behind NAT require a relay.
 
-## Codec features
-
-```toml
-zudp = { version = "0.2", default-features = false, features = ["serde"] }
-```
-
-| Feature | Codec | Error type |
-|---|---|---|
-| `bitcode` (default) | bitcode | `bitcode::Error` |
-| `serde` | postcard | `postcard::Error` |
-| both | postcard | `Box<dyn Error>` |
-| neither | manual impls | `Box<dyn Error>` |
-
 ## License
 
 MIT
