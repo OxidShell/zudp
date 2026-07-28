@@ -426,15 +426,40 @@ fn find_or_migrate_peer(
                     recv_states.insert((from, sid), state);
                 }
             }
+            // Path has changed — reset discovered MTU and re-probe.
+            peer.set_effective_mtu(0);
+            spawn_mtu_probe(inner, from);
         }
         return peer;
     }
 
-    // First contact: create peer and register session.
+    // First contact: create peer, register session, and discover path MTU.
     let peer = inner.get_or_create_peer(from);
     peer.store_their_session_id(session_id);
     inner.sessions.write().insert(session_id, peer.clone());
+    spawn_mtu_probe(inner, from);
     peer
+}
+
+/// Fire-and-forget PLPMTUD probe toward `peer_addr`.
+///
+/// Spawned on first contact and on every migration so the server always knows the usable path
+/// MTU — not just the client side (which probes inside `connect()`).
+fn spawn_mtu_probe(inner: &Arc<EngineInner>, peer_addr: SocketAddr) {
+    let inner = inner.clone();
+    let initial_mtu = inner.config.mtu;
+    let _mtu_probe = tokio::spawn(async move {
+        let discovered = crate::mtu::probe(&inner, peer_addr, initial_mtu).await;
+        if let Some(p) = inner.peers.read().get(&peer_addr) {
+            p.set_effective_mtu(discovered);
+        }
+        tracing::info!(
+            target: "zudp::mtu",
+            peer = %peer_addr,
+            mtu = discovered,
+            "path MTU discovered"
+        );
+    });
 }
 
 /// If the peer has an established Noise channel, re-encrypt the plain frame; otherwise send as-is.
