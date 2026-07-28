@@ -20,6 +20,12 @@ use parking_lot::{Mutex, RwLock};
 use crate::security::SecureChannel;
 use crate::cc::CongestionCtrl;
 
+/// Per-stream send-buffer frame cap.
+///
+/// At 1 400 B/frame and 1 024 frames, this is ~1.4 MB per stream per peer before pruning
+/// starts.  Frames are dropped in sequence order (oldest first) via `BTreeMap::pop_first`.
+const MAX_SENT_FRAMES_PER_STREAM: usize = 1_024;
+
 // ── Send-side ────────────────────────────────────────────────────────────────
 
 /// A fully encoded frame retained for NACK-triggered retransmission.
@@ -58,6 +64,13 @@ pub struct PeerState {
     /// `connect()` awaits this so it never returns before encryption is active.
     #[cfg(feature = "security")]
     pub channel_ready: tokio::sync::Notify,
+    // ── Metrics ──────────────────────────────────────────────────────────────
+    /// Total bytes received from this peer (payload bytes, not wire bytes).
+    pub rx_bytes: AtomicU64,
+    /// Total bytes sent to this peer (payload bytes, not wire bytes).
+    pub tx_bytes: AtomicU64,
+    /// Number of frames retransmitted due to NACKs from this peer.
+    pub retransmit_count: AtomicU64,
 }
 
 impl PeerState {
@@ -81,6 +94,9 @@ impl PeerState {
             channel: OnceLock::new(),
             #[cfg(feature = "security")]
             channel_ready: tokio::sync::Notify::new(),
+            rx_bytes: AtomicU64::new(0),
+            tx_bytes: AtomicU64::new(0),
+            retransmit_count: AtomicU64::new(0),
         }
     }
 
@@ -122,11 +138,23 @@ impl PeerState {
     }
 
     pub fn record_sent(&self, stream_id: u16, seq: u64, frame: Bytes) {
-        self.sent
-            .lock()
-            .entry(stream_id)
-            .or_default()
-            .insert(seq, SentPacket { frame, sent_at: Instant::now() });
+        self.tx_bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
+        let mut map = self.sent.lock();
+        let stream_buf = map.entry(stream_id).or_default();
+        // Evict the oldest frame before inserting if the per-stream cap is reached.
+        if stream_buf.len() >= MAX_SENT_FRAMES_PER_STREAM
+            && let Some((evicted_seq, _)) = stream_buf.pop_first()
+        {
+            tracing::warn!(
+                target: "zudp::peer",
+                stream_id,
+                evicted_seq,
+                cap = MAX_SENT_FRAMES_PER_STREAM,
+                "sent buffer full — evicting oldest frame (NACK for it will not retransmit)"
+            );
+        }
+        stream_buf.insert(seq, SentPacket { frame, sent_at: Instant::now() });
+        drop(map);
         *self.last_sent.lock() = Instant::now();
     }
 
@@ -135,9 +163,13 @@ impl PeerState {
         let Some(stream_buf) = map.get(&stream_id) else {
             return vec![];
         };
-        seqs.iter()
+        let frames: Vec<(u64, Bytes)> = seqs
+            .iter()
             .filter_map(|seq| stream_buf.get(seq).map(|p| (*seq, p.frame.clone())))
-            .collect()
+            .collect();
+        self.retransmit_count
+            .fetch_add(frames.len() as u64, Ordering::Relaxed);
+        frames
     }
 
     pub fn prune_sent(&self, max_age: Duration) {

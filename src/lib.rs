@@ -54,6 +54,40 @@ pub use error::Error;
 #[cfg(feature = "security")]
 pub use security::Keypair;
 
+/// Per-peer statistics snapshot.  Returned by [`ZudpSocket::peer_stats`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct PeerStats {
+    /// Smoothed round-trip time.  `None` until the first Pong is received.
+    pub srtt: Option<Duration>,
+    /// `srtt / min_rtt`: near 1.0 = clear path; >1.25 = queue building.  `None` until first RTT sample.
+    pub congestion_factor: Option<f64>,
+    /// Current BBR-lite pacing rate estimate in bytes/second.
+    pub pacing_rate_bps: u64,
+    /// Total application payload bytes received from this peer.
+    pub rx_bytes: u64,
+    /// Total application payload bytes sent to this peer.
+    pub tx_bytes: u64,
+    /// Number of frames retransmitted due to NACKs from this peer.
+    pub retransmit_count: u64,
+}
+
+/// Engine-wide drop counters.  Returned by [`ZudpSocket::engine_stats`].
+///
+/// All counters are monotonically increasing since the socket was created.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct EngineStats {
+    /// Packets dropped because the source IP exceeded the configured per-IP rate limit.
+    pub dropped_rate_limited: u64,
+    /// New peers rejected because the peer table was full (triggers LRU eviction).
+    pub dropped_peer_cap: u64,
+    /// Relay frames dropped because the source IP was not in the allowlist.
+    pub dropped_relay_blocked: u64,
+    /// Relay frames dropped because the relay routing table was full.
+    pub dropped_relay_cap: u64,
+}
+
 /// A message received from a ZUDP socket, together with its origin and stream.
 ///
 /// Returned by [`ZudpSocket::recv`] and [`ZudpConn::recv`].
@@ -98,7 +132,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU64, AtomicU32, Ordering},
     },
     time::Duration,
 };
@@ -381,6 +415,14 @@ impl Inner {
             #[cfg(feature = "security")]
             keypair: config.security.clone(),
             shutdown_reason: parking_lot::Mutex::new(None),
+            dropped_rate_limited: AtomicU64::new(0),
+            dropped_peer_cap: AtomicU64::new(0),
+            dropped_relay_blocked: AtomicU64::new(0),
+            dropped_relay_cap: AtomicU64::new(0),
+            relay_policy: RwLock::new(engine::RelayPolicy {
+                allowlist: config.relay_allowlist.clone(),
+                max_entries: config.max_relay_entries,
+            }),
         });
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let rx = engine::spawn(engine.clone(), shutdown_rx);
@@ -649,6 +691,49 @@ impl<M> ZudpSocket<M> {
         self.inner.engine.peers.read().get(&peer)?.cc.lock().congestion_factor()
     }
 
+    /// Full statistics snapshot for `peer`.  `None` if the peer is not in the table.
+    #[must_use]
+    pub fn peer_stats(&self, peer: SocketAddr) -> Option<PeerStats> {
+        let p = self.inner.engine.peers.read().get(&peer)?.clone();
+        let (srtt, congestion_factor, pacing_rate_bps) = {
+            let cc = p.cc.lock();
+            // pacing_rate is bounded to [10_000, 100_000_000] — cast is safe.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let rate = cc.pacing_rate() as u64;
+            (cc.srtt(), cc.congestion_factor(), rate)
+        };
+        Some(PeerStats {
+            srtt,
+            congestion_factor,
+            pacing_rate_bps,
+            rx_bytes: p.rx_bytes.load(Ordering::Relaxed),
+            tx_bytes: p.tx_bytes.load(Ordering::Relaxed),
+            retransmit_count: p.retransmit_count.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Engine-wide drop counters since the socket was created.
+    #[must_use]
+    pub fn engine_stats(&self) -> EngineStats {
+        let e = &self.inner.engine;
+        EngineStats {
+            dropped_rate_limited: e.dropped_rate_limited.load(Ordering::Relaxed),
+            dropped_peer_cap: e.dropped_peer_cap.load(Ordering::Relaxed),
+            dropped_relay_blocked: e.dropped_relay_blocked.load(Ordering::Relaxed),
+            dropped_relay_cap: e.dropped_relay_cap.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Update the relay access policy at runtime without rebinding the socket.
+    ///
+    /// - `allowlist`: IPs allowed to submit relay frames.  Pass `vec![]` to allow all.
+    /// - `max_entries`: maximum entries in the relay routing table.
+    pub fn set_relay_policy(&self, allowlist: Vec<IpAddr>, max_entries: usize) {
+        let mut p = self.inner.engine.relay_policy.write();
+        p.allowlist = allowlist;
+        p.max_entries = max_entries;
+    }
+
     /// Send a reliable, ordered message to `peer` on stream 0.
     ///
     /// Reliability uses NACK-based retransmission. For fire-and-forget,
@@ -782,6 +867,18 @@ impl<M> ZudpConn<M> {
     #[must_use]
     pub fn congestion_factor(&self) -> Option<f64> {
         self.socket.peer_congestion_factor(self.peer())
+    }
+
+    /// Full statistics snapshot for the bound peer.
+    #[must_use]
+    pub fn peer_stats(&self) -> Option<PeerStats> {
+        self.socket.peer_stats(self.peer())
+    }
+
+    /// Engine-wide drop counters since the socket was created.
+    #[must_use]
+    pub fn engine_stats(&self) -> EngineStats {
+        self.socket.engine_stats()
     }
 
     /// Send a reliable, ordered message to the bound peer on stream 0.

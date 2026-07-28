@@ -1,4 +1,12 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use bytes::{Bytes, BytesMut};
 use parking_lot::{Mutex, RwLock};
@@ -11,6 +19,14 @@ use crate::{
     peer::{Inbound, PeerState, RecvState},
     socket::RawSocket,
 };
+
+/// Runtime-mutable relay access control, updateable without socket rebind.
+pub struct RelayPolicy {
+    /// IP allowlist for relay frame sources.  Empty = allow all.
+    pub allowlist: Vec<std::net::IpAddr>,
+    /// Maximum entries in the relay routing table.
+    pub max_entries: usize,
+}
 
 /// Maximum concurrent NACK retransmit tasks across the engine.
 ///
@@ -32,6 +48,13 @@ pub(crate) struct EngineInner {
     /// Set by the engine task before it exits; callers read this to distinguish a
     /// clean shutdown from an unexpected crash (rebind failure, etc.).
     pub shutdown_reason: Mutex<Option<String>>,
+    // ── Capacity drop counters (monotonically increasing, read via engine_stats()) ──
+    pub dropped_rate_limited: AtomicU64,
+    pub dropped_peer_cap: AtomicU64,
+    pub dropped_relay_blocked: AtomicU64,
+    pub dropped_relay_cap: AtomicU64,
+    /// Runtime-mutable relay access policy (allowlist + table cap).
+    pub relay_policy: RwLock<RelayPolicy>,
 }
 
 impl EngineInner {
@@ -53,8 +76,22 @@ impl EngineInner {
             return p.clone();
         }
         if w.len() >= self.config.max_peers {
-            tracing::warn!(target: "zudp::engine", "peer table full — handling {addr} ephemerally");
-            return Arc::new(PeerState::new(addr));
+            // Evict the peer that has been silent the longest (LRU-by-last-seen).
+            // O(n) at cap — happens at most once per new peer beyond the limit.
+            let evict_addr = w
+                .iter()
+                .min_by_key(|(_, p)| *p.last_seen.lock())
+                .map(|(&a, _)| a);
+            if let Some(evict) = evict_addr {
+                tracing::warn!(
+                    target: "zudp::engine",
+                    evicted = %evict,
+                    new = %addr,
+                    "peer table full — evicting least-recently-seen peer"
+                );
+                w.remove(&evict);
+            }
+            self.dropped_peer_cap.fetch_add(1, Ordering::Relaxed);
         }
         let peer = Arc::new(PeerState::new(addr));
         w.insert(addr, peer.clone());
@@ -136,6 +173,7 @@ async fn run(
                             && !rate_limiter.allow(from.ip())
                         {
                             tracing::trace!(target: "zudp::engine", %from, "rate limited");
+                            inner.dropped_rate_limited.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
                         handle_incoming(
@@ -296,6 +334,9 @@ async fn dispatch_frame(
 ) {
     match frame {
         Frame::Datagram(payload) => {
+            if let Some(peer) = inner.peers.read().get(&from).cloned() {
+                peer.rx_bytes.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             let _ = inbound_tx.send((payload, from, 0));
         }
 
@@ -310,8 +351,12 @@ async fn dispatch_frame(
 
             let (ready, nack_seqs) = recv.ingest(seq, Inbound::Data(payload));
             send_nack_if_needed(nack_seqs, stream_id, from, inner).await;
+            let peer = inner.peers.read().get(&from).cloned();
             for item in ready {
                 if let Inbound::Data(bytes) = item {
+                    if let Some(p) = &peer {
+                        p.rx_bytes.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let _ = inbound_tx.send((bytes, from, stream_id));
                 }
             }
@@ -422,6 +467,9 @@ async fn dispatch_frame(
                     && let Some(complete) =
                         frag_assembler.insert(msg_id, frag_idx, frag_total, data)
                 {
+                    if let Some(peer) = inner.peers.read().get(&from).cloned() {
+                        peer.rx_bytes.fetch_add(complete.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let _ = inbound_tx.send((complete, from, stream_id));
                 }
             }
@@ -431,18 +479,21 @@ async fn dispatch_frame(
             dest,
             inner: payload,
         } => {
+            // Read relay policy atomically — policy may be updated at runtime.
+            let (policy_allowlist, policy_max) = {
+                let p = inner.relay_policy.read();
+                (p.allowlist.clone(), p.max_entries)
+            };
             // Allowlist check: if non-empty, only listed IPs may use this node as a relay.
-            if !inner.config.relay_allowlist.is_empty()
-                && !inner.config.relay_allowlist.contains(&from.ip())
-            {
+            if !policy_allowlist.is_empty() && !policy_allowlist.contains(&from.ip()) {
                 tracing::warn!(target: "zudp::engine", %from, "relay denied — not in allowlist");
+                inner.dropped_relay_blocked.fetch_add(1, Ordering::Relaxed);
                 return;
             }
             // Cap relay table size to prevent unbounded memory growth under abuse.
-            if !relay_table.contains_key(&dest)
-                && relay_table.len() >= inner.config.max_relay_entries
-            {
+            if !relay_table.contains_key(&dest) && relay_table.len() >= policy_max {
                 tracing::warn!(target: "zudp::engine", "relay table full — dropping entry for {dest}");
+                inner.dropped_relay_cap.fetch_add(1, Ordering::Relaxed);
                 return;
             }
             // Record client→server mapping so replies from `dest` can be routed back to `from`.
