@@ -173,13 +173,27 @@ if tokens < 0: suggest_sleep = min(−tokens / pacing_rate, 10 ms)
 
 **Exposed metrics**: `srtt(): Option<Duration>`, `congestion_factor(): Option<f64>` (= srtt/min_rtt).
 
+### Per-IP rate limiting
+- One token bucket per source IP address. Tokens refill at `max_pps` per second, cap at `burst = max(max_pps / 5, 1)`.
+- Each accepted packet consumes one token.  If the bucket has fewer than one token, the packet is dropped before frame parsing.
+- Prune idle buckets (no traffic for 60 s) on a background tick to prevent unbounded memory growth.
+- Applied on the receive path only — no rate limiting on sends.
+
+### Peer table cap
+- Track at most `max_peers` distinct remote addresses.
+- When a packet arrives from an unknown address and the table is full, drop the packet without allocating any peer state.
+- Existing peers are unaffected and continue to send/receive normally.
+
 ### Relay (stateful, bidirectional)
 - The relay node is a plain ZUDP socket — no special configuration flag.
 - On receiving `Frame::Relay { dest, inner }` from `client_addr`:
-  1. Update routing table: `relay_table[dest] = client_addr` (upsert, handles migration).
-  2. Forward `inner` verbatim to `dest`.
+  1. If an IP allowlist is configured and `client_addr.ip()` is not in it, drop and return.
+  2. If adding `dest` would exceed `max_relay_entries` and `dest` is not already in the table, drop and return.
+  3. Update routing table: `relay_table[dest] = (client_addr, now)` (upsert, handles migration).
+  4. Forward `inner` verbatim to `dest`.
 - Before decoding any incoming frame, check if `from` is in `relay_table`.  If so, forward the **raw bytes** to `relay_table[from]` and return — do not decode.  This ensures encrypted or opaque server replies are forwarded transparently.
 - The server sees `from == relay_addr`.  Reliable framing is end-to-end.
+- Prune entries idle for more than 300 s on each background tick.
 
 ### Network Migration
 - Each peer has a random `my_session_id` included in every outgoing Ping/Pong.
@@ -283,6 +297,16 @@ Do not mark the implementation done until every item passes.
 - [ ] After handshake, send a reliable message; it arrives decrypted on the other side.
 - [ ] NACK retransmit re-encrypts with a **fresh nonce** (no nonce reuse).
 - [ ] Replay detection: receiving the same `(nonce, ciphertext)` a second time is rejected.
+- [ ] Ping, Pong, Nack, and MtuAck are wrapped in Secure once the channel is established.
+- [ ] Key pinning (correct key): `connect()` succeeds when the pinned key matches the remote's static key.
+- [ ] Key pinning (wrong key): `connect()` never returns (or times out) when the pinned key does not match.
+- [ ] Key pinning (no pin): any valid peer is accepted when no key is pinned.
+
+### Access control and hardening (if implemented)
+- [ ] Rate limiting: sending N packets in a burst from one IP lets at most `burst` through initially; subsequent packets are dropped until tokens refill.
+- [ ] Peer table cap: new peers beyond `max_peers` are ignored; existing peers are unaffected.
+- [ ] Relay allowlist: a Relay frame from an IP not in the allowlist is dropped and never forwarded.
+- [ ] Relay table cap: a Relay frame that would add a new destination beyond `max_relay_entries` is dropped.
 
 ### Congestion control (unit)
 - [ ] `on_rtt_sample` with a constant RTT produces stable srtt ≈ that value.
@@ -320,6 +344,7 @@ Do not mark the implementation done until every item passes.
 - **Returning from `connect()` before Noise XX completes.** If the connection handle is exposed
   before `into_stateless_transport_mode()` is called, the first `send()` will transmit plaintext.
   Block inside `connect()` (e.g. via a `Notify`) until the channel is established.
+- **Leaving Ping/Pong/Nack plaintext after handshake.** Keepalives carry session IDs; NACKs expose sequence timing. Once the Noise channel is established, all frame types except Handshake and Relay/Probe/Beacon must be wrapped in Secure. Failing to do so leaks metadata even when application data is encrypted.
 - **Sleeping for retransmit pacing inside the recv loop.** If the engine's main read loop sleeps
   to pace a NACK retransmit batch, it stops receiving packets for the sleep duration.  Always run
   paced retransmit batches in a spawned task.

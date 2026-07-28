@@ -158,6 +158,8 @@ relay_table: HashMap<server_addr, client_addr>
 
 The routing table is maintained per relay-engine instance and is not persisted across restarts.  One server address maps to exactly one client address (the most recent sender); for multi-client scenarios a dedicated relay with per-session allocation is required.
 
+See **Access control and hardening → Relay abuse protection** for allowlist, table-cap, and TTL semantics.
+
 ### Handshake — `0x09` *(feature: `security`)*
 
 One message in a Noise XX key exchange. Three messages are exchanged before the connection is encrypted.
@@ -178,7 +180,7 @@ After all three messages the handshake is complete. Both sides call `into_statel
 
 ### Secure — `0x0A` *(feature: `security`)*
 
-A Noise-encrypted data frame. The `ciphertext` is the output of `ChaCha20-Poly1305` AEAD applied to any plain inner frame (Stream, Fragment, Datagram).
+A Noise-encrypted data frame. The `ciphertext` is the output of `ChaCha20-Poly1305` AEAD applied to any plain inner frame — once the channel is established, all frame types except Handshake and Relay/Probe/Beacon are wrapped in Secure.
 
 ```
 [ciphertext bytes] [nonce: u64] [0x0A]
@@ -358,19 +360,55 @@ The initiator is always the node that called `Zudp::connect()`. The responder is
 
 ### What is and is not encrypted
 
-| Frame | Encrypted |
+| Frame | Encrypted when channel is open |
 |---|---|
-| Stream | yes (wrapped in Secure when channel is open) |
+| Stream | yes |
 | Fragment | yes |
-| Ping / Pong | no (keepalives are unencrypted) |
-| Nack | no (only contains sequence numbers, no payload) |
-| Datagram (unreliable) | no |
+| Ping / Pong | yes — keepalives carry a session ID; encrypting them prevents replay-based migration attacks |
+| Nack | yes — sequence numbers reveal delivery timing; encrypting prevents traffic analysis |
+| MtuAck | yes |
+| Datagram (unreliable) | no — bypass for latency-critical fire-and-forget data |
 | Handshake | no (by definition, sent before the channel exists) |
-| Relay / Probe / Beacon | no |
+| Relay / Probe / Beacon | no (routing/discovery frames are always plaintext) |
 
 ### Nonce exhaustion
 
 The send nonce is a monotonically increasing `u64` starting from 0. At a rate of one million messages per second it takes ~585 000 years to exhaust. No special handling is needed.
+
+### Remote key pinning *(feature: `security`)*
+
+An endpoint may pin the expected X25519 static public key of its peer. If provided, the key is checked during the Noise XX handshake immediately after the remote's static key becomes available — after `read_message(msg2)` on the initiator side, and after `read_message(msg3)` on the responder side. A mismatch causes the handshake to be aborted silently (no error frame is sent to avoid oracle attacks). The `connect()` call on the initiator will time out rather than return an error, preventing peer enumeration.
+
+---
+
+## Access control and hardening
+
+These limits are enforced by the engine on the receiving path and require no coordination with the remote peer.
+
+### Per-IP rate limiting
+
+A token-bucket rate limiter is maintained per source IP address. Tokens refill at `max_pps` per second up to `burst` (default: `max_pps / 5`, minimum 1). Each accepted packet consumes one token; packets that arrive when the bucket is empty are silently dropped. The rate limiter is applied before frame parsing — malformed or oversized packets are still subject to the limit.
+
+- Default: `max_pps = 1 000`, `burst = 200`.
+- Idle buckets (no traffic for 60 s) are pruned to bound memory.
+
+### Peer table cap
+
+The engine tracks at most `max_peers` distinct remote addresses in its peer table. Connection attempts from new addresses beyond the cap are silently ignored (their packets are dropped before peer state is allocated). This prevents unbounded memory growth from address-scanning attacks.
+
+- Default: `max_peers = 1 024`.
+
+### Relay abuse protection
+
+A relay engine enforces two additional limits on its routing table:
+
+**Allowlist** — if configured, only source IPs present in the allowlist may submit Relay frames. Frames from any other IP are dropped before the routing table is updated. An empty allowlist (the default) allows any source.
+
+**Table cap** — the routing table is bounded by `max_relay_entries`. A Relay frame that would add a new destination beyond the cap is dropped; existing entries are unaffected.
+
+**Entry TTL** — routing entries expire after 300 seconds of inactivity (no Relay frames received for that destination). Expiry is implemented as a generation counter rather than wall-clock timestamps to avoid per-packet syscalls.
+
+- Defaults: no allowlist, `max_relay_entries = 256`.
 
 ---
 
