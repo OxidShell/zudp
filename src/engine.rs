@@ -38,14 +38,22 @@ impl EngineInner {
 }
 
 /// Spawn the engine background task and return the inbound receiver.
-pub(crate) fn spawn(inner: Arc<EngineInner>) -> mpsc::UnboundedReceiver<(Bytes, SocketAddr)> {
+///
+/// Each item is `(payload_bytes, sender_addr, stream_id)`.
+pub(crate) fn spawn(
+    inner: Arc<EngineInner>,
+) -> mpsc::UnboundedReceiver<(Bytes, SocketAddr, u16)> {
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
     tokio::spawn(run(inner, inbound_tx));
     inbound_rx
 }
 
-async fn run(inner: Arc<EngineInner>, inbound_tx: mpsc::UnboundedSender<(Bytes, SocketAddr)>) {
-    let mut recv_states: HashMap<SocketAddr, (RecvState, FragAssembler)> = HashMap::new();
+async fn run(
+    inner: Arc<EngineInner>,
+    inbound_tx: mpsc::UnboundedSender<(Bytes, SocketAddr, u16)>,
+) {
+    // Keyed by (peer_addr, stream_id) so each stream has independent reorder + reassembly.
+    let mut recv_states: HashMap<(SocketAddr, u16), (RecvState, FragAssembler)> = HashMap::new();
     let keepalive_interval = inner.config.keepalive_interval;
     let sent_prune_age = inner.config.sent_prune_age;
 
@@ -80,8 +88,8 @@ async fn handle_incoming(
     data: BytesMut,
     from: SocketAddr,
     inner: &Arc<EngineInner>,
-    inbound_tx: &mpsc::UnboundedSender<(Bytes, SocketAddr)>,
-    recv_states: &mut HashMap<SocketAddr, (RecvState, FragAssembler)>,
+    inbound_tx: &mpsc::UnboundedSender<(Bytes, SocketAddr, u16)>,
+    recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
 ) {
     let frame = match Frame::decode(data) {
         Ok(f) => f,
@@ -139,35 +147,39 @@ async fn dispatch_frame(
     frame: Frame,
     from: SocketAddr,
     inner: &Arc<EngineInner>,
-    inbound_tx: &mpsc::UnboundedSender<(Bytes, SocketAddr)>,
-    recv_states: &mut HashMap<SocketAddr, (RecvState, FragAssembler)>,
+    inbound_tx: &mpsc::UnboundedSender<(Bytes, SocketAddr, u16)>,
+    recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
 ) {
     match frame {
         Frame::Datagram(payload) => {
-            let _ = inbound_tx.send((payload, from));
+            let _ = inbound_tx.send((payload, from, 0));
         }
 
-        Frame::Stream { seq, payload } => {
+        Frame::Stream {
+            seq,
+            stream_id,
+            payload,
+        } => {
             let (recv, _frag) = recv_states
-                .entry(from)
+                .entry((from, stream_id))
                 .or_insert_with(|| (RecvState::new(), FragAssembler::new()));
 
             let (ready, nack_seqs) = recv.ingest(seq, Inbound::Data(payload));
-            send_nack_if_needed(nack_seqs, from, inner).await;
+            send_nack_if_needed(nack_seqs, stream_id, from, inner).await;
             for item in ready {
                 if let Inbound::Data(bytes) = item {
-                    let _ = inbound_tx.send((bytes, from));
+                    let _ = inbound_tx.send((bytes, from, stream_id));
                 }
             }
         }
 
-        Frame::Nack(seqs) => {
+        Frame::Nack { stream_id, seqs } => {
             let peer_opt = inner.peers.read().get(&from).cloned();
             if let Some(peer) = peer_opt {
-                let to_retransmit = peer.frames_for_retransmit(&seqs);
+                let to_retransmit = peer.frames_for_retransmit(stream_id, &seqs);
                 for (seq, plain_frame) in to_retransmit {
                     let wire = encrypt_or_plain(&peer, &plain_frame);
-                    tracing::debug!(target: "zudp::engine", peer = %from, seq, "retransmit on NACK");
+                    tracing::debug!(target: "zudp::engine", peer = %from, seq, stream_id, "retransmit on NACK");
                     if let Err(e) = inner.socket.send_to(&wire, from).await {
                         tracing::warn!(target: "zudp::engine", peer = %from, "retransmit failed: {e}");
                     }
@@ -187,10 +199,11 @@ async fn dispatch_frame(
             frag_idx,
             frag_total,
             seq,
+            stream_id,
             payload,
         } => {
             let (recv, frag_assembler) = recv_states
-                .entry(from)
+                .entry((from, stream_id))
                 .or_insert_with(|| (RecvState::new(), FragAssembler::new()));
 
             let inbound = Inbound::Fragment {
@@ -200,7 +213,7 @@ async fn dispatch_frame(
                 data: payload,
             };
             let (ready, nack_seqs) = recv.ingest(seq, inbound);
-            send_nack_if_needed(nack_seqs, from, inner).await;
+            send_nack_if_needed(nack_seqs, stream_id, from, inner).await;
 
             for item in ready {
                 if let Inbound::Fragment {
@@ -212,7 +225,7 @@ async fn dispatch_frame(
                     && let Some(complete) =
                         frag_assembler.insert(msg_id, frag_idx, frag_total, data)
                 {
-                    let _ = inbound_tx.send((complete, from));
+                    let _ = inbound_tx.send((complete, from, stream_id));
                 }
             }
         }
@@ -257,12 +270,17 @@ fn encrypt_or_plain(peer: &PeerState, plain: &Bytes) -> Bytes {
     plain.clone()
 }
 
-async fn send_nack_if_needed(nack_seqs: Vec<u64>, to: SocketAddr, inner: &Arc<EngineInner>) {
+async fn send_nack_if_needed(
+    nack_seqs: Vec<u64>,
+    stream_id: u16,
+    to: SocketAddr,
+    inner: &Arc<EngineInner>,
+) {
     if nack_seqs.is_empty() {
         return;
     }
-    tracing::debug!(target: "zudp::engine", peer = %to, count = nack_seqs.len(), "sending NACK");
-    let frame = Frame::Nack(nack_seqs).encode();
+    tracing::debug!(target: "zudp::engine", peer = %to, count = nack_seqs.len(), stream_id, "sending NACK");
+    let frame = Frame::Nack { stream_id, seqs: nack_seqs }.encode();
     if let Err(e) = inner.socket.send_to(&frame, to).await {
         tracing::warn!(target: "zudp::engine", peer = %to, "nack send failed: {e}");
     }
@@ -270,7 +288,7 @@ async fn send_nack_if_needed(nack_seqs: Vec<u64>, to: SocketAddr, inner: &Arc<En
 
 async fn run_background(
     inner: &Arc<EngineInner>,
-    recv_states: &mut HashMap<SocketAddr, (RecvState, FragAssembler)>,
+    recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
     keepalive_interval: Duration,
     sent_prune_age: Duration,
 ) {

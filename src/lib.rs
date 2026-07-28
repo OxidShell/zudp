@@ -16,7 +16,7 @@
 //! async fn main() -> anyhow::Result<()> {
 //!     // Multi-peer socket — type on the terminal call
 //!     let mut socket = Zudp::default().port(5000).listen::<Msg>().await?;
-//!     let (msg, from) = socket.recv().await?;
+//!     let (msg, from, _stream) = socket.recv().await?;
 //!
 //!     // Single-peer connection
 //!     let mut conn = Zudp::default().port(0).connect::<Msg>("1.2.3.4:5000".parse()?).await?;
@@ -37,6 +37,10 @@ mod peer;
 #[cfg(feature = "security")]
 mod security;
 mod socket;
+
+/// Stream ID for the default reliable channel.  Pass to `send_stream` / `recv_stream`
+/// or use `send` / `recv` which implicitly target this stream.
+pub const DEFAULT_STREAM: u16 = 0;
 
 pub use codec::{Decode, Encode};
 #[cfg(feature = "discovery")]
@@ -238,7 +242,7 @@ struct Inner {
 impl Inner {
     async fn new(
         config: Config,
-    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<(Bytes, SocketAddr)>), Error> {
+    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<(Bytes, SocketAddr, u16)>), Error> {
         let addr = SocketAddr::new(config.bind_ip, config.port);
         let socket = RawSocket::bind(addr).await?;
         let config = Arc::new(config);
@@ -297,7 +301,7 @@ impl Inner {
         self.engine.get_or_create_peer(addr)
     }
 
-    /// Encode and send a message to `dest`.
+    /// Encode and send a message to `dest` on `stream_id`.
     ///
     /// If `reliable` is `true` and the protocol config has reliability enabled,
     /// the frame is tracked for NACK-triggered retransmission.
@@ -306,6 +310,7 @@ impl Inner {
         msg: &M,
         dest: SocketAddr,
         reliable: bool,
+        stream_id: u16,
     ) -> Result<(), Error> {
         let payload = Bytes::from(msg.encode_to_bytes()?);
 
@@ -315,10 +320,10 @@ impl Inner {
         let reliable = reliable && self.config.reliable;
 
         if payload.len() <= self.config.mtu {
-            self.send_single(payload, dest, actual_dest, wrap_relay, reliable)
+            self.send_single(payload, dest, actual_dest, wrap_relay, reliable, stream_id)
                 .await
         } else {
-            self.send_fragmented(payload, dest, actual_dest, wrap_relay)
+            self.send_fragmented(payload, dest, actual_dest, wrap_relay, stream_id)
                 .await
         }
     }
@@ -330,12 +335,18 @@ impl Inner {
         actual_dest: SocketAddr,
         wrap_relay: bool,
         reliable: bool,
+        stream_id: u16,
     ) -> Result<(), Error> {
         if reliable {
             let peer = self.get_or_create_peer(peer_addr);
-            let seq = peer.alloc_seq();
+            let seq = peer.alloc_seq(stream_id);
             // Always store plain bytes; retransmits re-encrypt with a fresh nonce.
-            let plain_frame = Frame::Stream { seq, payload }.encode();
+            let plain_frame = Frame::Stream {
+                seq,
+                stream_id,
+                payload,
+            }
+            .encode();
             let inner_wire = maybe_encrypt(&peer, &plain_frame)?;
             let wire = if wrap_relay {
                 Frame::Relay {
@@ -347,7 +358,7 @@ impl Inner {
                 inner_wire
             };
             self.engine.socket.send_to(&wire, actual_dest).await?;
-            peer.record_sent(seq, plain_frame);
+            peer.record_sent(stream_id, seq, plain_frame);
         } else if wrap_relay {
             let frame = Frame::Datagram(payload).encode();
             let wire = Frame::Relay {
@@ -380,6 +391,7 @@ impl Inner {
         peer_addr: SocketAddr,
         actual_dest: SocketAddr,
         wrap_relay: bool,
+        stream_id: u16,
     ) -> Result<(), Error> {
         let chunks = fragment(&payload, self.config.mtu)?;
         let msg_id = self.alloc_msg_id();
@@ -391,12 +403,13 @@ impl Inner {
         let peer = self.get_or_create_peer(peer_addr);
 
         for (frag_idx, chunk) in (0u16..).zip(chunks) {
-            let seq = peer.alloc_seq();
+            let seq = peer.alloc_seq(stream_id);
             let plain_frame = Frame::Fragment {
                 msg_id,
                 frag_idx,
                 frag_total,
                 seq,
+                stream_id,
                 payload: chunk,
             }
             .encode();
@@ -411,7 +424,7 @@ impl Inner {
                 inner_wire
             };
             self.engine.socket.send_to(&wire, actual_dest).await?;
-            peer.record_sent(seq, plain_frame);
+            peer.record_sent(stream_id, seq, plain_frame);
         }
         Ok(())
     }
@@ -441,7 +454,7 @@ fn maybe_encrypt(peer: &PeerState, plain: &Bytes) -> Result<Bytes, Error> {
 /// Created by [`Zudp::listen`].
 pub struct ZudpSocket<M> {
     inner: Arc<Inner>,
-    rx: mpsc::UnboundedReceiver<(Bytes, SocketAddr)>,
+    rx: mpsc::UnboundedReceiver<(Bytes, SocketAddr, u16)>,
     _phantom: PhantomData<fn() -> M>,
 }
 
@@ -464,10 +477,11 @@ impl<M> ZudpSocket<M> {
         self.inner.engine.socket.local_addr()
     }
 
-    /// Send a reliable, ordered message to `peer`.
+    /// Send a reliable, ordered message to `peer` on stream 0.
     ///
     /// Reliability uses NACK-based retransmission. For fire-and-forget,
-    /// use [`send_unreliable`](Self::send_unreliable).
+    /// use [`send_unreliable`](Self::send_unreliable). To target a specific
+    /// stream, use [`send_stream`](Self::send_stream).
     ///
     /// # Errors
     /// Returns `Err` on I/O failure or if the message is too large to fragment.
@@ -475,7 +489,21 @@ impl<M> ZudpSocket<M> {
     where
         M: Encode,
     {
-        self.inner.send_msg(&msg, peer, true).await
+        self.inner.send_msg(&msg, peer, true, DEFAULT_STREAM).await
+    }
+
+    /// Send a reliable, ordered message to `peer` on the given `stream_id`.
+    ///
+    /// Each stream maintains an independent sequence space, so loss on one
+    /// stream never blocks delivery on another (no head-of-line blocking).
+    ///
+    /// # Errors
+    /// Returns `Err` on I/O failure or if the message is too large to fragment.
+    pub async fn send_stream(&self, msg: M, peer: SocketAddr, stream_id: u16) -> Result<(), Error>
+    where
+        M: Encode,
+    {
+        self.inner.send_msg(&msg, peer, true, stream_id).await
     }
 
     /// Send an unreliable, unordered datagram to `peer`.
@@ -488,21 +516,23 @@ impl<M> ZudpSocket<M> {
     where
         M: Encode,
     {
-        self.inner.send_msg(&msg, peer, false).await
+        self.inner.send_msg(&msg, peer, false, DEFAULT_STREAM).await
     }
 
-    /// Receive the next message from any peer.
+    /// Receive the next message from any peer on any stream.
+    ///
+    /// Returns `(message, sender_addr, stream_id)`.
     ///
     /// # Errors
     /// Returns `Err(Error::ChannelClosed)` if the engine task has stopped.
-    pub async fn recv(&mut self) -> Result<(M, SocketAddr), Error>
+    pub async fn recv(&mut self) -> Result<(M, SocketAddr, u16), Error>
     where
         M: Decode,
     {
         loop {
-            let (bytes, from) = self.rx.recv().await.ok_or(Error::ChannelClosed)?;
+            let (bytes, from, stream_id) = self.rx.recv().await.ok_or(Error::ChannelClosed)?;
             match M::decode_from_bytes(&bytes) {
-                Ok(msg) => return Ok((msg, from)),
+                Ok(msg) => return Ok((msg, from, stream_id)),
                 Err(e) => {
                     tracing::warn!(target: "zudp", peer = %from, "decode failed: {e}");
                 }
@@ -538,7 +568,7 @@ impl<M> ZudpConn<M> {
         self.socket.local_addr()
     }
 
-    /// Send a reliable, ordered message to the bound peer.
+    /// Send a reliable, ordered message to the bound peer on stream 0.
     ///
     /// # Errors
     /// Returns `Err` on I/O failure or if the message is too large to fragment.
@@ -547,6 +577,20 @@ impl<M> ZudpConn<M> {
         M: Encode,
     {
         self.socket.send(msg, self.peer).await
+    }
+
+    /// Send a reliable, ordered message to the bound peer on `stream_id`.
+    ///
+    /// Each stream has an independent sequence space — loss on one stream
+    /// never delays delivery on another.
+    ///
+    /// # Errors
+    /// Returns `Err` on I/O failure or if the message is too large to fragment.
+    pub async fn send_stream(&self, msg: M, stream_id: u16) -> Result<(), Error>
+    where
+        M: Encode,
+    {
+        self.socket.send_stream(msg, self.peer, stream_id).await
     }
 
     /// Send an unreliable datagram to the bound peer.
@@ -560,20 +604,20 @@ impl<M> ZudpConn<M> {
         self.socket.send_unreliable(msg, self.peer).await
     }
 
-    /// Receive the next message from the bound peer.
+    /// Receive the next message from the bound peer on any stream.
     ///
-    /// Messages from other peers are silently discarded.
+    /// Returns `(message, stream_id)`. Messages from other peers are silently discarded.
     ///
     /// # Errors
     /// Returns `Err(Error::ChannelClosed)` if the engine task has stopped.
-    pub async fn recv(&mut self) -> Result<M, Error>
+    pub async fn recv(&mut self) -> Result<(M, u16), Error>
     where
         M: Decode,
     {
         loop {
-            let (msg, from) = self.socket.recv().await?;
+            let (msg, from, stream_id) = self.socket.recv().await?;
             if from == self.peer {
-                return Ok(msg);
+                return Ok((msg, stream_id));
             }
             tracing::debug!(
                 target: "zudp",

@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
         println!("\nserver listening on {}", server.local_addr().unwrap());
 
         for i in 1u32..=3 {
-            let (msg, from) = server.recv().await.expect("server recv");
+            let (msg, from, _stream) = server.recv().await.expect("server recv");
             let Msg::Ping(seq) = msg else { continue };
             println!("server  ←  Ping({seq}) from {from}  [encrypted ✓]");
 
@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
         conn.send(Msg::Ping(seq)).await?;
         println!("client  →  Ping({seq})");
 
-        let reply = conn.recv().await?;
+        let (reply, _stream) = conn.recv().await?;
         println!("client  ←  {reply:?}\n");
 
         tokio::time::sleep(Duration::from_millis(200)).await;

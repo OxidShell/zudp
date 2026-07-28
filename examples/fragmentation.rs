@@ -25,7 +25,7 @@ async fn main() {
             .await
             .expect("server bind");
 
-        let (msg, from) = server.recv().await.expect("recv");
+        let (msg, from, _stream) = server.recv().await.expect("recv");
         let Msg::LargeData(data) = msg;
         println!(
             "server: received {} bytes from {} — reassembly OK",

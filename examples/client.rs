@@ -50,14 +50,14 @@ async fn main() -> anyhow::Result<()> {
         match tokio::time::timeout(Duration::from_secs(2), conn.recv()).await {
             Err(_) => println!("#{seq:>3}  timeout"),
             Ok(Err(e)) => println!("#{seq:>3}  error: {e}"),
-            Ok(Ok(Msg::Pong { sent_at_us })) => {
+            Ok(Ok((Msg::Pong { sent_at_us }, _stream))) => {
                 let elapsed_us = now_us().saturating_sub(sent_at_us);
                 #[allow(clippy::cast_precision_loss)]
                 let rtt_ms = elapsed_us as f64 / 1000.0;
                 rtts.push(rtt_ms);
                 println!("#{seq:>3}  rtt = {rtt_ms:.2} ms");
             }
-            Ok(Ok(_)) => {}
+            Ok(Ok(_)) => {} // Ping echo or unexpected variant
         }
 
         if seq < count {

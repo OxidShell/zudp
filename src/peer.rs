@@ -1,10 +1,9 @@
 #[cfg(feature = "security")]
 use std::sync::OnceLock;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     net::SocketAddr,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -24,8 +23,10 @@ pub struct SentPacket {
 /// Send-side state for one remote peer, shared between the caller and the engine task.
 pub struct PeerState {
     pub addr: SocketAddr,
-    next_seq: AtomicU64,
-    pub sent: Mutex<BTreeMap<u64, SentPacket>>,
+    /// Per-stream sequence counters; each stream starts at 1 and advances independently.
+    next_seqs: Mutex<HashMap<u16, u64>>,
+    /// Per-stream send buffers for NACK-triggered retransmission.
+    pub sent: Mutex<HashMap<u16, BTreeMap<u64, SentPacket>>>,
     pub last_sent: Mutex<Instant>,
     pub last_seen: Mutex<Instant>,
     /// In-progress Noise XX handshake state; `None` once the channel is established.
@@ -42,8 +43,8 @@ impl PeerState {
         let now = Instant::now();
         Self {
             addr,
-            next_seq: AtomicU64::new(1),
-            sent: Mutex::new(BTreeMap::new()),
+            next_seqs: Mutex::new(HashMap::new()),
+            sent: Mutex::new(HashMap::new()),
             last_sent: Mutex::new(now),
             last_seen: Mutex::new(now),
             #[cfg(feature = "security")]
@@ -53,31 +54,40 @@ impl PeerState {
         }
     }
 
-    pub fn alloc_seq(&self) -> u64 {
-        self.next_seq.fetch_add(1, Ordering::Relaxed)
+    /// Allocate the next sequence number for `stream_id`.  Each stream starts at 1.
+    pub fn alloc_seq(&self, stream_id: u16) -> u64 {
+        let mut map = self.next_seqs.lock();
+        let counter = map.entry(stream_id).or_insert(1);
+        let seq = *counter;
+        *counter += 1;
+        seq
     }
 
-    pub fn record_sent(&self, seq: u64, frame: Bytes) {
-        self.sent.lock().insert(
-            seq,
-            SentPacket {
-                frame,
-                sent_at: Instant::now(),
-            },
-        );
+    pub fn record_sent(&self, stream_id: u16, seq: u64, frame: Bytes) {
+        self.sent
+            .lock()
+            .entry(stream_id)
+            .or_default()
+            .insert(seq, SentPacket { frame, sent_at: Instant::now() });
         *self.last_sent.lock() = Instant::now();
     }
 
-    pub fn frames_for_retransmit(&self, seqs: &[u64]) -> Vec<(u64, Bytes)> {
-        let sent = self.sent.lock();
+    pub fn frames_for_retransmit(&self, stream_id: u16, seqs: &[u64]) -> Vec<(u64, Bytes)> {
+        let map = self.sent.lock();
+        let Some(stream_buf) = map.get(&stream_id) else {
+            return vec![];
+        };
         seqs.iter()
-            .filter_map(|seq| sent.get(seq).map(|p| (*seq, p.frame.clone())))
+            .filter_map(|seq| stream_buf.get(seq).map(|p| (*seq, p.frame.clone())))
             .collect()
     }
 
-    pub fn prune_sent(&self, max_age: std::time::Duration) {
+    pub fn prune_sent(&self, max_age: Duration) {
         if let Some(cutoff) = Instant::now().checked_sub(max_age) {
-            self.sent.lock().retain(|_, p| p.sent_at > cutoff);
+            let mut map = self.sent.lock();
+            for stream_buf in map.values_mut() {
+                stream_buf.retain(|_, p| p.sent_at > cutoff);
+            }
         }
     }
 
@@ -106,10 +116,7 @@ pub enum Inbound {
     },
 }
 
-/// Per-peer receive state, owned exclusively by the engine task.
-///
-/// Both `Stream` and `Fragment` frames share the same sequence space on each peer,
-/// so a single reorder buffer handles both.
+/// Per-(peer, stream) receive state, owned exclusively by the engine task.
 pub struct RecvState {
     pub expected_seq: u64,
     buf: BTreeMap<u64, Inbound>,

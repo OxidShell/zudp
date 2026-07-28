@@ -20,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
     println!("listening on {}", socket.local_addr()?);
 
     loop {
-        let (msg, from) = socket.recv().await?;
+        let (msg, from, _stream) = socket.recv().await?;
         match msg {
             Msg::Ping { sent_at_us } => {
                 println!("ping from {from}");

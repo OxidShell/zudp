@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
 
         println!("server listening on {}", server.local_addr().unwrap());
 
-        let (msg, from) = server.recv().await.expect("server recv failed");
+        let (msg, from, _stream) = server.recv().await.expect("server recv failed");
         println!("server got {msg:?} from {from}");
 
         server
@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
     client.send(Msg::Ping).await?;
     println!("client sent Ping");
 
-    let reply = client.recv().await?;
+    let (reply, _stream) = client.recv().await?;
     println!("client got {reply:?}");
 
     server_task.await?;

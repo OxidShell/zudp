@@ -10,18 +10,18 @@ pub const MAX_NACK_SEQS: usize = 128;
 /// Wire format overhead appended after the payload, per frame type:
 ///
 /// ```text
-/// Datagram  : [payload][0x00]                                          (1 byte)
-/// Stream    : [payload][seq: u64 BE][0x01]                             (9 bytes)
-/// Nack      : [seq0: u64 BE]...[0x02]                                  (no payload)
-/// Ping      : [echo: u64 BE][0x03]                                     (9 bytes)
-/// Pong      : [echo: u64 BE][0x04]                                     (9 bytes)
-/// Fragment  : [payload][msg_id: u32 BE][frag_total: u16 BE]
-///                      [frag_idx: u16 BE][seq: u64 BE][0x05]           (17 bytes)
-/// Relay(v4) : [inner][port: u16 BE][ip: 4 bytes][0x00][0x06]          (8 bytes)
-/// Relay(v6) : [inner][port: u16 BE][ip: 16 bytes][0x01][0x06]         (20 bytes)
-/// Probe     : [app_id: u64 BE][proto_ver: u16 BE][0x07]                (11 bytes)
+/// Datagram  : [payload][0x00]                                                     (1 byte)
+/// Stream    : [payload][seq: u64 BE][stream_id: u16 BE][0x01]                     (11 bytes)
+/// Nack      : [seq0: u64 BE]...[stream_id: u16 BE][0x02]                          (3 + N*8 bytes)
+/// Ping      : [echo: u64 BE][0x03]                                                (9 bytes)
+/// Pong      : [echo: u64 BE][0x04]                                                (9 bytes)
+/// Fragment  : [payload][msg_id: u32 BE][frag_total: u16 BE][frag_idx: u16 BE]
+///                      [seq: u64 BE][stream_id: u16 BE][0x05]                     (19 bytes)
+/// Relay(v4) : [inner][port: u16 BE][ip: 4 bytes][0x00][0x06]                     (8 bytes)
+/// Relay(v6) : [inner][port: u16 BE][ip: 16 bytes][0x01][0x06]                    (20 bytes)
+/// Probe     : [app_id: u64 BE][proto_ver: u16 BE][0x07]                           (11 bytes)
 /// Beacon    : [meta bytes][data_port: u16 BE][proto_ver: u16 BE]
-///                         [app_id: u64 BE][0x08]                       (13 + meta bytes)
+///                         [app_id: u64 BE][0x08]                                  (13 + meta bytes)
 /// ```
 ///
 /// The frame type byte is always last, making parsing O(1) from the tail.
@@ -46,20 +46,25 @@ const ADDR_V6: u8 = 0x01;
 pub enum Frame {
     /// Unreliable fire-and-forget delivery.
     Datagram(Bytes),
-    /// Reliably delivered, ordered payload with a sequence number.
-    Stream { seq: u64, payload: Bytes },
-    /// Negative acknowledgement — request retransmission of the listed sequences.
-    Nack(Vec<u64>),
+    /// Reliably delivered, in-order payload on a specific stream.
+    Stream {
+        seq: u64,
+        stream_id: u16,
+        payload: Bytes,
+    },
+    /// Negative acknowledgement — request retransmission of the listed sequences on a stream.
+    Nack { stream_id: u16, seqs: Vec<u64> },
     /// Keepalive probe carrying an echo token.
     Ping { echo: u64 },
     /// Keepalive reply mirroring the probe token.
     Pong { echo: u64 },
-    /// One slice of a fragmented reliable message.
+    /// One slice of a fragmented reliable message, on a specific stream.
     Fragment {
         msg_id: u32,
         frag_idx: u16,
         frag_total: u16,
         seq: u64,
+        stream_id: u16,
         payload: Bytes,
     },
     /// Relay request: forward `inner` to `dest` unchanged.
@@ -92,19 +97,25 @@ impl Frame {
                 buf.put_u8(TYPE_DATAGRAM);
                 buf.freeze()
             }
-            Frame::Stream { seq, payload } => {
-                let mut buf = BytesMut::with_capacity(payload.len() + 9);
+            Frame::Stream {
+                seq,
+                stream_id,
+                payload,
+            } => {
+                let mut buf = BytesMut::with_capacity(payload.len() + 11);
                 buf.extend_from_slice(&payload);
                 buf.put_u64(seq);
+                buf.put_u16(stream_id);
                 buf.put_u8(TYPE_STREAM);
                 buf.freeze()
             }
-            Frame::Nack(seqs) => {
+            Frame::Nack { stream_id, seqs } => {
                 let count = seqs.len().min(MAX_NACK_SEQS);
-                let mut buf = BytesMut::with_capacity(count * 8 + 1);
+                let mut buf = BytesMut::with_capacity(count * 8 + 3);
                 for seq in seqs.iter().take(count) {
                     buf.put_u64(*seq);
                 }
+                buf.put_u16(stream_id);
                 buf.put_u8(TYPE_NACK);
                 buf.freeze()
             }
@@ -125,14 +136,16 @@ impl Frame {
                 frag_idx,
                 frag_total,
                 seq,
+                stream_id,
                 payload,
             } => {
-                let mut buf = BytesMut::with_capacity(payload.len() + 17);
+                let mut buf = BytesMut::with_capacity(payload.len() + 19);
                 buf.extend_from_slice(&payload);
                 buf.put_u32(msg_id);
                 buf.put_u16(frag_total);
                 buf.put_u16(frag_idx);
                 buf.put_u64(seq);
+                buf.put_u16(stream_id);
                 buf.put_u8(TYPE_FRAGMENT);
                 buf.freeze()
             }
@@ -197,17 +210,26 @@ impl Frame {
             TYPE_DATAGRAM => Ok(Frame::Datagram(data.freeze())),
 
             TYPE_STREAM => {
+                let stream_id = pop_u16(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "stream",
+                    field: "stream_id",
+                })?;
                 let seq = pop_u64(&mut data).ok_or(Error::FrameTruncated {
                     frame: "stream",
                     field: "seq",
                 })?;
                 Ok(Frame::Stream {
                     seq,
+                    stream_id,
                     payload: data.freeze(),
                 })
             }
 
             TYPE_NACK => {
+                let stream_id = pop_u16(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "nack",
+                    field: "stream_id",
+                })?;
                 if !data.len().is_multiple_of(8) {
                     return Err(Error::NackInvalidLength { len: data.len() });
                 }
@@ -215,7 +237,7 @@ impl Frame {
                     .chunks(8)
                     .map(|c| u64::from_be_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
                     .collect();
-                Ok(Frame::Nack(seqs))
+                Ok(Frame::Nack { stream_id, seqs })
             }
 
             TYPE_PING => {
@@ -235,7 +257,11 @@ impl Frame {
             }
 
             TYPE_FRAGMENT => {
-                // layout (reading tail-first): seq(8) frag_idx(2) frag_total(2) msg_id(4)
+                // tail-first: stream_id(2) seq(8) frag_idx(2) frag_total(2) msg_id(4)
+                let stream_id = pop_u16(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "fragment",
+                    field: "stream_id",
+                })?;
                 let seq = pop_u64(&mut data).ok_or(Error::FrameTruncated {
                     frame: "fragment",
                     field: "seq",
@@ -257,6 +283,7 @@ impl Frame {
                     frag_idx,
                     frag_total,
                     seq,
+                    stream_id,
                     payload: data.freeze(),
                 })
             }
@@ -435,22 +462,50 @@ mod tests {
     #[test]
     fn stream_roundtrip() {
         let payload = Bytes::from_static(b"reliable data");
-        let Frame::Stream { seq, payload: out } = roundtrip(Frame::Stream {
+        let Frame::Stream {
+            seq,
+            stream_id,
+            payload: out,
+        } = roundtrip(Frame::Stream {
             seq: 42,
+            stream_id: 3,
+            payload: payload.clone(),
+        })
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(seq, 42);
+        assert_eq!(stream_id, 3);
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn stream_default_stream_roundtrip() {
+        let payload = Bytes::from_static(b"default stream");
+        let Frame::Stream { stream_id, .. } = roundtrip(Frame::Stream {
+            seq: 1,
+            stream_id: 0,
             payload: payload.clone(),
         }) else {
             panic!("wrong variant");
         };
-        assert_eq!(seq, 42);
-        assert_eq!(out, payload);
+        assert_eq!(stream_id, 0);
     }
 
     #[test]
     fn nack_roundtrip() {
         let seqs = vec![1u64, 5, 9];
-        let Frame::Nack(out) = roundtrip(Frame::Nack(seqs.clone())) else {
+        let Frame::Nack {
+            stream_id,
+            seqs: out,
+        } = roundtrip(Frame::Nack {
+            stream_id: 2,
+            seqs: seqs.clone(),
+        })
+        else {
             panic!("wrong variant");
         };
+        assert_eq!(stream_id, 2);
         assert_eq!(out, seqs);
     }
 
@@ -462,12 +517,14 @@ mod tests {
             frag_idx,
             frag_total,
             seq,
+            stream_id,
             payload: out,
         } = roundtrip(Frame::Fragment {
             msg_id: 7,
             frag_idx: 2,
             frag_total: 5,
             seq: 99,
+            stream_id: 1,
             payload: payload.clone(),
         })
         else {
@@ -477,6 +534,7 @@ mod tests {
         assert_eq!(frag_idx, 2);
         assert_eq!(frag_total, 5);
         assert_eq!(seq, 99);
+        assert_eq!(stream_id, 1);
         assert_eq!(out, payload);
     }
 
