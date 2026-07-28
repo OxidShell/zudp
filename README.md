@@ -2,14 +2,6 @@
 
 Minimal UDP protocol for real-time applications. NACK-based reliability, automatic fragmentation, relay/NAT traversal, optional end-to-end encryption, and optional LAN discovery.
 
-```toml
-[dependencies]
-zudp = "0.1"                                               # bitcode codec
-zudp = { version = "0.1", features = ["security"] }        # + Noise XX encryption
-zudp = { version = "0.1", features = ["discovery"] }       # + LAN peer discovery
-zudp = { version = "0.1", features = ["security", "discovery"] }  # both
-```
-
 ## Quick start
 
 ```rust
