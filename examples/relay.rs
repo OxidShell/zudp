@@ -41,9 +41,10 @@ async fn main() {
             .await
             .expect("server bind");
 
-        let (msg, apparent_from, _stream) = server.recv().await.expect("recv");
+        let pkt = server.recv().await.expect("recv");
         println!(
-            "server: received {msg:?}\n        apparent sender: {apparent_from} (relay addr, not client)"
+            "server: received {:?}\n        apparent sender: {} (relay addr, not client)",
+            pkt.msg, pkt.from
         );
     });
 

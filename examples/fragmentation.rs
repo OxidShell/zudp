@@ -25,12 +25,12 @@ async fn main() {
             .await
             .expect("server bind");
 
-        let (msg, from, _stream) = server.recv().await.expect("recv");
-        let Msg::LargeData(data) = msg;
+        let pkt = server.recv().await.expect("recv");
+        let Msg::LargeData(data) = pkt.msg;
         println!(
             "server: received {} bytes from {} — reassembly OK",
             data.len(),
-            from
+            pkt.from
         );
         assert_eq!(data.len(), 50_000);
         assert!(data.iter().all(|&b| b == 0xAB));

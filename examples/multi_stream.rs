@@ -51,8 +51,8 @@ async fn main() -> anyhow::Result<()> {
         println!("server listening on {}", server.local_addr().unwrap());
 
         for _ in 0..5 {
-            let (msg, from, stream_id) = server.recv().await.expect("server recv");
-            println!("server  ←  stream {stream_id}  {msg:?}  from {from}");
+            let pkt = server.recv().await.expect("server recv");
+            println!("server  ←  stream {}  {:?}  from {}", pkt.stream, pkt.msg, pkt.from);
         }
         println!("server done");
     });

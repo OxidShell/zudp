@@ -16,12 +16,12 @@
 //! async fn main() -> anyhow::Result<()> {
 //!     // Multi-peer socket — type on the terminal call
 //!     let mut socket = Zudp::default().port(5000).listen::<Msg>().await?;
-//!     let (msg, from, _stream) = socket.recv().await?;
+//!     let pkt = socket.recv().await?;   // pkt.msg, pkt.from, pkt.stream
 //!
 //!     // Single-peer connection
 //!     let mut conn = Zudp::default().port(0).connect::<Msg>("1.2.3.4:5000".parse()?).await?;
 //!     conn.send(Msg::Ping).await?;
-//!     let reply = conn.recv().await?;
+//!     let pkt = conn.recv().await?;     // pkt.msg, pkt.from (== peer), pkt.stream
 //!     Ok(())
 //! }
 //! ```
@@ -50,6 +50,34 @@ pub use discovery::{
 pub use error::Error;
 #[cfg(feature = "security")]
 pub use security::Keypair;
+
+/// A message received from a ZUDP socket, together with its origin and stream.
+///
+/// Returned by [`ZudpSocket::recv`] and [`ZudpConn::recv`].
+///
+/// ```rust,no_run
+/// # use zudp::{Zudp, Packet};
+/// # use zudp::bitcode::{Encode, Decode};
+/// # #[derive(Encode, Decode)] enum Msg { Hi }
+/// # async fn f() -> Result<(), zudp::Error> {
+/// # let mut socket = Zudp::default().port(0).listen::<Msg>().await?;
+/// // field access
+/// let pkt = socket.recv().await?;
+/// println!("from {} on stream {}", pkt.from, pkt.stream);
+///
+/// // or destructure
+/// let Packet { msg, from, stream } = socket.recv().await?;
+/// # Ok(()) }
+/// ```
+#[derive(Debug)]
+pub struct Packet<M> {
+    /// The decoded application message.
+    pub msg: M,
+    /// Address the message was received from.
+    pub from: std::net::SocketAddr,
+    /// Stream the message was sent on (`0` = [`DEFAULT_STREAM`]).
+    pub stream: u16,
+}
 
 /// Re-exported so users can derive `Encode`/`Decode` without a direct `bitcode` dependency.
 #[cfg(feature = "bitcode")]
@@ -521,18 +549,16 @@ impl<M> ZudpSocket<M> {
 
     /// Receive the next message from any peer on any stream.
     ///
-    /// Returns `(message, sender_addr, stream_id)`.
-    ///
     /// # Errors
     /// Returns `Err(Error::ChannelClosed)` if the engine task has stopped.
-    pub async fn recv(&mut self) -> Result<(M, SocketAddr, u16), Error>
+    pub async fn recv(&mut self) -> Result<Packet<M>, Error>
     where
         M: Decode,
     {
         loop {
-            let (bytes, from, stream_id) = self.rx.recv().await.ok_or(Error::ChannelClosed)?;
+            let (bytes, from, stream) = self.rx.recv().await.ok_or(Error::ChannelClosed)?;
             match M::decode_from_bytes(&bytes) {
-                Ok(msg) => return Ok((msg, from, stream_id)),
+                Ok(msg) => return Ok(Packet { msg, from, stream }),
                 Err(e) => {
                     tracing::warn!(target: "zudp", peer = %from, "decode failed: {e}");
                 }
@@ -606,22 +632,23 @@ impl<M> ZudpConn<M> {
 
     /// Receive the next message from the bound peer on any stream.
     ///
-    /// Returns `(message, stream_id)`. Messages from other peers are silently discarded.
+    /// `pkt.from` is always equal to [`ZudpConn::peer`]. Messages from other peers
+    /// are silently discarded.
     ///
     /// # Errors
     /// Returns `Err(Error::ChannelClosed)` if the engine task has stopped.
-    pub async fn recv(&mut self) -> Result<(M, u16), Error>
+    pub async fn recv(&mut self) -> Result<Packet<M>, Error>
     where
         M: Decode,
     {
         loop {
-            let (msg, from, stream_id) = self.socket.recv().await?;
-            if from == self.peer {
-                return Ok((msg, stream_id));
+            let pkt = self.socket.recv().await?;
+            if pkt.from == self.peer {
+                return Ok(pkt);
             }
             tracing::debug!(
                 target: "zudp",
-                unexpected = %from,
+                unexpected = %pkt.from,
                 expected = %self.peer,
                 "dropping message from unexpected peer"
             );
