@@ -4,10 +4,10 @@
 
 use std::net::SocketAddr;
 
-use bitcode::{Decode, Encode};
+use zudp::rkyv::{Archive, Deserialize, Serialize};
 use zudp::{Zudp, ZudpSocket};
 
-#[derive(Debug, Encode, Decode, PartialEq)]
+#[derive(Debug, Archive, Serialize, Deserialize, PartialEq)]
 enum Msg {
     LargeData(Vec<u8>),
 }

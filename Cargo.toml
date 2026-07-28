@@ -13,7 +13,8 @@ keywords = ["udp", "networking", "gamedev", "relay", "protocol"]
 categories = ["network-programming", "game-development", "asynchronous"]
 
 [features]
-default = ["bitcode"]
+default = ["rkyv"]
+rkyv = ["dep:rkyv"]
 bitcode = ["dep:bitcode"]
 serde = ["dep:serde", "dep:postcard"]
 discovery = []
@@ -22,6 +23,7 @@ security = ["dep:snow"]
 [dependencies]
 tokio = { version = "1", features = ["net", "sync", "rt-multi-thread", "macros", "time", "io-util"] }
 bytes = "1"
+rkyv = { version = "0.8", features = ["bytecheck"], optional = true }
 bitcode = { version = "0.6", features = ["derive"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 postcard = { version = "1", features = ["alloc"], optional = true }

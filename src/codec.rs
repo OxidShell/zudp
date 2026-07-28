@@ -12,19 +12,53 @@ pub trait Decode: Sized + Send + 'static {
     fn decode_from_bytes(bytes: &[u8]) -> Result<Self, crate::Error>;
 }
 
-// encode is infallible; decode carries a concrete bitcode::Error.
+// encode is infallible for bitcode; decode carries a concrete bitcode::Error.
 
-#[cfg(all(feature = "bitcode", not(feature = "serde")))]
+#[cfg(all(feature = "bitcode", not(feature = "serde"), not(feature = "rkyv")))]
 impl<T: bitcode::Encode + Send + 'static> Encode for T {
     fn encode_to_bytes(&self) -> Result<Vec<u8>, crate::Error> {
         Ok(bitcode::encode(self))
     }
 }
 
-#[cfg(all(feature = "bitcode", not(feature = "serde")))]
+#[cfg(all(feature = "bitcode", not(feature = "serde"), not(feature = "rkyv")))]
 impl<T: for<'de> bitcode::Decode<'de> + Send + 'static> Decode for T {
     fn decode_from_bytes(bytes: &[u8]) -> Result<Self, crate::Error> {
         bitcode::decode(bytes).map_err(crate::Error::Decode)
+    }
+}
+
+// rkyv wins over bitcode; both directions carry a boxed rancor error.
+
+#[cfg(all(feature = "rkyv", not(feature = "serde")))]
+impl<T> Encode for T
+where
+    T: for<'a> rkyv::Serialize<
+            rkyv::api::high::HighSerializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'a>,
+                rkyv::rancor::Error,
+            >,
+        > + Send + 'static,
+{
+    fn encode_to_bytes(&self) -> Result<Vec<u8>, crate::Error> {
+        rkyv::to_bytes::<rkyv::rancor::Error>(self)
+            .map(|v| v.to_vec())
+            .map_err(|e| crate::Error::Encode(Box::new(e)))
+    }
+}
+
+#[cfg(all(feature = "rkyv", not(feature = "serde")))]
+impl<T> Decode for T
+where
+    T: rkyv::Archive + Send + 'static,
+    T::Archived: for<'a> rkyv::bytecheck::CheckBytes<
+            rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
+        > + rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>,
+{
+    fn decode_from_bytes(bytes: &[u8]) -> Result<Self, crate::Error> {
+        rkyv::from_bytes::<T, rkyv::rancor::Error>(bytes)
+            .map_err(|e| crate::Error::Decode(Box::new(e)))
     }
 }
 

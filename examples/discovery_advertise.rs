@@ -1,9 +1,9 @@
 use std::time::Duration;
 
-use bitcode::{Decode, Encode};
+use zudp::rkyv::{Archive, Deserialize, Serialize};
 use zudp::{Discovery, DiscoveryConfig};
 
-#[derive(Debug, Clone, Encode, Decode)]
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 struct GameInfo {
     name: String,
     players: u8,

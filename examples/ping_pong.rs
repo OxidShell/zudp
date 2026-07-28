@@ -1,9 +1,9 @@
 use std::net::SocketAddr;
 
-use bitcode::{Decode, Encode};
+use zudp::rkyv::{Archive, Deserialize, Serialize};
 use zudp::Zudp;
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, Archive, Serialize, Deserialize)]
 enum Msg {
     Ping,
     Pong,

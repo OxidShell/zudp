@@ -12,26 +12,26 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use bitcode::{Decode, Encode};
+use zudp::rkyv::{Archive, Deserialize, Serialize};
 use zudp::Zudp;
 
 const STREAM_COMMANDS: u16 = 0;
 const STREAM_STATE: u16 = 1;
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, Archive, Serialize, Deserialize)]
 enum Command {
     Jump,
     Fire { target_id: u32 },
     Respawn,
 }
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, Archive, Serialize, Deserialize)]
 enum StateSnapshot {
     World { tick: u32, data: Vec<u8> },
 }
 
 // The server uses a single enum to receive from both streams.
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, Archive, Serialize, Deserialize)]
 enum ServerMsg {
     Command(Command),
     State(StateSnapshot),

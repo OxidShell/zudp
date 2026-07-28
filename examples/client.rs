@@ -1,9 +1,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bitcode::{Decode, Encode};
+use zudp::rkyv::{Archive, Deserialize, Serialize};
 use zudp::Zudp;
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, Archive, Serialize, Deserialize)]
 enum Msg {
     Ping { sent_at_us: u64 },
     Pong { sent_at_us: u64 },

@@ -10,10 +10,10 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use bitcode::{Decode, Encode};
+use zudp::rkyv::{Archive, Deserialize, Serialize};
 use zudp::{Keypair, Zudp};
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, Archive, Serialize, Deserialize)]
 enum Msg {
     Hello,
     Hi,

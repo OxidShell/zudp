@@ -6,10 +6,10 @@
 //! ## Quick start
 //!
 //! ```rust,no_run
-//! use zudp::bitcode::{Encode, Decode};
+//! use zudp::rkyv::{Archive, Deserialize, Serialize};
 //! use zudp::Zudp;
 //!
-//! #[derive(Encode, Decode)]
+//! #[derive(Archive, Serialize, Deserialize)]
 //! enum Msg { Ping, Pong, Data(Vec<u8>) }
 //!
 //! #[tokio::main]
@@ -94,8 +94,8 @@ pub struct EngineStats {
 ///
 /// ```rust,no_run
 /// # use zudp::{Zudp, Packet};
-/// # use zudp::bitcode::{Encode, Decode};
-/// # #[derive(Encode, Decode)] enum Msg { Hi }
+/// # use zudp::rkyv::{Archive, Deserialize, Serialize};
+/// # #[derive(Archive, Serialize, Deserialize)] enum Msg { Hi }
 /// # async fn f() -> Result<(), zudp::Error> {
 /// # let mut socket = Zudp::default().port(0).listen::<Msg>().await?;
 /// // field access
@@ -116,6 +116,9 @@ pub struct Packet<M> {
     pub stream: u16,
 }
 
+/// Re-exported so users can use `rkyv::Archive`, `rkyv::Serialize`, `rkyv::Deserialize` without a direct `rkyv` dependency.
+#[cfg(feature = "rkyv")]
+pub use ::rkyv;
 /// Re-exported so users can derive `Encode`/`Decode` without a direct `bitcode` dependency.
 #[cfg(feature = "bitcode")]
 pub use ::bitcode;
@@ -208,7 +211,7 @@ impl Default for Config {
 ///
 /// ```rust,no_run
 /// # use zudp::{Zudp, ZudpSocket};
-/// # #[derive(bitcode::Encode, bitcode::Decode)] enum Msg { Hi }
+/// # #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)] enum Msg { Hi }
 /// # async fn f() -> Result<(), zudp::Error> {
 /// // turbofish on the terminal call
 /// let socket = Zudp::default().port(1234).listen::<Msg>().await?;

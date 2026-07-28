@@ -1,16 +1,11 @@
 use std::{fmt, net::SocketAddr};
 
-// cfg shorthand: "exactly one codec active"
-// bitcode-only: all(feature = "bitcode", not(feature = "serde"))
-// serde-only:   all(feature = "serde",   not(feature = "bitcode"))
-// both/neither: the complement — handled by the fallback Box variants
-
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
 
     // encode is infallible (bitcode::encode returns Vec<u8>), so no Encode here.
-    #[cfg(all(feature = "bitcode", not(feature = "serde")))]
+    #[cfg(all(feature = "bitcode", not(feature = "serde"), not(feature = "rkyv")))]
     Decode(bitcode::Error),
 
     #[cfg(all(feature = "serde", not(feature = "bitcode")))]
@@ -19,15 +14,15 @@ pub enum Error {
     #[cfg(all(feature = "serde", not(feature = "bitcode")))]
     Decode(postcard::Error),
 
-    // Preserves the source error without stringly-typing it.
+    // Covers: rkyv-only, rkyv+bitcode, serde+bitcode, serde+rkyv, all three, none.
     #[cfg(not(any(
-        all(feature = "bitcode", not(feature = "serde")),
+        all(feature = "bitcode", not(feature = "serde"), not(feature = "rkyv")),
         all(feature = "serde", not(feature = "bitcode")),
     )))]
     Encode(Box<dyn std::error::Error + Send + Sync + 'static>),
 
     #[cfg(not(any(
-        all(feature = "bitcode", not(feature = "serde")),
+        all(feature = "bitcode", not(feature = "serde"), not(feature = "rkyv")),
         all(feature = "serde", not(feature = "bitcode")),
     )))]
     Decode(Box<dyn std::error::Error + Send + Sync + 'static>),
@@ -78,7 +73,7 @@ impl fmt::Display for Error {
         match self {
             Self::Io(e) => write!(f, "I/O: {e}"),
 
-            #[cfg(all(feature = "bitcode", not(feature = "serde")))]
+            #[cfg(all(feature = "bitcode", not(feature = "serde"), not(feature = "rkyv")))]
             Self::Decode(e) => write!(f, "decode: {e}"),
 
             #[cfg(all(feature = "serde", not(feature = "bitcode")))]
@@ -87,12 +82,12 @@ impl fmt::Display for Error {
             Self::Decode(e) => write!(f, "decode: {e}"),
 
             #[cfg(not(any(
-                all(feature = "bitcode", not(feature = "serde")),
+                all(feature = "bitcode", not(feature = "serde"), not(feature = "rkyv")),
                 all(feature = "serde", not(feature = "bitcode")),
             )))]
             Self::Encode(e) => write!(f, "encode: {e}"),
             #[cfg(not(any(
-                all(feature = "bitcode", not(feature = "serde")),
+                all(feature = "bitcode", not(feature = "serde"), not(feature = "rkyv")),
                 all(feature = "serde", not(feature = "bitcode")),
             )))]
             Self::Decode(e) => write!(f, "decode: {e}"),
@@ -130,7 +125,7 @@ impl std::error::Error for Error {
         match self {
             Self::Io(e) => Some(e),
 
-            #[cfg(all(feature = "bitcode", not(feature = "serde")))]
+            #[cfg(all(feature = "bitcode", not(feature = "serde"), not(feature = "rkyv")))]
             Self::Decode(e) => Some(e),
 
             #[cfg(all(feature = "serde", not(feature = "bitcode")))]
@@ -139,12 +134,12 @@ impl std::error::Error for Error {
             Self::Decode(e) => Some(e),
 
             #[cfg(not(any(
-                all(feature = "bitcode", not(feature = "serde")),
+                all(feature = "bitcode", not(feature = "serde"), not(feature = "rkyv")),
                 all(feature = "serde", not(feature = "bitcode")),
             )))]
             Self::Encode(e) => Some(e.as_ref()),
             #[cfg(not(any(
-                all(feature = "bitcode", not(feature = "serde")),
+                all(feature = "bitcode", not(feature = "serde"), not(feature = "rkyv")),
                 all(feature = "serde", not(feature = "bitcode")),
             )))]
             Self::Decode(e) => Some(e.as_ref()),
