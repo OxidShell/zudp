@@ -26,6 +26,7 @@
 //! }
 //! ```
 
+mod cc;
 mod codec;
 #[cfg(feature = "discovery")]
 mod discovery;
@@ -245,8 +246,8 @@ impl Zudp {
     /// `recv()` only delivers messages originating from `peer`.
     ///
     /// When the `security` feature is enabled and a keypair was configured via
-    /// [`.security()`](Self::security), the Noise XX handshake is initiated
-    /// automatically before returning.
+    /// [`.security()`](Self::security), the full three-message Noise XX handshake
+    /// completes before this function returns — the channel is encrypted and ready.
     ///
     /// # Errors
     /// Returns `Err` if the OS refuses to bind the requested address/port.
@@ -295,10 +296,11 @@ impl Inner {
         Ok((inner, rx))
     }
 
-    /// Initiate a Noise XX handshake toward `peer`.
+    /// Initiate a Noise XX handshake toward `peer` and block until the channel is established.
     ///
-    /// Writes msg1, stores the in-progress `HandshakeState` in the peer slot,
-    /// and returns.  The engine drives the remaining two messages.
+    /// Sends msg1, then yields to the executor while the engine drives msg2 and msg3.
+    /// Returns only after the `SecureChannel` is live, so callers cannot accidentally
+    /// send plaintext frames.  Typical wait: one network round-trip.
     #[cfg(feature = "security")]
     async fn initiate_handshake(&self, peer_addr: SocketAddr) -> Result<(), Error> {
         use security::build_initiator;
@@ -318,10 +320,22 @@ impl Inner {
             payload: Bytes::from(buf),
         }
         .encode();
-        self.engine.get_socket().send_to(&wire, peer_addr).await?;
 
         let peer = self.get_or_create_peer(peer_addr);
+
+        // Register the notification future BEFORE sending msg1.  `notify_one` stores a permit
+        // even if it fires before we first poll the future, so this ordering prevents any race
+        // between the server responding very quickly and our subsequent `.await`.
+        let notified = peer.channel_ready.notified();
+
+        self.engine.get_socket().send_to(&wire, peer_addr).await?;
         *peer.handshake.lock() = Some(hs);
+
+        // Fast path: channel already established (extremely unlikely in practice but correct).
+        // Slow path: yield until the engine calls `notify_one` after msg3.
+        if peer.channel.get().is_none() {
+            notified.await;
+        }
 
         Ok(())
     }
@@ -390,6 +404,8 @@ impl Inner {
             } else {
                 inner_wire
             };
+            // Track token usage; new sends are never delayed (latency budget).
+            peer.cc.lock().consume(wire.len());
             self.engine.get_socket().send_to(&wire, actual_dest).await?;
             peer.record_sent(stream_id, seq, plain_frame);
         } else if wrap_relay {
@@ -456,6 +472,9 @@ impl Inner {
             } else {
                 inner_wire
             };
+            // Track tokens; new fragment sends are not delayed (65 KB burst budget
+            // covers typical game state syncs without any pacing delay).
+            peer.cc.lock().consume(wire.len());
             self.engine.get_socket().send_to(&wire, actual_dest).await?;
             peer.record_sent(stream_id, seq, plain_frame);
         }
@@ -508,6 +527,21 @@ impl<M> ZudpSocket<M> {
     #[must_use = "the address is returned, not printed"]
     pub fn local_addr(&self) -> Result<SocketAddr, Error> {
         self.inner.engine.get_socket().local_addr()
+    }
+
+    /// Smoothed RTT to `peer`.  `None` until the first Pong from that peer.
+    #[must_use]
+    pub fn peer_srtt(&self, peer: SocketAddr) -> Option<Duration> {
+        self.inner.engine.peers.read().get(&peer)?.cc.lock().srtt()
+    }
+
+    /// Congestion factor for `peer` (SRTT / min_RTT).
+    ///
+    /// Values near 1.0 mean the path is clear; above 1.25 indicates buffer bloat.
+    /// `None` until at least one RTT sample has been taken.
+    #[must_use]
+    pub fn peer_congestion_factor(&self, peer: SocketAddr) -> Option<f64> {
+        self.inner.engine.peers.read().get(&peer)?.cc.lock().congestion_factor()
     }
 
     /// Send a reliable, ordered message to `peer` on stream 0.
@@ -603,6 +637,21 @@ impl<M> ZudpConn<M> {
     #[must_use = "the address is returned, not printed"]
     pub fn local_addr(&self) -> Result<SocketAddr, Error> {
         self.socket.local_addr()
+    }
+
+    /// Smoothed RTT to the bound peer.  `None` until the first Pong is received.
+    #[must_use]
+    pub fn srtt(&self) -> Option<Duration> {
+        self.socket.peer_srtt(self.peer())
+    }
+
+    /// Congestion factor (SRTT / min_RTT).
+    ///
+    /// Values near 1.0 mean the path is clear; above 1.25 indicates buffer bloat.
+    /// `None` until at least one RTT sample has been taken.
+    #[must_use]
+    pub fn congestion_factor(&self) -> Option<f64> {
+        self.socket.peer_congestion_factor(self.peer())
     }
 
     /// Send a reliable, ordered message to the bound peer on stream 0.

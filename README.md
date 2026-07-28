@@ -1,6 +1,6 @@
 # zudp
 
-Minimal UDP protocol for real-time applications. NACK-based reliability, automatic fragmentation, relay/NAT traversal, optional end-to-end encryption, and optional LAN discovery.
+Minimal UDP protocol for real-time applications. NACK-based reliability, automatic fragmentation, relay/NAT traversal, RTT-based congestion control, optional end-to-end encryption, and optional LAN discovery.
 
 ## Quick start
 
@@ -13,13 +13,13 @@ enum Msg { Ping, Pong }
 
 // listener — accepts any peer
 let mut socket = Zudp::default().port(5000).listen::<Msg>().await?;
-let (msg, from, stream_id) = socket.recv().await?;  // stream_id = 0 for default stream
-socket.send(Msg::Pong, from).await?;
+let pkt = socket.recv().await?;   // pkt.msg, pkt.from, pkt.stream
+socket.send(Msg::Pong, pkt.from).await?;
 
 // single-peer connection
 let mut conn = Zudp::default().port(0).connect::<Msg>(peer).await?;
 conn.send(Msg::Ping).await?;
-let (reply, stream_id) = conn.recv().await?;
+let pkt = conn.recv().await?;     // pkt.msg, pkt.from (== peer), pkt.stream
 ```
 
 ## Builder options
@@ -42,17 +42,39 @@ Zudp::default()
 Each reliable connection supports up to 65 535 independent ordered streams. Streams have separate sequence spaces, so packet loss on one stream never delays delivery on another (no head-of-line blocking).
 
 ```rust
-// server: recv returns (message, peer_addr, stream_id)
-let (msg, from, stream_id) = socket.recv().await?;
-socket.send_stream(reply, from, stream_id).await?;   // reply on same stream
+// server
+let pkt = socket.recv().await?;
+socket.send_stream(reply, pkt.from, pkt.stream).await?;  // reply on same stream
 
 // client: send to specific stream
-conn.send_stream(Msg::Command(cmd), 0).await?;         // stream 0 — commands
-conn.send_stream(Msg::Snapshot(data), 1).await?;       // stream 1 — snapshots
-let (msg, stream_id) = conn.recv().await?;             // from any stream
+conn.send_stream(Msg::Command(cmd), 0).await?;           // stream 0 — commands
+conn.send_stream(Msg::Snapshot(data), 1).await?;         // stream 1 — snapshots
+let pkt = conn.recv().await?;                            // pkt.stream tells which
 ```
 
 `DEFAULT_STREAM = 0`. `send()` / `recv()` target stream 0 — existing code continues to work unchanged.
+
+## Congestion control
+
+Built-in BBR-lite per peer — RTT-based, not loss-based, so it detects queue build-up before drops occur.
+
+- RTT measured from Ping/Pong echo timestamps; EWMA smoothed.
+- Pacing rate adjusts: backs off when `srtt > 1.25 × min_rtt`, probes up otherwise.
+- 65 KB burst allowance covers typical game state syncs without any delay.
+- NACK retransmits are paced (up to 10 ms inter-send); new sends are never delayed.
+
+```rust
+// query congestion state on a conn
+if let Some(rtt) = conn.srtt() {
+    println!("RTT {rtt:?}");
+}
+if let Some(factor) = conn.congestion_factor() {
+    if factor > 1.25 { /* consider reducing send rate */ }
+}
+
+// same on a multi-peer socket
+if let Some(rtt) = socket.peer_srtt(peer_addr) { /* … */ }
+```
 
 ## End-to-end encryption
 
@@ -71,7 +93,7 @@ let mut socket = Zudp::default()
     .listen::<Msg>()
     .await?;
 
-// Client — connect; Noise XX handshake happens automatically.
+// Client — connect; Noise XX handshake completes before connect() returns.
 let mut conn = Zudp::default()
     .port(0)
     .security(Keypair::generate())
@@ -80,10 +102,10 @@ let mut conn = Zudp::default()
 
 // Send/recv API is identical — encryption is transparent.
 conn.send(Msg::Ping).await?;
-let reply = conn.recv().await?;
+let pkt = conn.recv().await?;
 ```
 
-The three Noise handshake messages are exchanged before any data flows. Reliable frames (Stream, Fragment) are encrypted; keepalive Ping/Pong and Nack frames are not. NACK retransmits re-encrypt with a fresh nonce to prevent nonce reuse.
+All three Noise handshake messages complete inside `connect()` — the channel is encrypted and ready before the first `send()`. Reliable frames (Stream, Fragment) are encrypted; keepalive Ping/Pong and Nack frames are not. NACK retransmits re-encrypt with a fresh nonce to prevent nonce reuse.
 
 ## LAN discovery
 
@@ -119,19 +141,6 @@ let peer = stream.next().await?;
 `DiscoveryConfig` builder: `.discovery_port(u16)`, `.probe_interval(Duration)`.
 `AppId` is derived from the app name string via a stable FNV-1a hash.
 
-## Codec features
-
-```toml
-zudp = { version = "0.1", default-features = false, features = ["serde"] }
-```
-
-| Feature | Codec | Error type |
-|---|---|---|
-| `bitcode` (default) | bitcode | `bitcode::Error` |
-| `serde` | postcard | `postcard::Error` |
-| both | postcard | `Box<dyn Error>` |
-| neither | manual impls | `Box<dyn Error>` |
-
 ## Relay
 
 The relay node is a plain `ZudpSocket` — no special configuration needed.
@@ -162,6 +171,19 @@ When the local interface changes (WiFi → mobile, DHCP renew, VPN toggle), ZUDP
 4. Traffic resumes — no reconnect, no application-level handling required.
 
 Works for client→server topologies where the server has a public IP.  P2P connections where both peers are behind NAT require a relay.
+
+## Codec features
+
+```toml
+zudp = { version = "0.2", default-features = false, features = ["serde"] }
+```
+
+| Feature | Codec | Error type |
+|---|---|---|
+| `bitcode` (default) | bitcode | `bitcode::Error` |
+| `serde` | postcard | `postcard::Error` |
+| both | postcard | `Box<dyn Error>` |
+| neither | manual impls | `Box<dyn Error>` |
 
 ## License
 

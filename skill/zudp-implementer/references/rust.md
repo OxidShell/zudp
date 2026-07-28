@@ -102,6 +102,10 @@ let pkt = conn.recv().await?;   // pkt.msg, pkt.from, pkt.stream
 conn.send_stream(Msg::Ping, 1).await?;
 ```
 
+When the `security` feature is enabled, `connect()` blocks until the full Noise XX
+handshake (3 messages) completes.  The channel is encrypted and ready before the first
+`send()` can be called.
+
 ---
 
 ## Builder options
@@ -242,6 +246,35 @@ println!("peer is now {}", conn.peer());
 - Client configured with `.relay(...)` — relay table updates automatically
 
 **Does not work for:** P2P where both peers are behind NAT without a relay (NAT mappings expire on network change).
+
+---
+
+## Congestion control
+
+Built-in per peer; no configuration required.  RTT samples are collected automatically from
+Ping/Pong exchanges.
+
+```rust
+// ZudpConn — query congestion state
+if let Some(rtt) = conn.srtt() {
+    println!("RTT: {rtt:?}");
+}
+if let Some(factor) = conn.congestion_factor() {
+    if factor > 1.25 {
+        // srtt has grown > 25% above min_rtt → queue building
+        // consider reducing voluntary send rate or switching to unreliable
+    }
+}
+
+// ZudpSocket — per-peer query
+if let Some(rtt) = socket.peer_srtt(peer_addr) { /* … */ }
+if let Some(f)   = socket.peer_congestion_factor(peer_addr) { /* … */ }
+```
+
+- `srtt()` / `peer_srtt()` — smoothed RTT as `Option<Duration>` (`None` until first Pong).
+- `congestion_factor()` — `srtt / min_rtt`; below 1.25 = path clear; above 1.25 = bloat.
+- NACK retransmits are automatically paced (up to 10 ms inter-send) when the token bucket is overdrawn; new sends are never delayed.
+- The 65 KB burst allowance covers typical game state syncs without any pacing delay.
 
 ---
 

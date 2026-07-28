@@ -1,6 +1,6 @@
 # ZUDP Protocol Specification
 
-Version 0.1 — wire format is not yet stable.
+Version 0.2 — wire format is not yet stable.
 
 ---
 
@@ -103,6 +103,8 @@ Reply to a Ping.  Mirrors `echo` unchanged; carries the **replier's** own `sessi
 ```
 
 Receiving any frame from a peer updates `last_seen`.  Neither Ping nor Pong carry sequence numbers; they are not tracked for retransmission.
+
+The `echo` round-trip is also used by the congestion controller: the receiver computes `rtt_us = (now_ms − echo) × 1000` and feeds it into the per-peer RTT estimator (see *Congestion Control* below).
 
 ### Fragment — `0x05`
 
@@ -338,6 +340,8 @@ Initiator                              Responder
 
 The initiator is always the node that called `Zudp::connect()`. The responder is the node that called `Zudp::listen()`. The engine drives the handshake automatically.
 
+`Zudp::connect()` **blocks until all three messages complete** before returning to the caller. This guarantees that no application data can be sent before the `SecureChannel` is established. Implementations must enforce the same invariant: do not expose a send API on the connection handle until `into_stateless_transport_mode()` has been called successfully.
+
 ### Encrypted send path
 
 1. Encode the inner frame (Stream / Fragment) as usual.
@@ -367,6 +371,67 @@ The initiator is always the node that called `Zudp::connect()`. The responder is
 ### Nonce exhaustion
 
 The send nonce is a monotonically increasing `u64` starting from 0. At a rate of one million messages per second it takes ~585 000 years to exhaust. No special handling is needed.
+
+---
+
+## Congestion Control
+
+ZUDP uses a BBR-lite congestion controller per peer.  It is RTT-based (not loss-based), so it responds to queue build-up before packet loss occurs — important for gaming where a single NACK stall is already harmful.
+
+### RTT estimation
+
+RTT samples come from Ping/Pong echo timestamps (millisecond resolution).  Each Pong yields:
+
+```
+rtt_us = (now_ms − echo) × 1000
+```
+
+The smoothed RTT (`srtt`) is an EWMA with α = 1/8:
+
+```
+srtt = 7/8 × srtt + 1/8 × rtt_sample
+```
+
+The minimum RTT (`min_rtt`) is the smallest sample observed within a rolling 10-second window.  When the window expires it resets to the current sample.
+
+### Pacing rate
+
+An estimated pacing rate (bytes/second) is maintained per peer:
+
+- Initial value: 1 MB/s.
+- On each RTT sample, compute `inflation = srtt / min_rtt`.
+  - `inflation > 1.25` → queue bloat detected → `pacing_rate × 0.75` (multiplicative decrease, floor 10 KB/s).
+  - `inflation ≤ 1.25` → path clear → `pacing_rate × 1.05` (additive increase, ceiling 100 MB/s).
+
+### Token bucket
+
+A per-peer token bucket controls the effective send rate.  Tokens refill at `pacing_rate` bytes/second; sending `N` bytes deducts `N` tokens.  The bucket caps at `65 535` bytes (burst allowance), which is enough to send a typical game state sync without any delay.
+
+When the bucket is overdrawn, `consume(bytes)` returns a suggested sleep duration:
+
+```
+sleep = min(−tokens / pacing_rate, 10 ms)
+```
+
+The 10 ms cap ensures congestion never completely stalls a retransmit.
+
+### Send-path policy
+
+| Send type | Token tracking | Pacing delay |
+|---|---|---|
+| New reliable send (`send`, `send_stream`) | yes | **never** — gaming latency budget |
+| Fragmented send (`send` > MTU) | yes | **never** — burst allowance covers typical sizes |
+| NACK retransmit | yes | **yes** (up to 10 ms) — retransmits tolerate small delay |
+| Unreliable datagram | no | never |
+
+Retransmit pacing is performed in a dedicated spawned task so the engine receive loop is never stalled.
+
+### Exposed metrics
+
+Implementations should expose per-peer congestion state for application use:
+
+- `srtt(): Option<Duration>` — smoothed RTT; `None` until first Pong.
+- `congestion_factor(): Option<f64>` — `srtt / min_rtt`; values near 1.0 mean path is clear.
 
 ---
 

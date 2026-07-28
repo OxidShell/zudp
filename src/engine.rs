@@ -244,15 +244,33 @@ async fn dispatch_frame(
         }
 
         Frame::Nack { stream_id, seqs } => {
-            let peer_opt = inner.peers.read().get(&from).cloned();
-            if let Some(peer) = peer_opt {
+            if let Some(peer) = inner.peers.read().get(&from).cloned() {
                 let to_retransmit = peer.frames_for_retransmit(stream_id, &seqs);
-                for (seq, plain_frame) in to_retransmit {
-                    let wire = encrypt_or_plain(&peer, &plain_frame);
-                    tracing::debug!(target: "zudp::engine", peer = %from, seq, stream_id, "retransmit on NACK");
-                    if let Err(e) = inner.get_socket().send_to(&wire, from).await {
-                        tracing::warn!(target: "zudp::engine", peer = %from, "retransmit failed: {e}");
-                    }
+                if !to_retransmit.is_empty() {
+                    // Spawn so the engine recv loop isn't stalled by pacing sleeps.
+                    let sock = inner.get_socket();
+                    tokio::spawn(async move {
+                        for (seq, plain_frame) in to_retransmit {
+                            let wire = encrypt_or_plain(&peer, &plain_frame);
+                            // Extract delay before awaiting — MutexGuard is not Send.
+                            let delay = peer.cc.lock().consume(wire.len());
+                            if let Some(d) = delay {
+                                tokio::time::sleep(d).await;
+                            }
+                            tracing::debug!(
+                                target: "zudp::engine",
+                                peer = %from, seq, stream_id,
+                                "retransmit on NACK"
+                            );
+                            if let Err(e) = sock.send_to(&wire, from).await {
+                                tracing::warn!(
+                                    target: "zudp::engine",
+                                    peer = %from,
+                                    "retransmit failed: {e}"
+                                );
+                            }
+                        }
+                    });
                 }
             }
         }
@@ -265,11 +283,23 @@ async fn dispatch_frame(
             }
         }
 
-        Frame::Pong { session_id, .. } => {
-            // Learn the remote's session ID from their Pong if not yet known.
+        Frame::Pong { echo, session_id } => {
             if let Some(peer) = inner.peers.read().get(&from).cloned() {
                 if peer.store_their_session_id(session_id) {
-                    inner.sessions.write().insert(session_id, peer);
+                    inner.sessions.write().insert(session_id, peer.clone());
+                }
+                // RTT sample: echo is the ms timestamp we stamped in the Ping.
+                let now_ms = now_millis();
+                if echo <= now_ms {
+                    let rtt_us = (now_ms - echo).saturating_mul(1_000);
+                    peer.cc.lock().on_rtt_sample(rtt_us);
+                    tracing::debug!(
+                        target: "zudp::engine",
+                        peer = %from,
+                        rtt_us,
+                        pacing_rate = peer.cc.lock().pacing_rate as u64,
+                        "RTT sample"
+                    );
                 }
             }
         }
@@ -549,6 +579,8 @@ async fn handle_handshake(payload: Bytes, from: SocketAddr, inner: &Arc<EngineIn
         match hs.into_stateless_transport_mode() {
             Ok(transport) => {
                 let _ = peer.channel.set(SecureChannel::new(transport));
+                // Unblock connect() which may be waiting for encryption to be active.
+                peer.channel_ready.notify_one();
                 tracing::info!(target: "zudp::engine", peer = %from, "Noise XX handshake complete");
             }
             Err(e) => {

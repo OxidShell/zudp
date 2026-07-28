@@ -16,6 +16,7 @@ use parking_lot::{Mutex, RwLock};
 
 #[cfg(feature = "security")]
 use crate::security::SecureChannel;
+use crate::cc::CongestionCtrl;
 
 // ── Send-side ────────────────────────────────────────────────────────────────
 
@@ -39,12 +40,18 @@ pub struct PeerState {
     pub sent: Mutex<HashMap<u16, BTreeMap<u64, SentPacket>>>,
     pub last_sent: Mutex<Instant>,
     pub last_seen: Mutex<Instant>,
+    /// RTT-based congestion controller; updated on every Pong.
+    pub cc: Mutex<CongestionCtrl>,
     /// In-progress Noise XX handshake state; `None` once the channel is established.
     #[cfg(feature = "security")]
     pub handshake: Mutex<Option<snow::HandshakeState>>,
     /// Established Noise transport channel; set exactly once after handshake completes.
     #[cfg(feature = "security")]
     pub channel: OnceLock<SecureChannel>,
+    /// Notified (via `notify_one`) when `channel` transitions from `None` to `Some`.
+    /// `connect()` awaits this so it never returns before encryption is active.
+    #[cfg(feature = "security")]
+    pub channel_ready: tokio::sync::Notify,
 }
 
 impl PeerState {
@@ -59,10 +66,13 @@ impl PeerState {
             sent: Mutex::new(HashMap::new()),
             last_sent: Mutex::new(now),
             last_seen: Mutex::new(now),
+            cc: Mutex::new(CongestionCtrl::new()),
             #[cfg(feature = "security")]
             handshake: Mutex::new(None),
             #[cfg(feature = "security")]
             channel: OnceLock::new(),
+            #[cfg(feature = "security")]
+            channel_ready: tokio::sync::Notify::new(),
         }
     }
 

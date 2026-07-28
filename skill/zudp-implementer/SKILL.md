@@ -39,14 +39,15 @@ Build bottom-up and test each layer before starting the next.  Skipping ahead pr
 untestable integration bugs.
 
 ```
-1. Frame codec          — encode / decode every frame type; roundtrip test each
-2. Raw UDP socket       — send_to, recv_from, SO_REUSEPORT, buffer sizes
-3. Reliability layer    — RecvState (reorder buffer) + send buffer (retransmit map)
-4. Fragmentation        — split on send, reassemble on recv
-5. Engine / event loop  — background read loop, NACK dispatch, keepalive tick
-6. Public API           — listen / connect / send / recv
-7. Relay (optional)     — wrap/unwrap Relay frames
-8. Discovery (optional) — Probe/Beacon, SO_BROADCAST socket
+1. Frame codec            — encode / decode every frame type; roundtrip test each
+2. Raw UDP socket         — send_to, recv_from, SO_REUSEPORT, buffer sizes
+3. Reliability layer      — RecvState (reorder buffer) + send buffer (retransmit map)
+4. Fragmentation          — split on send, reassemble on recv
+5. Engine / event loop    — background read loop, NACK dispatch, keepalive tick
+6. Public API             — listen / connect / send / recv
+7. Congestion control     — CongestionCtrl per peer, RTT from Pong echo, token bucket
+8. Relay (optional)       — wrap/unwrap Relay frames
+9. Discovery (optional)   — Probe/Beacon, SO_BROADCAST socket
 ```
 
 ---
@@ -138,6 +139,39 @@ on recv(stream_id, seq, payload):
 - Reply to every Ping with Pong mirroring `echo`; Pong carries the **replier's** `session_id`.
 - The keepalive tick fires at `keepalive_interval / 4` to avoid missing the threshold.
 - On first receipt of a Ping/Pong, store the remote's `session_id` in a `sessions` map keyed by that ID; this enables migration detection (see below).
+
+### Congestion control
+
+Per-peer RTT-based congestion control (BBR-lite).
+
+**RTT measurement** — on Pong receipt:
+```
+rtt_us = (now_ms − echo) × 1000
+srtt   = 7/8 × srtt + 1/8 × rtt_us   (EWMA, α = 1/8)
+min_rtt = rolling minimum over 10-second window
+```
+
+**Pacing rate adjustment** — on each RTT sample:
+```
+inflation = srtt / min_rtt
+if inflation > 1.25: pacing_rate *= 0.75   (floor 10 KB/s)
+else:                pacing_rate *= 1.05   (ceiling 100 MB/s)
+```
+Initial pacing_rate: 1 MB/s.
+
+**Token bucket** — charge `N` bytes on every reliable send:
+```
+tokens += pacing_rate × elapsed_seconds   (cap: 65 535 B burst allowance)
+tokens -= N
+if tokens < 0: suggest_sleep = min(−tokens / pacing_rate, 10 ms)
+```
+
+**Send-path policy**:
+- New sends (reliable + fragment): consume tokens, **never sleep** — gaming latency budget.
+- NACK retransmits: consume tokens, **sleep up to 10 ms** if overdrawn — retransmit is already late, small delay acceptable. Run in a spawned task so the recv loop is never blocked.
+- Unreliable datagrams: bypass CC entirely.
+
+**Exposed metrics**: `srtt(): Option<Duration>`, `congestion_factor(): Option<f64>` (= srtt/min_rtt).
 
 ### Relay (stateful, bidirectional)
 - The relay node is a plain ZUDP socket — no special configuration flag.
@@ -245,9 +279,17 @@ Do not mark the implementation done until every item passes.
 
 ### Security / Noise XX (if implemented)
 - [ ] Noise XX handshake completes (3 messages exchanged): initiator → msg1, responder → msg2, initiator → msg3.
+- [ ] `connect()` (or equivalent) **blocks until all 3 messages complete** — the caller cannot send before encryption is active.
 - [ ] After handshake, send a reliable message; it arrives decrypted on the other side.
 - [ ] NACK retransmit re-encrypts with a **fresh nonce** (no nonce reuse).
 - [ ] Replay detection: receiving the same `(nonce, ciphertext)` a second time is rejected.
+
+### Congestion control (unit)
+- [ ] `on_rtt_sample` with a constant RTT produces stable srtt ≈ that value.
+- [ ] When `srtt > 1.25 × min_rtt`, pacing_rate decreases; when `srtt ≤ min_rtt`, it increases.
+- [ ] `consume(N)` returns `None` while token bucket is positive; returns `Some(Duration ≤ 10 ms)` when overdrawn.
+- [ ] Token bucket refills over time: after sleeping for `pacing_rate / N` seconds, bucket returns to positive.
+- [ ] NACK retransmits are paced (sleep is honoured); new `send()` calls are never delayed.
 
 ---
 
@@ -275,3 +317,12 @@ Do not mark the implementation done until every item passes.
 - **Using `TransportState` instead of `StatelessTransportState`.** `TransportState` tracks nonces
   internally and increments them sequentially.  UDP packets arrive out-of-order, so this breaks.
   Always use `into_stateless_transport_mode()` for ZUDP.
+- **Returning from `connect()` before Noise XX completes.** If the connection handle is exposed
+  before `into_stateless_transport_mode()` is called, the first `send()` will transmit plaintext.
+  Block inside `connect()` (e.g. via a `Notify`) until the channel is established.
+- **Sleeping for retransmit pacing inside the recv loop.** If the engine's main read loop sleeps
+  to pace a NACK retransmit batch, it stops receiving packets for the sleep duration.  Always run
+  paced retransmit batches in a spawned task.
+- **Pacing new sends (latency-sensitive).** The token bucket applies only to retransmits.  New
+  game sends must never block on CC — games require bounded latency on the outbound path.  The
+  65 KB burst allowance is sized so typical game state syncs send without any delay.
