@@ -9,6 +9,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use tokio::{sync::mpsc, task::JoinSet, time};
 
@@ -44,9 +45,9 @@ const INBOUND_CAP: usize = 8_192;
 pub(crate) struct EngineInner {
     /// Current socket; replaced atomically on rebind.  Use [`get_socket`] to obtain a cheap clone.
     pub socket: RwLock<RawSocket>,
-    pub peers: RwLock<HashMap<SocketAddr, Arc<PeerState>>>,
+    pub peers: DashMap<SocketAddr, Arc<PeerState>>,
     /// Reverse index: remote's `my_session_id` → peer, for detecting address migrations.
-    pub sessions: RwLock<HashMap<u64, Arc<PeerState>>>,
+    pub sessions: DashMap<u64, Arc<PeerState>>,
     pub config: Arc<Config>,
     /// Noise keypair for the `security` feature; `None` when security is disabled.
     #[cfg(feature = "security")]
@@ -69,24 +70,13 @@ impl EngineInner {
     }
 
     pub fn get_or_create_peer(self: &Arc<Self>, addr: SocketAddr) -> Arc<PeerState> {
-        {
-            let r = self.peers.read();
-            if let Some(p) = r.get(&addr) {
-                return p.clone();
-            }
+        if let Some(p) = self.peers.get(&addr) {
+            return p.value().clone();
         }
-        let mut w = self.peers.write();
-        // Re-check under write lock; another task may have inserted it.
-        if let Some(p) = w.get(&addr) {
-            return p.clone();
-        }
-        if w.len() >= self.config.max_peers {
-            // Evict the peer that has been silent the longest (LRU-by-last-seen).
-            // O(n) at cap — happens at most once per new peer beyond the limit.
-            let evict_addr = w
-                .iter()
-                .min_by_key(|(_, p)| *p.last_seen.lock())
-                .map(|(&a, _)| a);
+        if self.peers.len() >= self.config.max_peers {
+            let evict_addr = self.peers.iter()
+                .min_by_key(|r| *r.value().last_seen.lock())
+                .map(|r| *r.key());
             if let Some(evict) = evict_addr {
                 tracing::warn!(
                     target: "zudp::engine",
@@ -94,13 +84,14 @@ impl EngineInner {
                     new = %addr,
                     "peer table full — evicting least-recently-seen peer"
                 );
-                w.remove(&evict);
+                self.peers.remove(&evict);
             }
             self.dropped_peer_cap.fetch_add(1, Ordering::Relaxed);
         }
-        let peer = Arc::new(PeerState::new(addr));
-        w.insert(addr, peer.clone());
-        peer
+        self.peers.entry(addr)
+            .or_insert_with(|| Arc::new(PeerState::new(addr)))
+            .value()
+            .clone()
     }
 }
 
@@ -241,7 +232,7 @@ async fn rebind_socket(inner: &Arc<EngineInner>) -> Result<RawSocket, crate::Err
 /// Send a Ping carrying our session ID to every known peer so they update our address.
 async fn ping_all_peers(inner: &Arc<EngineInner>, sock: &RawSocket) {
     let now_ms = now_micros();
-    let peers: Vec<Arc<PeerState>> = inner.peers.read().values().cloned().collect();
+    let peers: Vec<Arc<PeerState>> = inner.peers.iter().map(|r| r.value().clone()).collect();
     for peer in peers {
         let ping = secure_frame(&peer, Frame::Ping { echo: now_ms, session_id: peer.my_session_id });
         if let Err(e) = sock.send_to(&ping, peer.addr()).await {
@@ -280,7 +271,7 @@ async fn handle_incoming(
         }
     };
 
-    let known_peer = inner.peers.read().get(&from).cloned();
+    let known_peer = inner.peers.get(&from).map(|r| r.value().clone());
     if let Some(peer) = &known_peer {
         peer.mark_seen();
     }
@@ -369,7 +360,7 @@ async fn dispatch_frame(
         }
 
         Frame::Nack { stream_id, seqs } => {
-            if let Some(peer) = inner.peers.read().get(&from).cloned() {
+            if let Some(peer) = inner.peers.get(&from).map(|r| r.value().clone()) {
                 let to_retransmit = peer.frames_for_retransmit(stream_id, &seqs);
                 if !to_retransmit.is_empty() {
                     if retransmit_tasks.len() >= MAX_RETRANSMIT_TASKS {
@@ -418,9 +409,9 @@ async fn dispatch_frame(
         }
 
         Frame::Pong { echo, session_id } => {
-            if let Some(peer) = inner.peers.read().get(&from).cloned() {
+            if let Some(peer) = inner.peers.get(&from).map(|r| r.value().clone()) {
                 if peer.store_their_session_id(session_id) {
-                    inner.sessions.write().insert(session_id, peer.clone());
+                    inner.sessions.insert(session_id, peer.clone());
                 }
                 // echo carries a µs timestamp; RTT is the round-trip in microseconds.
                 let now_us = now_micros();
@@ -521,7 +512,7 @@ async fn dispatch_frame(
         Frame::MtuProbe { probe_id, .. } => {
             // Reflect probe_id in a tiny MtuAck — always gets through regardless of path MTU.
             let ack_frame = Frame::MtuAck { probe_id };
-            let ack = if let Some(peer) = inner.peers.read().get(&from).cloned() {
+            let ack = if let Some(peer) = inner.peers.get(&from).map(|r| r.value().clone()) {
                 secure_frame(&peer, ack_frame)
             } else {
                 ack_frame.encode()
@@ -532,7 +523,7 @@ async fn dispatch_frame(
         }
 
         Frame::MtuAck { probe_id } => {
-            if let Some(peer) = inner.peers.read().get(&from).cloned()
+            if let Some(peer) = inner.peers.get(&from).map(|r| r.value().clone())
                 && let Some(tx) = peer.probe_acks.lock().remove(&probe_id)
             {
                 let _ = tx.send(());
@@ -558,15 +549,15 @@ fn find_or_migrate_peer(
     recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
 ) -> Arc<PeerState> {
     // Fast path: familiar address.
-    if let Some(peer) = inner.peers.read().get(&from).cloned() {
+    if let Some(peer) = inner.peers.get(&from).map(|r| r.value().clone()) {
         if peer.store_their_session_id(session_id) {
-            inner.sessions.write().insert(session_id, peer.clone());
+            inner.sessions.insert(session_id, peer.clone());
         }
         return peer;
     }
 
     // Migration: known session but new address.
-    if let Some(peer) = inner.sessions.read().get(&session_id).cloned() {
+    if let Some(peer) = inner.sessions.get(&session_id).map(|r| r.value().clone()) {
         let old_addr = peer.addr();
         if old_addr != from {
             tracing::info!(
@@ -576,11 +567,8 @@ fn find_or_migrate_peer(
                 "peer address migrated"
             );
             peer.migrate_to(from);
-            {
-                let mut peers = inner.peers.write();
-                peers.remove(&old_addr);
-                peers.insert(from, peer.clone());
-            }
+            inner.peers.remove(&old_addr);
+            inner.peers.insert(from, peer.clone());
             // Move all recv_states from old key to new key.
             let stream_ids: Vec<u16> = recv_states
                 .keys()
@@ -602,7 +590,7 @@ fn find_or_migrate_peer(
     // First contact: create peer, register session, and discover path MTU.
     let peer = inner.get_or_create_peer(from);
     peer.store_their_session_id(session_id);
-    inner.sessions.write().insert(session_id, peer.clone());
+    inner.sessions.insert(session_id, peer.clone());
     spawn_mtu_probe(inner, from);
     peer
 }
@@ -616,7 +604,7 @@ fn spawn_mtu_probe(inner: &Arc<EngineInner>, peer_addr: SocketAddr) {
     let initial_mtu = inner.config.mtu;
     let _mtu_probe = tokio::spawn(async move {
         let discovered = crate::mtu::probe(&inner, peer_addr, initial_mtu).await;
-        if let Some(p) = inner.peers.read().get(&peer_addr) {
+        if let Some(p) = inner.peers.get(&peer_addr) {
             p.set_effective_mtu(discovered);
         }
         tracing::info!(
@@ -672,7 +660,7 @@ async fn send_nack_if_needed(
     }
     tracing::debug!(target: "zudp::engine", peer = %to, count = nack_seqs.len(), stream_id, "sending NACK");
     let nack = Frame::Nack { stream_id, seqs: nack_seqs };
-    let wire = if let Some(peer) = inner.peers.read().get(&to).cloned() {
+    let wire = if let Some(peer) = inner.peers.get(&to).map(|r| r.value().clone()) {
         secure_frame(&peer, nack)
     } else {
         nack.encode()
@@ -696,7 +684,7 @@ fn run_background(
     let keepalive_threshold = keepalive_interval.as_secs();
     let now_ms = now_micros();
 
-    let peers: Vec<Arc<PeerState>> = inner.peers.read().values().cloned().collect();
+    let peers: Vec<Arc<PeerState>> = inner.peers.iter().map(|r| r.value().clone()).collect();
 
     for peer in peers {
         if peer.secs_since_sent() >= keepalive_threshold {

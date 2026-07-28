@@ -130,7 +130,6 @@ pub use ::serde;
 pub use ::postcard;
 
 use std::{
-    collections::HashMap,
     marker::PhantomData,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
@@ -141,6 +140,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use engine::EngineInner;
@@ -379,7 +379,7 @@ impl Zudp {
                 )
                 .await
                 .unwrap_or(initial_mtu);
-                if let Some(p) = inner.peers.read().get(&peer) {
+                if let Some(p) = inner.peers.get(&peer) {
                     p.set_effective_mtu(discovered);
                 }
                 tracing::info!(target: "zudp::mtu", peer = %peer, mtu = discovered, "path MTU discovered");
@@ -406,8 +406,8 @@ impl Inner {
         let config = Arc::new(config);
         let engine = Arc::new(EngineInner {
             socket: RwLock::new(socket),
-            peers: RwLock::new(HashMap::new()),
-            sessions: RwLock::new(HashMap::new()),
+            peers: DashMap::new(),
+            sessions: DashMap::new(),
             config: config.clone(),
             #[cfg(feature = "security")]
             keypair: config.security.clone(),
@@ -669,7 +669,7 @@ impl<M> ZudpSocket<M> {
     /// Smoothed RTT to `peer`.  `None` until the first Pong from that peer.
     #[must_use]
     pub fn peer_srtt(&self, peer: SocketAddr) -> Option<Duration> {
-        self.inner.engine.peers.read().get(&peer)?.cc.lock().srtt()
+        self.inner.engine.peers.get(&peer)?.cc.lock().srtt()
     }
 
     /// Congestion factor for `peer` (SRTT / min_RTT).
@@ -678,13 +678,13 @@ impl<M> ZudpSocket<M> {
     /// `None` until at least one RTT sample has been taken.
     #[must_use]
     pub fn peer_congestion_factor(&self, peer: SocketAddr) -> Option<f64> {
-        self.inner.engine.peers.read().get(&peer)?.cc.lock().congestion_factor()
+        self.inner.engine.peers.get(&peer)?.cc.lock().congestion_factor()
     }
 
     /// Full statistics snapshot for `peer`.  `None` if the peer is not in the table.
     #[must_use]
     pub fn peer_stats(&self, peer: SocketAddr) -> Option<PeerStats> {
-        let p = self.inner.engine.peers.read().get(&peer)?.clone();
+        let p = self.inner.engine.peers.get(&peer)?.value().clone();
         let (srtt, congestion_factor, pacing_rate_bps) = {
             let cc = p.cc.lock();
             // pacing_rate is bounded to [10_000, 100_000_000] — cast is safe.
@@ -836,7 +836,6 @@ impl<M> ZudpConn<M> {
             .inner
             .engine
             .peers
-            .read()
             .get(&self.peer())
             .map(|p| p.effective_mtu_or(0))
             .filter(|&v| v != 0)
