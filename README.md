@@ -5,10 +5,10 @@ Minimal UDP protocol for real-time applications. NACK-based reliability, automat
 ## Quick start
 
 ```rust
-use bitcode::{Encode, Decode};
+use zudp::rkyv::{Archive, Deserialize, Serialize};
 use zudp::Zudp;
 
-#[derive(Encode, Decode)]
+#[derive(Archive, Serialize, Deserialize)]
 enum Msg { Ping, Pong }
 
 // listener — accepts any peer
@@ -162,7 +162,7 @@ Requires `features = ["discovery"]`.
 ```rust
 use zudp::{Discovery, DiscoveryConfig};
 
-#[derive(Encode, Decode, Clone)]
+#[derive(Archive, Serialize, Deserialize, Clone)]
 struct GameInfo { name: String, players: u8 }
 
 // advertise — responds to probes from scanners on the same LAN

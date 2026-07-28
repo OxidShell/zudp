@@ -10,11 +10,12 @@ implementing the wire protocol; that is in `SKILL.md` and `PROTOCOL.md`.
 
 ```toml
 [dependencies]
-zudp = "0.2"                                                        # bitcode codec (default)
-zudp = { version = "0.2", features = ["security"] }                 # + Noise XX encryption
-zudp = { version = "0.2", features = ["discovery"] }                # + LAN peer discovery
-zudp = { version = "0.2", features = ["security", "discovery"] }    # both
-zudp = { version = "0.2", default-features = false, features = ["serde"] } # postcard codec
+zudp = "0.3"                                                        # rkyv codec (default)
+zudp = { version = "0.3", features = ["security"] }                 # + Noise XX encryption
+zudp = { version = "0.3", features = ["discovery"] }                # + LAN peer discovery
+zudp = { version = "0.3", features = ["security", "discovery"] }    # both
+zudp = { version = "0.3", default-features = false, features = ["serde"] }   # postcard codec
+zudp = { version = "0.3", default-features = false, features = ["bitcode"] } # bitcode codec
 ```
 
 ---
@@ -22,12 +23,12 @@ zudp = { version = "0.2", default-features = false, features = ["serde"] } # pos
 ## Message types
 
 Every message type must implement `zudp::Encode` + `zudp::Decode`.
-With the default `bitcode` feature, derive them via `bitcode`:
+With the default `rkyv` feature, derive the three rkyv traits:
 
 ```rust
-use bitcode::{Encode, Decode};
+use zudp::rkyv::{Archive, Deserialize, Serialize};
 
-#[derive(Encode, Decode)]
+#[derive(Archive, Serialize, Deserialize)]
 enum Msg {
     Ping,
     Pong,
@@ -36,7 +37,16 @@ enum Msg {
 }
 ```
 
-With the `serde` feature, implement `serde::Serialize` + `serde::Deserialize` instead:
+With `default-features = false, features = ["bitcode"]`:
+
+```rust
+use zudp::bitcode::{Encode, Decode};
+
+#[derive(Encode, Decode)]
+enum Msg { /* … */ }
+```
+
+With `default-features = false, features = ["serde"]`:
 
 ```rust
 use serde::{Serialize, Deserialize};
@@ -326,7 +336,7 @@ Key points:
 ```rust
 use zudp::{Discovery, DiscoveryConfig};
 
-#[derive(Encode, Decode, Clone)]
+#[derive(Archive, Serialize, Deserialize, Clone)]
 struct GameInfo { name: String, players: u8 }
 
 // start advertising; handle keeps the task alive
