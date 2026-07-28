@@ -54,7 +54,6 @@ pub(crate) struct EngineInner {
     /// Set by the engine task before it exits; callers read this to distinguish a
     /// clean shutdown from an unexpected crash (rebind failure, etc.).
     pub shutdown_reason: Mutex<Option<String>>,
-    // ── Capacity drop counters (monotonically increasing, read via engine_stats()) ──
     pub dropped_rate_limited: AtomicU64,
     pub dropped_peer_cap: AtomicU64,
     pub dropped_relay_blocked: AtomicU64,

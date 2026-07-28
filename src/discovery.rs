@@ -67,8 +67,6 @@ impl From<u64> for AppId {
     }
 }
 
-// ── DiscoveryConfig ───────────────────────────────────────────────────────────
-
 /// Configuration for a discovery session.
 ///
 /// Build with [`DiscoveryConfig::new`] then chain optional builder methods:
@@ -152,8 +150,6 @@ impl<A: Into<AppId>, M> From<(A, u16, M)> for DiscoveryConfig<M> {
         DiscoveryConfig::new(app_id, data_port).meta(meta)
     }
 }
-
-// ── Outputs ───────────────────────────────────────────────────────────────────
 
 /// A peer found on the local network.
 #[derive(Debug, Clone)]
@@ -241,8 +237,6 @@ impl<M: Decode> ScanStream<M> {
         }
     }
 }
-
-// ── Discovery ─────────────────────────────────────────────────────────────────
 
 /// LAN peer discovery service.
 ///
@@ -381,8 +375,6 @@ impl Discovery {
         Ok(peers)
     }
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn bind_discovery_socket(port: u16) -> Result<UdpSocket, Error> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);

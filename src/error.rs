@@ -9,19 +9,16 @@ use std::{fmt, net::SocketAddr};
 pub enum Error {
     Io(std::io::Error),
 
-    // ── bitcode-only ─────────────────────────────────────────────────────────
     // encode is infallible (bitcode::encode returns Vec<u8>), so no Encode here.
     #[cfg(all(feature = "bitcode", not(feature = "serde")))]
     Decode(bitcode::Error),
 
-    // ── serde-only ───────────────────────────────────────────────────────────
     #[cfg(all(feature = "serde", not(feature = "bitcode")))]
     Encode(postcard::Error),
 
     #[cfg(all(feature = "serde", not(feature = "bitcode")))]
     Decode(postcard::Error),
 
-    // ── both active or neither (custom codec) ─────────────────────────────
     // Preserves the source error without stringly-typing it.
     #[cfg(not(any(
         all(feature = "bitcode", not(feature = "serde")),
@@ -35,7 +32,6 @@ pub enum Error {
     )))]
     Decode(Box<dyn std::error::Error + Send + Sync + 'static>),
 
-    // ── protocol errors ───────────────────────────────────────────────────────
     ChannelClosed,
     /// The engine task stopped unexpectedly.  `reason` explains why.
     EngineStopped {

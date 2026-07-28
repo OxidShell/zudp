@@ -1,8 +1,6 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use zudp::{Decode, Encode, Zudp};
 
-// ── codec ─────────────────────────────────────────────────────────────────────
-
 fn bench_encode_decode(c: &mut Criterion) {
     let payload: Vec<u8> = vec![0xABu8; 512];
     let mut g = c.benchmark_group("codec");
@@ -19,8 +17,6 @@ fn bench_encode_decode(c: &mut Criterion) {
 
     g.finish();
 }
-
-// ── loopback send / recv ──────────────────────────────────────────────────────
 
 fn bench_loopback(c: &mut Criterion) {
     // Multi-thread runtime so the server task runs concurrently with block_on.
@@ -80,8 +76,6 @@ fn bench_loopback(c: &mut Criterion) {
 
     g.finish();
 }
-
-// ── encrypted loopback (Noise XX) ────────────────────────────────────────────
 
 fn bench_encrypted_loopback(c: &mut Criterion) {
     #[cfg(feature = "security")]

@@ -147,8 +147,6 @@ use frame::Frame;
 use peer::PeerState;
 use socket::RawSocket;
 
-// ── Config ────────────────────────────────────────────────────────────────────
-
 /// Protocol configuration, built via [`Zudp`].
 #[derive(Clone)]
 pub struct Config {
@@ -202,8 +200,6 @@ impl Default for Config {
         }
     }
 }
-
-// ── Builder ───────────────────────────────────────────────────────────────────
 
 /// Entry point for constructing a ZUDP socket.
 ///
@@ -389,8 +385,6 @@ impl Zudp {
         Ok(ZudpConn { socket, peer: peer_addr })
     }
 }
-
-// ── Shared socket internals ───────────────────────────────────────────────────
 
 struct Inner {
     engine: Arc<EngineInner>,
@@ -641,8 +635,6 @@ fn maybe_encrypt(peer: &PeerState, plain: &Bytes) -> Result<Bytes, Error> {
     Ok(plain.clone())
 }
 
-// ── ZudpSocket (multi-peer) ────────────────────────────────────────────────────
-
 /// A ZUDP socket that sends and receives messages from any remote peer.
 ///
 /// Created by [`Zudp::listen`].
@@ -801,8 +793,6 @@ impl<M> ZudpSocket<M> {
         }
     }
 }
-
-// ── ZudpConn (single-peer) ────────────────────────────────────────────────────
 
 /// A ZUDP socket bound to a single remote peer.
 ///

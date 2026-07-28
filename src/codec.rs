@@ -12,7 +12,6 @@ pub trait Decode: Sized + Send + 'static {
     fn decode_from_bytes(bytes: &[u8]) -> Result<Self, crate::Error>;
 }
 
-// ── bitcode-only ──────────────────────────────────────────────────────────────
 // encode is infallible; decode carries a concrete bitcode::Error.
 
 #[cfg(all(feature = "bitcode", not(feature = "serde")))]
@@ -29,7 +28,6 @@ impl<T: for<'de> bitcode::Decode<'de> + Send + 'static> Decode for T {
     }
 }
 
-// ── serde-only ────────────────────────────────────────────────────────────────
 // postcard is used; both directions carry a concrete postcard::Error.
 
 #[cfg(all(feature = "serde", not(feature = "bitcode")))]
@@ -46,7 +44,6 @@ impl<T: serde::de::DeserializeOwned + Send + 'static> Decode for T {
     }
 }
 
-// ── both features active ──────────────────────────────────────────────────────
 // serde/postcard wins; errors are boxed since the active codec is ambiguous.
 
 #[cfg(all(feature = "serde", feature = "bitcode"))]

@@ -26,8 +26,6 @@ use crate::cc::CongestionCtrl;
 /// starts.  Frames are dropped in sequence order (oldest first) via `BTreeMap::pop_first`.
 const MAX_SENT_FRAMES_PER_STREAM: usize = 1_024;
 
-// ── Send-side ────────────────────────────────────────────────────────────────
-
 /// A fully encoded frame retained for NACK-triggered retransmission.
 pub struct SentPacket {
     pub frame: Bytes,
@@ -64,7 +62,6 @@ pub struct PeerState {
     /// `connect()` awaits this so it never returns before encryption is active.
     #[cfg(feature = "security")]
     pub channel_ready: tokio::sync::Notify,
-    // ── Metrics ──────────────────────────────────────────────────────────────
     /// Total bytes received from this peer (payload bytes, not wire bytes).
     pub rx_bytes: AtomicU64,
     /// Total bytes sent to this peer (payload bytes, not wire bytes).
@@ -219,8 +216,6 @@ fn gen_session_id() -> u64 {
     addr.hash(&mut h);
     h.finish()
 }
-
-// ── Receive-side ─────────────────────────────────────────────────────────────
 
 /// An in-order payload element delivered by [`RecvState::ingest`].
 #[derive(Debug)]

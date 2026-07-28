@@ -136,8 +136,6 @@ async fn multiple_messages_in_order() {
     }
 }
 
-// ── Item 1: Remote key pinning ────────────────────────────────────────────────
-
 #[cfg(feature = "security")]
 #[tokio::test]
 async fn key_pinning_correct_key_allowed() {
@@ -233,8 +231,6 @@ async fn key_pinning_none_allows_any() {
     assert_eq!(pkt.msg, b"no pin ok".to_vec());
 }
 
-// ── Item 3: Rate limiting + peer cap ─────────────────────────────────────────
-
 #[tokio::test]
 async fn rate_limit_throttled() {
     // max_pps=10 → burst=max(10/5,1)=2 tokens initially.
@@ -291,8 +287,6 @@ async fn peer_table_cap() {
     assert!(!pkt1.msg.is_empty());
     assert!(!pkt2.msg.is_empty());
 }
-
-// ── Item 2: Observability (PeerStats / EngineStats) ──────────────────────────
 
 #[tokio::test]
 async fn peer_stats_tracks_rx_and_tx_bytes() {
@@ -412,8 +406,6 @@ async fn engine_stats_relay_blocked_counter_increments() {
     );
 }
 
-// ── Item 5: LRU eviction correctness ─────────────────────────────────────────
-
 #[tokio::test]
 async fn lru_eviction_keeps_most_recently_active_peer() {
     // max_peers=1: when c2 arrives it evicts c1 (c1 is LRU at that moment).
@@ -448,8 +440,6 @@ async fn lru_eviction_keeps_most_recently_active_peer() {
         "c2 should be in the peer table after evicting c1"
     );
 }
-
-// ── Item 4: Relay abuse protection ────────────────────────────────────────────
 
 #[tokio::test]
 async fn relay_allowlist_blocks_unauthorized() {
