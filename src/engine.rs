@@ -353,6 +353,22 @@ async fn dispatch_frame(
             }
         }
 
+        Frame::MtuProbe { probe_id, .. } => {
+            // Reflect probe_id in a tiny MtuAck — always gets through regardless of path MTU.
+            let ack = Frame::MtuAck { probe_id }.encode();
+            if let Err(e) = inner.get_socket().send_to(&ack, from).await {
+                tracing::warn!(target: "zudp::engine", peer = %from, "mtu ack send failed: {e}");
+            }
+        }
+
+        Frame::MtuAck { probe_id } => {
+            if let Some(peer) = inner.peers.read().get(&from).cloned() {
+                if let Some(tx) = peer.probe_acks.lock().remove(&probe_id) {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
         Frame::Probe { .. } | Frame::Beacon { .. } => {}
 
         // Handshake and Secure are handled before dispatch_frame is called.

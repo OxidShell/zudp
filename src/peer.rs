@@ -6,10 +6,12 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
+
+use tokio::sync::oneshot;
 
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
@@ -42,6 +44,10 @@ pub struct PeerState {
     pub last_seen: Mutex<Instant>,
     /// RTT-based congestion controller; updated on every Pong.
     pub cc: Mutex<CongestionCtrl>,
+    /// Path MTU discovered by PLPMTUD; 0 = discovery not yet complete, use config default.
+    effective_mtu: AtomicU32,
+    /// Pending MTU probe acks: maps `probe_id → oneshot sender` woken by the engine on MtuAck.
+    pub probe_acks: Mutex<HashMap<u16, oneshot::Sender<()>>>,
     /// In-progress Noise XX handshake state; `None` once the channel is established.
     #[cfg(feature = "security")]
     pub handshake: Mutex<Option<snow::HandshakeState>>,
@@ -67,6 +73,8 @@ impl PeerState {
             last_sent: Mutex::new(now),
             last_seen: Mutex::new(now),
             cc: Mutex::new(CongestionCtrl::new()),
+            effective_mtu: AtomicU32::new(0),
+            probe_acks: Mutex::new(HashMap::new()),
             #[cfg(feature = "security")]
             handshake: Mutex::new(None),
             #[cfg(feature = "security")]
@@ -147,6 +155,18 @@ impl PeerState {
 
     pub fn secs_since_sent(&self) -> u64 {
         self.last_sent.lock().elapsed().as_secs()
+    }
+
+    /// Effective path MTU discovered by PLPMTUD; falls back to `default` until discovery completes.
+    pub fn effective_mtu_or(&self, default: usize) -> usize {
+        match self.effective_mtu.load(Ordering::Relaxed) {
+            0 => default,
+            v => v as usize,
+        }
+    }
+
+    pub fn set_effective_mtu(&self, mtu: usize) {
+        self.effective_mtu.store(mtu as u32, Ordering::Relaxed);
     }
 }
 

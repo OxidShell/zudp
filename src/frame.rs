@@ -22,6 +22,8 @@ pub const MAX_NACK_SEQS: usize = 128;
 /// Probe     : [app_id: u64 BE][proto_ver: u16 BE][0x07]                           (11 bytes)
 /// Beacon    : [meta bytes][data_port: u16 BE][proto_ver: u16 BE]
 ///                         [app_id: u64 BE][0x08]                                  (13 + meta bytes)
+/// MtuProbe  : [zeros: padding bytes][probe_id: u16 BE][0x0B]                     (3 + padding bytes)
+/// MtuAck    : [probe_id: u16 BE][0x0C]                                            (3 bytes)
 /// ```
 ///
 /// The frame type byte is always last, making parsing O(1) from the tail.
@@ -38,6 +40,8 @@ const TYPE_BEACON: u8 = 0x08;
 const TYPE_HANDSHAKE: u8 = 0x09;
 #[cfg(feature = "security")]
 const TYPE_SECURE: u8 = 0x0A;
+pub(crate) const TYPE_MTU_PROBE: u8 = 0x0B;
+const TYPE_MTU_ACK: u8 = 0x0C;
 
 const ADDR_V4: u8 = 0x00;
 const ADDR_V6: u8 = 0x01;
@@ -85,6 +89,11 @@ pub enum Frame {
     /// Noise-encrypted data frame; `nonce` is the per-send AEAD counter.
     #[cfg(feature = "security")]
     Secure { nonce: u64, ciphertext: Bytes },
+    /// PLPMTUD path-MTU probe.  `padding` zero bytes are prepended so the total
+    /// datagram is `padding + 3` bytes — the size being probed.
+    MtuProbe { probe_id: u16, padding: usize },
+    /// PLPMTUD path-MTU acknowledgement.  Always 3 bytes; gets through any path.
+    MtuAck { probe_id: u16 },
 }
 
 impl Frame {
@@ -200,6 +209,21 @@ impl Frame {
                 buf.extend_from_slice(&ciphertext);
                 buf.put_u64(nonce);
                 buf.put_u8(TYPE_SECURE);
+                buf.freeze()
+            }
+            Frame::MtuProbe { probe_id, padding } => {
+                let total = padding + 3;
+                let mut buf = BytesMut::zeroed(total);
+                let id = probe_id.to_be_bytes();
+                buf[total - 3] = id[0];
+                buf[total - 2] = id[1];
+                buf[total - 1] = TYPE_MTU_PROBE;
+                buf.freeze()
+            }
+            Frame::MtuAck { probe_id } => {
+                let mut buf = BytesMut::with_capacity(3);
+                buf.put_u16(probe_id);
+                buf.put_u8(TYPE_MTU_ACK);
                 buf.freeze()
             }
         }
@@ -383,6 +407,22 @@ impl Frame {
                     nonce,
                     ciphertext: data.freeze(),
                 })
+            }
+
+            TYPE_MTU_PROBE => {
+                let probe_id = pop_u16(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "mtu_probe",
+                    field: "probe_id",
+                })?;
+                Ok(Frame::MtuProbe { probe_id, padding: data.len() })
+            }
+
+            TYPE_MTU_ACK => {
+                let probe_id = pop_u16(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "mtu_ack",
+                    field: "probe_id",
+                })?;
+                Ok(Frame::MtuAck { probe_id })
             }
 
             tag => Err(Error::UnknownFrameType { tag }),
@@ -648,5 +688,31 @@ mod tests {
         };
         assert_eq!(nonce, 0xdead_beef_0000_0001);
         assert_eq!(out, ciphertext);
+    }
+
+    #[test]
+    fn mtu_probe_roundtrip() {
+        let Frame::MtuProbe { probe_id, padding } =
+            roundtrip(Frame::MtuProbe { probe_id: 0xABCD, padding: 1397 })
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(probe_id, 0xABCD);
+        assert_eq!(padding, 1397);
+    }
+
+    #[test]
+    fn mtu_probe_size_is_correct() {
+        let padding = 1397;
+        let encoded = Frame::MtuProbe { probe_id: 1, padding }.encode();
+        assert_eq!(encoded.len(), padding + 3);
+    }
+
+    #[test]
+    fn mtu_ack_roundtrip() {
+        let Frame::MtuAck { probe_id } = roundtrip(Frame::MtuAck { probe_id: 42 }) else {
+            panic!("wrong variant");
+        };
+        assert_eq!(probe_id, 42);
     }
 }

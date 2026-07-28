@@ -34,6 +34,7 @@ mod engine;
 mod error;
 mod frag;
 mod frame;
+mod mtu;
 mod peer;
 #[cfg(feature = "security")]
 mod security;
@@ -260,6 +261,18 @@ impl Zudp {
         if socket.inner.config.security.is_some() {
             socket.inner.initiate_handshake(peer).await?;
         }
+        // Probe path MTU in background; sends use config.mtu until discovery completes.
+        {
+            let inner = socket.inner.engine.clone();
+            let initial_mtu = socket.inner.config.mtu;
+            tokio::spawn(async move {
+                let discovered = mtu::probe(&inner, peer, initial_mtu).await;
+                if let Some(p) = inner.peers.read().get(&peer) {
+                    p.set_effective_mtu(discovered);
+                }
+                tracing::info!(target: "zudp::mtu", peer = %peer, mtu = discovered, "path MTU discovered");
+            });
+        }
         Ok(ZudpConn { socket, peer: peer_addr })
     }
 }
@@ -363,14 +376,21 @@ impl Inner {
 
         let actual_dest = self.config.relay_addr.unwrap_or(dest);
         let wrap_relay = self.config.relay_addr.is_some();
-
         let reliable = reliable && self.config.reliable;
 
-        if payload.len() <= self.config.mtu {
+        // Use the peer's discovered path MTU if available; fall back to the configured default.
+        let mtu = self
+            .engine
+            .peers
+            .read()
+            .get(&dest)
+            .map_or(self.config.mtu, |p| p.effective_mtu_or(self.config.mtu));
+
+        if payload.len() <= mtu {
             self.send_single(payload, dest, actual_dest, wrap_relay, reliable, stream_id)
                 .await
         } else {
-            self.send_fragmented(payload, dest, actual_dest, wrap_relay, stream_id)
+            self.send_fragmented(payload, dest, actual_dest, wrap_relay, stream_id, mtu)
                 .await
         }
     }
@@ -441,8 +461,9 @@ impl Inner {
         actual_dest: SocketAddr,
         wrap_relay: bool,
         stream_id: u16,
+        mtu: usize,
     ) -> Result<(), Error> {
-        let chunks = fragment(&payload, self.config.mtu)?;
+        let chunks = fragment(&payload, mtu)?;
         let msg_id = self.alloc_msg_id();
         // fragment() guarantees chunks.len() ≤ MAX_FRAGMENTS = u16::MAX; error if not.
         let frag_total = u16::try_from(chunks.len()).map_err(|_| Error::MessageTooLarge {
@@ -637,6 +658,20 @@ impl<M> ZudpConn<M> {
     #[must_use = "the address is returned, not printed"]
     pub fn local_addr(&self) -> Result<SocketAddr, Error> {
         self.socket.local_addr()
+    }
+
+    /// Path MTU discovered by PLPMTUD.  `None` until the background probe completes
+    /// (typically 1–2 s after `connect()`); use `Zudp::mtu(N)` to set a fixed override.
+    #[must_use]
+    pub fn effective_mtu(&self) -> Option<usize> {
+        self.socket
+            .inner
+            .engine
+            .peers
+            .read()
+            .get(&self.peer())
+            .map(|p| p.effective_mtu_or(0))
+            .filter(|&v| v != 0)
     }
 
     /// Smoothed RTT to the bound peer.  `None` until the first Pong is received.
