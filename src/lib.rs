@@ -334,11 +334,18 @@ impl Zudp {
             socket.inner.initiate_handshake(peer).await?;
         }
         // Probe path MTU in background; sends use config.mtu until discovery completes.
+        // Total cap: 5 s.  Individual probes are already capped at 200 ms each;
+        // the outer timeout guards against extreme binary-search depths or stalled peers.
         {
             let inner = socket.inner.engine.clone();
             let initial_mtu = socket.inner.config.mtu;
             tokio::spawn(async move {
-                let discovered = mtu::probe(&inner, peer, initial_mtu).await;
+                let discovered = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    mtu::probe(&inner, peer, initial_mtu),
+                )
+                .await
+                .unwrap_or(initial_mtu);
                 if let Some(p) = inner.peers.read().get(&peer) {
                     p.set_effective_mtu(discovered);
                 }
@@ -355,6 +362,8 @@ struct Inner {
     engine: Arc<EngineInner>,
     config: Arc<Config>,
     next_msg_id: AtomicU32,
+    /// Dropped on `Inner::drop` to signal the engine to shut down gracefully.
+    _shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
 impl Inner {
@@ -371,12 +380,15 @@ impl Inner {
             config: config.clone(),
             #[cfg(feature = "security")]
             keypair: config.security.clone(),
+            shutdown_reason: parking_lot::Mutex::new(None),
         });
-        let rx = engine::spawn(engine.clone());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let rx = engine::spawn(engine.clone(), shutdown_rx);
         let inner = Arc::new(Self {
             engine,
             config,
             next_msg_id: AtomicU32::new(0),
+            _shutdown: shutdown_tx,
         });
         Ok((inner, rx))
     }
@@ -682,13 +694,24 @@ impl<M> ZudpSocket<M> {
     /// Receive the next message from any peer on any stream.
     ///
     /// # Errors
-    /// Returns `Err(Error::ChannelClosed)` if the engine task has stopped.
+    /// Returns `Err(Error::EngineStopped)` if the engine task has stopped, with the reason
+    /// (e.g. socket rebind failure).  Returns `Err(Error::ChannelClosed)` if the internal
+    /// channel closed for an unknown reason.
     pub async fn recv(&mut self) -> Result<Packet<M>, Error>
     where
         M: Decode,
     {
         loop {
-            let (bytes, from, stream) = self.rx.recv().await.ok_or(Error::ChannelClosed)?;
+            let Some((bytes, from, stream)) = self.rx.recv().await else {
+                let reason = self
+                    .inner
+                    .engine
+                    .shutdown_reason
+                    .lock()
+                    .clone()
+                    .unwrap_or_else(|| "channel closed".into());
+                return Err(Error::EngineStopped { reason });
+            };
             match M::decode_from_bytes(&bytes) {
                 Ok(msg) => return Ok(Packet { msg, from, stream }),
                 Err(e) => {

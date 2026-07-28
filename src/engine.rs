@@ -1,8 +1,8 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
-use parking_lot::RwLock;
-use tokio::{sync::mpsc, time};
+use parking_lot::{Mutex, RwLock};
+use tokio::{sync::mpsc, task::JoinSet, time};
 
 use crate::{
     Config,
@@ -11,6 +11,12 @@ use crate::{
     peer::{Inbound, PeerState, RecvState},
     socket::RawSocket,
 };
+
+/// Maximum concurrent NACK retransmit tasks across the engine.
+///
+/// Each task handles one NACK batch (one peer, one burst of missing seqs).  Capping
+/// prevents memory/CPU runaway when a peer floods NACKs faster than retransmits drain.
+const MAX_RETRANSMIT_TASKS: usize = 32;
 
 /// State shared between the engine task and the [`crate::ZudpSocket`] / [`crate::ZudpConn`] handles.
 pub(crate) struct EngineInner {
@@ -23,6 +29,9 @@ pub(crate) struct EngineInner {
     /// Noise keypair for the `security` feature; `None` when security is disabled.
     #[cfg(feature = "security")]
     pub keypair: Option<crate::security::Keypair>,
+    /// Set by the engine task before it exits; callers read this to distinguish a
+    /// clean shutdown from an unexpected crash (rebind failure, etc.).
+    pub shutdown_reason: Mutex<Option<String>>,
 }
 
 impl EngineInner {
@@ -55,18 +64,23 @@ impl EngineInner {
 
 /// Spawn the engine background task and return the inbound receiver.
 ///
-/// Each item is `(payload_bytes, sender_addr, stream_id)`.
+/// `shutdown_rx` resolves when the caller drops the paired `oneshot::Sender`; the engine
+/// then drains in-flight retransmits and exits cleanly.
+///
+/// Each item on the returned channel is `(payload_bytes, sender_addr, stream_id)`.
 pub(crate) fn spawn(
     inner: Arc<EngineInner>,
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> mpsc::UnboundedReceiver<(Bytes, SocketAddr, u16)> {
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
-    tokio::spawn(run(inner, inbound_tx));
+    tokio::spawn(run(inner, inbound_tx, shutdown_rx));
     inbound_rx
 }
 
 async fn run(
     inner: Arc<EngineInner>,
     inbound_tx: mpsc::UnboundedSender<(Bytes, SocketAddr, u16)>,
+    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     // Keyed by (peer_addr, stream_id) so each stream has independent reorder + reassembly.
     let mut recv_states: HashMap<(SocketAddr, u16), (RecvState, FragAssembler)> = HashMap::new();
@@ -92,14 +106,28 @@ async fn run(
         (inner.config.max_pps_per_ip / 5.0).max(1.0),
     );
 
+    // Bounded pool for NACK retransmit tasks.  Each task may sleep for CC pacing, so
+    // they are spawned off the recv loop to avoid stalling it — but the pool is capped
+    // to prevent unbounded task accumulation under heavy loss or adversarial NACKs.
+    let mut retransmit_tasks: JoinSet<()> = JoinSet::new();
+
     // Local recv socket; replaced in-place when the socket is rebound.
     let mut recv_sock = inner.get_socket();
 
     let mut ticker = time::interval(keepalive_interval / 4);
 
     loop {
+        // Reap completed retransmit tasks without blocking.
+        while retransmit_tasks.try_join_next().is_some() {}
+
         tokio::select! {
             biased;
+
+            _ = &mut shutdown_rx => {
+                *inner.shutdown_reason.lock() = Some("shutdown requested".into());
+                tracing::info!(target: "zudp::engine", "graceful shutdown — draining retransmits");
+                break;
+            }
 
             result = recv_sock.recv_from() => {
                 match result {
@@ -113,6 +141,7 @@ async fn run(
                         handle_incoming(
                             data, from, &inner, &inbound_tx,
                             &mut recv_states, &mut relay_table, relay_gen,
+                            &mut retransmit_tasks,
                         ).await;
                     }
                     Err(e) => {
@@ -124,7 +153,9 @@ async fn run(
                                 ping_all_peers(&inner, &recv_sock).await;
                             }
                             Err(bind_err) => {
-                                tracing::error!(target: "zudp::engine", "rebind failed: {bind_err}");
+                                let reason = format!("socket rebind failed: {bind_err}");
+                                tracing::error!(target: "zudp::engine", "{reason}");
+                                *inner.shutdown_reason.lock() = Some(reason);
                                 break;
                             }
                         }
@@ -141,7 +172,9 @@ async fn run(
         }
     }
 
-    tracing::warn!(target: "zudp::engine", "engine task exited");
+    // Drain in-flight retransmits before the socket closes.
+    retransmit_tasks.shutdown().await;
+    tracing::info!(target: "zudp::engine", "engine task exited");
 }
 
 /// Try to bind a new socket on the same local address (same port if available, else port 0).
@@ -174,6 +207,7 @@ async fn ping_all_peers(inner: &Arc<EngineInner>, sock: &RawSocket) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_incoming(
     data: BytesMut,
     from: SocketAddr,
@@ -182,6 +216,7 @@ async fn handle_incoming(
     recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
     relay_table: &mut HashMap<SocketAddr, (SocketAddr, u32)>,
     relay_gen: u32,
+    retransmit_tasks: &mut JoinSet<()>,
 ) {
     // Stateful relay pass-through: if `from` is a server we're relaying for, forward its raw
     // reply bytes directly to the mapped client without decoding.  This is checked before
@@ -236,16 +271,19 @@ async fn handle_incoming(
                         return;
                     }
                 };
-                dispatch_frame(inner_frame, from, inner, inbound_tx, recv_states, relay_table, relay_gen).await;
+                dispatch_frame(inner_frame, from, inner, inbound_tx, recv_states, relay_table, relay_gen, retransmit_tasks).await;
             }
-            frame => dispatch_frame(frame, from, inner, inbound_tx, recv_states, relay_table, relay_gen).await,
+            frame => dispatch_frame(frame, from, inner, inbound_tx, recv_states, relay_table, relay_gen, retransmit_tasks).await,
         }
     }
 
     #[cfg(not(feature = "security"))]
-    dispatch_frame(frame, from, inner, inbound_tx, recv_states, relay_table, relay_gen).await;
+    dispatch_frame(frame, from, inner, inbound_tx, recv_states, relay_table, relay_gen, retransmit_tasks).await;
 }
 
+// All parameters are genuinely distinct state that the frame dispatch needs to mutate or read;
+// grouping them into a context struct would add complexity without architectural benefit.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn dispatch_frame(
     frame: Frame,
     from: SocketAddr,
@@ -254,6 +292,7 @@ async fn dispatch_frame(
     recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
     relay_table: &mut HashMap<SocketAddr, (SocketAddr, u32)>,
     relay_gen: u32,
+    retransmit_tasks: &mut JoinSet<()>,
 ) {
     match frame {
         Frame::Datagram(payload) => {
@@ -282,30 +321,39 @@ async fn dispatch_frame(
             if let Some(peer) = inner.peers.read().get(&from).cloned() {
                 let to_retransmit = peer.frames_for_retransmit(stream_id, &seqs);
                 if !to_retransmit.is_empty() {
-                    // Spawn so the engine recv loop isn't stalled by pacing sleeps.
-                    let sock = inner.get_socket();
-                    tokio::spawn(async move {
-                        for (seq, plain_frame) in to_retransmit {
-                            let wire = encrypt_or_plain(&peer, &plain_frame);
-                            // Extract delay before awaiting — MutexGuard is not Send.
-                            let delay = peer.cc.lock().consume(wire.len());
-                            if let Some(d) = delay {
-                                tokio::time::sleep(d).await;
-                            }
-                            tracing::debug!(
-                                target: "zudp::engine",
-                                peer = %from, seq, stream_id,
-                                "retransmit on NACK"
-                            );
-                            if let Err(e) = sock.send_to(&wire, from).await {
-                                tracing::warn!(
+                    if retransmit_tasks.len() >= MAX_RETRANSMIT_TASKS {
+                        tracing::warn!(
+                            target: "zudp::engine",
+                            peer = %from, stream_id,
+                            cap = MAX_RETRANSMIT_TASKS,
+                            "retransmit pool full — dropping NACK batch"
+                        );
+                    } else {
+                        // Spawn so the engine recv loop isn't stalled by CC pacing sleeps.
+                        let sock = inner.get_socket();
+                        retransmit_tasks.spawn(async move {
+                            for (seq, plain_frame) in to_retransmit {
+                                let wire = encrypt_or_plain(&peer, &plain_frame);
+                                // Extract delay before awaiting — MutexGuard is not Send.
+                                let delay = peer.cc.lock().consume(wire.len());
+                                if let Some(d) = delay {
+                                    tokio::time::sleep(d).await;
+                                }
+                                tracing::debug!(
                                     target: "zudp::engine",
-                                    peer = %from,
-                                    "retransmit failed: {e}"
+                                    peer = %from, seq, stream_id,
+                                    "retransmit on NACK"
                                 );
+                                if let Err(e) = sock.send_to(&wire, from).await {
+                                    tracing::warn!(
+                                        target: "zudp::engine",
+                                        peer = %from,
+                                        "retransmit failed: {e}"
+                                    );
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
                 }
             }
         }
@@ -426,10 +474,10 @@ async fn dispatch_frame(
         }
 
         Frame::MtuAck { probe_id } => {
-            if let Some(peer) = inner.peers.read().get(&from).cloned() {
-                if let Some(tx) = peer.probe_acks.lock().remove(&probe_id) {
-                    let _ = tx.send(());
-                }
+            if let Some(peer) = inner.peers.read().get(&from).cloned()
+                && let Some(tx) = peer.probe_acks.lock().remove(&probe_id)
+            {
+                let _ = tx.send(());
             }
         }
 
@@ -576,6 +624,7 @@ async fn send_nack_if_needed(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_background(
     inner: &Arc<EngineInner>,
     recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,

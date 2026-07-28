@@ -37,6 +37,10 @@ pub enum Error {
 
     // ── protocol errors ───────────────────────────────────────────────────────
     ChannelClosed,
+    /// The engine task stopped unexpectedly.  `reason` explains why.
+    EngineStopped {
+        reason: String,
+    },
     MessageTooLarge {
         got: usize,
         max: usize,
@@ -97,7 +101,8 @@ impl fmt::Display for Error {
             )))]
             Self::Decode(e) => write!(f, "decode: {e}"),
 
-            Self::ChannelClosed => f.write_str("channel closed — engine stopped"),
+            Self::ChannelClosed => f.write_str("channel closed"),
+            Self::EngineStopped { reason } => write!(f, "engine stopped: {reason}"),
             Self::MessageTooLarge { got, max } => {
                 write!(f, "message needs {got} fragments, max is {max}")
             }

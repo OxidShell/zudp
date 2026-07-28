@@ -49,7 +49,7 @@ impl RateLimiter {
     /// the actual HashMap scan runs only every [`PRUNE_INTERVAL_TICKS`] ticks.
     pub(crate) fn tick_prune(&mut self) {
         self.ticks += 1;
-        if self.ticks % PRUNE_INTERVAL_TICKS != 0 {
+        if !self.ticks.is_multiple_of(PRUNE_INTERVAL_TICKS) {
             return;
         }
         if let Some(cutoff) = Instant::now().checked_sub(std::time::Duration::from_mins(1)) {
