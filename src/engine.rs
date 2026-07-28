@@ -34,6 +34,12 @@ pub struct RelayPolicy {
 /// prevents memory/CPU runaway when a peer floods NACKs faster than retransmits drain.
 const MAX_RETRANSMIT_TASKS: usize = 32;
 
+/// Capacity of the bounded inbound channel between the engine task and the socket handle.
+///
+/// At 1 400 B/frame and 8 192 slots this is ~11 MB peak backpressure before the engine
+/// starts dropping frames.  The engine uses `try_send` so the recv loop is never stalled.
+const INBOUND_CAP: usize = 8_192;
+
 /// State shared between the engine task and the [`crate::ZudpSocket`] / [`crate::ZudpConn`] handles.
 pub(crate) struct EngineInner {
     /// Current socket; replaced atomically on rebind.  Use [`get_socket`] to obtain a cheap clone.
@@ -108,15 +114,15 @@ impl EngineInner {
 pub(crate) fn spawn(
     inner: Arc<EngineInner>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
-) -> mpsc::UnboundedReceiver<(Bytes, SocketAddr, u16)> {
-    let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+) -> mpsc::Receiver<(Bytes, SocketAddr, u16)> {
+    let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CAP);
     tokio::spawn(run(inner, inbound_tx, shutdown_rx));
     inbound_rx
 }
 
 async fn run(
     inner: Arc<EngineInner>,
-    inbound_tx: mpsc::UnboundedSender<(Bytes, SocketAddr, u16)>,
+    inbound_tx: mpsc::Sender<(Bytes, SocketAddr, u16)>,
     mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     // Keyed by (peer_addr, stream_id) so each stream has independent reorder + reassembly.
@@ -205,7 +211,7 @@ async fn run(
                 run_background(
                     &inner, &mut recv_states, &mut relay_table, &mut relay_gen,
                     relay_ttl_ticks, &mut rate_limiter, keepalive_interval, sent_prune_age,
-                ).await;
+                );
             }
         }
     }
@@ -250,7 +256,7 @@ async fn handle_incoming(
     data: BytesMut,
     from: SocketAddr,
     inner: &Arc<EngineInner>,
-    inbound_tx: &mpsc::UnboundedSender<(Bytes, SocketAddr, u16)>,
+    inbound_tx: &mpsc::Sender<(Bytes, SocketAddr, u16)>,
     recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
     relay_table: &mut HashMap<SocketAddr, (SocketAddr, u32)>,
     relay_gen: u32,
@@ -326,7 +332,7 @@ async fn dispatch_frame(
     frame: Frame,
     from: SocketAddr,
     inner: &Arc<EngineInner>,
-    inbound_tx: &mpsc::UnboundedSender<(Bytes, SocketAddr, u16)>,
+    inbound_tx: &mpsc::Sender<(Bytes, SocketAddr, u16)>,
     recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
     relay_table: &mut HashMap<SocketAddr, (SocketAddr, u32)>,
     relay_gen: u32,
@@ -337,7 +343,9 @@ async fn dispatch_frame(
             if let Some(peer) = inner.peers.read().get(&from).cloned() {
                 peer.rx_bytes.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
             }
-            let _ = inbound_tx.send((payload, from, 0));
+            if inbound_tx.try_send((payload, from, 0)).is_err() {
+                tracing::warn!(target: "zudp::engine", %from, "inbound channel full — dropping datagram");
+            }
         }
 
         Frame::Stream {
@@ -357,7 +365,9 @@ async fn dispatch_frame(
                     if let Some(p) = &peer {
                         p.rx_bytes.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     }
-                    let _ = inbound_tx.send((bytes, from, stream_id));
+                    if inbound_tx.try_send((bytes, from, stream_id)).is_err() {
+                        tracing::warn!(target: "zudp::engine", %from, stream_id, "inbound channel full — dropping stream frame");
+                    }
                 }
             }
         }
@@ -470,7 +480,9 @@ async fn dispatch_frame(
                     if let Some(peer) = inner.peers.read().get(&from).cloned() {
                         peer.rx_bytes.fetch_add(complete.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     }
-                    let _ = inbound_tx.send((complete, from, stream_id));
+                    if inbound_tx.try_send((complete, from, stream_id)).is_err() {
+                        tracing::warn!(target: "zudp::engine", %from, stream_id, "inbound channel full — dropping reassembled fragment");
+                    }
                 }
             }
         }
@@ -676,7 +688,7 @@ async fn send_nack_if_needed(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_background(
+fn run_background(
     inner: &Arc<EngineInner>,
     recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
     relay_table: &mut HashMap<SocketAddr, (SocketAddr, u32)>,
@@ -693,11 +705,18 @@ async fn run_background(
 
     for peer in peers {
         if peer.secs_since_sent() >= keepalive_threshold {
-            let ping = secure_frame(&peer, Frame::Ping { echo: now_ms, session_id: peer.my_session_id });
-            if let Err(e) = inner.get_socket().send_to(&ping, peer.addr()).await {
-                tracing::warn!(target: "zudp::engine", peer = %peer.addr(), "keepalive failed: {e}");
-            }
-            tracing::trace!(target: "zudp::engine", peer = %peer.addr(), "sent keepalive ping");
+            // Spawn each keepalive independently so sequential `send_to` calls
+            // don't stall the recv loop when many peers need pinging at once.
+            let sock = inner.get_socket();
+            let peer_clone = peer.clone();
+            tokio::spawn(async move {
+                let addr = peer_clone.addr();
+                let ping = secure_frame(&peer_clone, Frame::Ping { echo: now_ms, session_id: peer_clone.my_session_id });
+                if let Err(e) = sock.send_to(&ping, addr).await {
+                    tracing::warn!(target: "zudp::engine", peer = %addr, "keepalive failed: {e}");
+                }
+                tracing::trace!(target: "zudp::engine", peer = %addr, "sent keepalive ping");
+            });
         }
         peer.prune_sent(sent_prune_age);
     }

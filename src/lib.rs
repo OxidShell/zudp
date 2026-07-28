@@ -403,7 +403,7 @@ struct Inner {
 impl Inner {
     async fn new(
         config: Config,
-    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<(Bytes, SocketAddr, u16)>), Error> {
+    ) -> Result<(Arc<Self>, mpsc::Receiver<(Bytes, SocketAddr, u16)>), Error> {
         let addr = SocketAddr::new(config.bind_ip, config.port);
         let socket = RawSocket::bind(addr).await?;
         let config = Arc::new(config);
@@ -504,19 +504,16 @@ impl Inner {
         let wrap_relay = self.config.relay_addr.is_some();
         let reliable = reliable && self.config.reliable;
 
-        // Use the peer's discovered path MTU if available; fall back to the configured default.
-        let mtu = self
-            .engine
-            .peers
-            .read()
-            .get(&dest)
-            .map_or(self.config.mtu, |p| p.effective_mtu_or(self.config.mtu));
+        // Single peer lookup covers both MTU discovery and send-side state;
+        // avoids a second lock acquisition in send_single/send_fragmented.
+        let peer = self.get_or_create_peer(dest);
+        let mtu = peer.effective_mtu_or(self.config.mtu);
 
         if payload.len() <= mtu {
-            self.send_single(payload, dest, actual_dest, wrap_relay, reliable, stream_id)
+            self.send_single(payload, peer, actual_dest, wrap_relay, reliable, stream_id)
                 .await
         } else {
-            self.send_fragmented(payload, dest, actual_dest, wrap_relay, stream_id, mtu)
+            self.send_fragmented(payload, peer, actual_dest, wrap_relay, stream_id, mtu)
                 .await
         }
     }
@@ -524,14 +521,13 @@ impl Inner {
     async fn send_single(
         &self,
         payload: Bytes,
-        peer_addr: SocketAddr,
+        peer: Arc<PeerState>,
         actual_dest: SocketAddr,
         wrap_relay: bool,
         reliable: bool,
         stream_id: u16,
     ) -> Result<(), Error> {
         if reliable {
-            let peer = self.get_or_create_peer(peer_addr);
             let seq = peer.alloc_seq(stream_id);
             // Always store plain bytes; retransmits re-encrypt with a fresh nonce.
             let plain_frame = Frame::Stream {
@@ -543,7 +539,7 @@ impl Inner {
             let inner_wire = maybe_encrypt(&peer, &plain_frame)?;
             let wire = if wrap_relay {
                 Frame::Relay {
-                    dest: peer_addr,
+                    dest: peer.addr(),
                     inner: inner_wire,
                 }
                 .encode()
@@ -557,7 +553,7 @@ impl Inner {
         } else if wrap_relay {
             let frame = Frame::Datagram(payload).encode();
             let wire = Frame::Relay {
-                dest: peer_addr,
+                dest: peer.addr(),
                 inner: frame,
             }
             .encode();
@@ -583,7 +579,7 @@ impl Inner {
     async fn send_fragmented(
         &self,
         payload: Bytes,
-        peer_addr: SocketAddr,
+        peer: Arc<PeerState>,
         actual_dest: SocketAddr,
         wrap_relay: bool,
         stream_id: u16,
@@ -596,7 +592,6 @@ impl Inner {
             got: chunks.len(),
             max: frag::MAX_FRAGMENTS,
         })?;
-        let peer = self.get_or_create_peer(peer_addr);
 
         for (frag_idx, chunk) in (0u16..).zip(chunks) {
             let seq = peer.alloc_seq(stream_id);
@@ -612,7 +607,7 @@ impl Inner {
             let inner_wire = maybe_encrypt(&peer, &plain_frame)?;
             let wire = if wrap_relay {
                 Frame::Relay {
-                    dest: peer_addr,
+                    dest: peer.addr(),
                     inner: inner_wire,
                 }
                 .encode()
@@ -653,7 +648,7 @@ fn maybe_encrypt(peer: &PeerState, plain: &Bytes) -> Result<Bytes, Error> {
 /// Created by [`Zudp::listen`].
 pub struct ZudpSocket<M> {
     inner: Arc<Inner>,
-    rx: mpsc::UnboundedReceiver<(Bytes, SocketAddr, u16)>,
+    rx: mpsc::Receiver<(Bytes, SocketAddr, u16)>,
     _phantom: PhantomData<fn() -> M>,
 }
 
