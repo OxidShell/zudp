@@ -62,6 +62,10 @@ path = "examples/secure_ping_pong.rs"
 required-features = ["security"]
 
 [[example]]
+name = "multi_stream"
+path = "examples/multi_stream.rs"
+
+[[example]]
 name = "server"
 path = "examples/server.rs"
 
