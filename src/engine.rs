@@ -131,7 +131,7 @@ async fn rebind_socket(inner: &Arc<EngineInner>) -> Result<RawSocket, crate::Err
 
 /// Send a Ping carrying our session ID to every known peer so they update our address.
 async fn ping_all_peers(inner: &Arc<EngineInner>, sock: &RawSocket) {
-    let now_ms = now_millis();
+    let now_ms = now_micros();
     let peers: Vec<Arc<PeerState>> = inner.peers.read().values().cloned().collect();
     for peer in peers {
         let ping = Frame::Ping { echo: now_ms, session_id: peer.my_session_id }.encode();
@@ -288,16 +288,20 @@ async fn dispatch_frame(
                 if peer.store_their_session_id(session_id) {
                     inner.sessions.write().insert(session_id, peer.clone());
                 }
-                // RTT sample: echo is the ms timestamp we stamped in the Ping.
-                let now_ms = now_millis();
-                if echo <= now_ms {
-                    let rtt_us = (now_ms - echo).saturating_mul(1_000);
-                    peer.cc.lock().on_rtt_sample(rtt_us);
+                // echo carries a µs timestamp; RTT is the round-trip in microseconds.
+                let now_us = now_micros();
+                if echo <= now_us {
+                    let rtt_us = now_us - echo;
+                    let pacing_rate = {
+                        let mut cc = peer.cc.lock();
+                        cc.on_rtt_sample(rtt_us);
+                        cc.pacing_rate() as u64
+                    };
                     tracing::debug!(
                         target: "zudp::engine",
                         peer = %from,
                         rtt_us,
-                        pacing_rate = peer.cc.lock().pacing_rate as u64,
+                        pacing_rate,
                         "RTT sample"
                     );
                 }
@@ -479,7 +483,7 @@ async fn run_background(
     sent_prune_age: Duration,
 ) {
     let keepalive_threshold = keepalive_interval.as_secs();
-    let now_ms = now_millis();
+    let now_ms = now_micros();
 
     let peers: Vec<Arc<PeerState>> = inner.peers.read().values().cloned().collect();
 
@@ -499,10 +503,10 @@ async fn run_background(
     }
 }
 
-fn now_millis() -> u64 {
+fn now_micros() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0u64, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .map_or(0u64, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
 /// Drive a Noise XX handshake step on behalf of the engine.

@@ -84,7 +84,7 @@ Negative acknowledgement. Requests retransmission of one or more sequence number
 
 ### Ping — `0x03`
 
-Keepalive probe.  `echo` is an arbitrary token (typically the current Unix timestamp in milliseconds).  `session_id` is the **sender's own** randomly-generated session identifier, sent so the receiver can recognise this node if its network address changes between Pings.
+Keepalive probe.  `echo` is the sender's current Unix timestamp in **microseconds**.  `session_id` is the **sender's own** randomly-generated session identifier, sent so the receiver can recognise this node if its network address changes between Pings.
 
 ```
 [echo: u64] [session_id: u64] [0x03]
@@ -104,7 +104,7 @@ Reply to a Ping.  Mirrors `echo` unchanged; carries the **replier's** own `sessi
 
 Receiving any frame from a peer updates `last_seen`.  Neither Ping nor Pong carry sequence numbers; they are not tracked for retransmission.
 
-The `echo` round-trip is also used by the congestion controller: the receiver computes `rtt_us = (now_ms − echo) × 1000` and feeds it into the per-peer RTT estimator (see *Congestion Control* below).
+The `echo` round-trip is also used by the congestion controller: the receiver computes `rtt_us = now_us − echo` and feeds it into the per-peer RTT estimator (see *Congestion Control* below).  Using microseconds allows sub-millisecond RTT tracking on LAN paths.
 
 ### Fragment — `0x05`
 
@@ -380,10 +380,10 @@ ZUDP uses a BBR-lite congestion controller per peer.  It is RTT-based (not loss-
 
 ### RTT estimation
 
-RTT samples come from Ping/Pong echo timestamps (millisecond resolution).  Each Pong yields:
+RTT samples come from Ping/Pong echo timestamps (`echo` is a Unix timestamp in **microseconds**).  Each Pong yields:
 
 ```
-rtt_us = (now_ms − echo) × 1000
+rtt_us = now_us − echo
 ```
 
 The smoothed RTT (`srtt`) is an EWMA with α = 1/8:

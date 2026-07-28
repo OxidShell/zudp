@@ -26,7 +26,7 @@ pub struct CongestionCtrl {
     min_rtt_us: u64,
     min_rtt_window_start: Instant,
     /// Estimated bottleneck pacing rate in bytes/second.
-    pub pacing_rate: f64,
+    pacing_rate: f64,
     /// Token bucket balance in bytes; can go negative during bursts.
     tokens: f64,
     last_refill: Instant,
@@ -96,6 +96,11 @@ impl CongestionCtrl {
         } else {
             None
         }
+    }
+
+    /// Current pacing rate in bytes/second.
+    pub fn pacing_rate(&self) -> f64 {
+        self.pacing_rate
     }
 
     /// Smoothed RTT.  `None` until the first Pong is received.

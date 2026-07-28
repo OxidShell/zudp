@@ -144,9 +144,9 @@ on recv(stream_id, seq, payload):
 
 Per-peer RTT-based congestion control (BBR-lite).
 
-**RTT measurement** — on Pong receipt:
+**RTT measurement** — on Pong receipt (`echo` is a µs Unix timestamp):
 ```
-rtt_us = (now_ms − echo) × 1000
+rtt_us = now_us − echo
 srtt   = 7/8 × srtt + 1/8 × rtt_us   (EWMA, α = 1/8)
 min_rtt = rolling minimum over 10-second window
 ```
