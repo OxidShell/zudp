@@ -35,16 +35,11 @@ fn bench_loopback(c: &mut Criterion) {
 
     rt.spawn(async move {
         let mut server: zudp::ZudpSocket<Vec<u8>> =
-            Zudp::default().port(0).listen().await.unwrap();
+            Zudp::default().port(0).rate_limit(0.0).listen().await.unwrap();
         addr_tx.send(server.local_addr().unwrap()).unwrap();
-        loop {
-            match server.recv().await {
-                Ok(_) => {
-                    if msg_tx.send(()).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(_) = server.recv().await {
+            if msg_tx.send(()).is_err() {
+                break;
             }
         }
     });
@@ -105,19 +100,15 @@ fn bench_encrypted_loopback(c: &mut Criterion) {
         rt.spawn(async move {
             let mut server: zudp::ZudpSocket<Vec<u8>> = Zudp::default()
                 .port(0)
+                .rate_limit(0.0)
                 .security(server_kp)
                 .listen()
                 .await
                 .unwrap();
             addr_tx.send(server.local_addr().unwrap()).unwrap();
-            loop {
-                match server.recv().await {
-                    Ok(_) => {
-                        if msg_tx.send(()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok(_) = server.recv().await {
+                if msg_tx.send(()).is_err() {
+                    break;
                 }
             }
         });
