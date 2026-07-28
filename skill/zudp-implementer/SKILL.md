@@ -74,6 +74,8 @@ Probe     (0x07): [app_id:u64] [proto_ver:u16]                                  
 Beacon    (0x08): [meta]   [data_port:u16] [proto_ver:u16] [app_id:u64]                      + [0x08]
 Handshake (0x09): [noise_msg]                                                                + [0x09]  ← security feature
 Secure    (0x0A): [ciphertext] [nonce:u64]                                                   + [0x0A]  ← security feature
+MtuProbe  (0x0B): [zeros:padding_bytes] [probe_id:u16]                                       + [0x0B]  total = padding + 3 B
+MtuAck    (0x0C): [probe_id:u16]                                                             + [0x0C]  always 3 B
 ```
 
 **Parsing is always from the tail.**  To decode a datagram:
@@ -108,6 +110,7 @@ breaks interoperability.
 - Keep the fully-encoded wire bytes for every reliable frame sent, keyed by `(stream_id, seq)`.
 - Use one sorted map per stream (BTreeMap / SortedDict / TreeMap) so pruning old entries is O(log n).
 - Prune all stream buffers older than `sent_prune_age` (default 10 s) on a background tick.
+- **Cap per-stream send buffer at `MAX_SENT_FRAMES_PER_STREAM` (1 024) entries.** When the cap is reached, evict the oldest entry (`pop_first`) before inserting the new one.  A NACK for the evicted sequence cannot be honoured — log a warning but continue normally.  Without the cap, a fast sender on a slow path exhausts memory.
 
 ### Reorder buffer
 One reorder buffer per `(peer, stream_id)` pair:
@@ -132,6 +135,7 @@ on recv(stream_id, seq, payload):
   (they arrive in order because they go through the reliability layer first).  Concatenate
   when all slots are full, in index order.
 - Maximum fragments per message: 65 535 (`u16::MAX`).
+- **Fragment bomb mitigation** (mandatory): reject Fragment frames where `frag_total > MAX_FRAG_RECV` (1 024) before allocating any slot array. Also cap concurrent incomplete assemblies per (peer, stream) at `MAX_CONCURRENT_ASSEMBLIES` (64); drop new assemblies beyond the cap. Without these limits an adversary can exhaust memory by sending Fragment frames with `frag_total = 65535` and never completing them.
 
 ### Keepalives
 - Send Ping when no outbound frame has been sent for `keepalive_interval` (default 5 s).
@@ -181,8 +185,16 @@ if tokens < 0: suggest_sleep = min(−tokens / pacing_rate, 10 ms)
 
 ### Peer table cap
 - Track at most `max_peers` distinct remote addresses.
-- When a packet arrives from an unknown address and the table is full, drop the packet without allocating any peer state.
-- Existing peers are unaffected and continue to send/receive normally.
+- When a packet arrives from an unknown address and the table is at capacity, **evict the least-recently-seen peer** (LRU by `last_seen` timestamp) and insert the new one.  The new peer is processed normally; the evicted peer is simply removed from the table (its in-flight NACKs will time out).  Increment a `dropped_peer_cap` counter on each eviction.
+- Do **not** silently drop the new peer's packet — LRU eviction ensures active peers displace idle ones, which is the correct behaviour under a connection flood.
+
+### NACK retransmit pool cap
+- Run NACK retransmits in spawned tasks (not in the recv loop) so pacing sleeps don't block receiving.
+- Cap the number of concurrent retransmit tasks at `MAX_RETRANSMIT_TASKS` (32).  If the pool is full when a NACK arrives, log a warning and drop the NACK batch — the remote will re-NACK.  Without the cap, an adversary flooding NACKs can spawn unlimited tasks.
+
+### Inbound channel backpressure
+- The engine delivers decoded payloads to the application via a bounded channel (`INBOUND_CAP = 8 192` slots).
+- Use non-blocking send (`try_send` / `offer`) at every delivery site.  If the channel is full, log a warning and drop the frame — **never block the recv loop waiting for the application to consume**.  A slow consumer should drop frames, not stall the engine.
 
 ### Relay (stateful, bidirectional)
 - The relay node is a plain ZUDP socket — no special configuration flag.
@@ -259,7 +271,9 @@ Do not mark the implementation done until every item passes.
 
 ### Frame codec (unit)
 - [ ] Roundtrip encode→decode for every frame type: Datagram, Stream, Nack, Ping, Pong,
-      Fragment, Relay/v4, Relay/v6, Probe, Beacon.
+      Fragment, Relay/v4, Relay/v6, Probe, Beacon, MtuProbe, MtuAck.
+- [ ] MtuProbe: `encoded.len() == padding + 3`; non-probe bytes are all zero.
+- [ ] MtuAck: always exactly 3 bytes.
 - [ ] Decode of a truncated packet returns an error, not a panic / exception.
 - [ ] Nack body with length not a multiple of 8 returns an error.
 - [ ] Unknown type byte (e.g. `0xFF`) returns an error.
@@ -304,9 +318,15 @@ Do not mark the implementation done until every item passes.
 
 ### Access control and hardening (if implemented)
 - [ ] Rate limiting: sending N packets in a burst from one IP lets at most `burst` through initially; subsequent packets are dropped until tokens refill.
-- [ ] Peer table cap: new peers beyond `max_peers` are ignored; existing peers are unaffected.
+- [ ] Peer table cap: with `max_peers = 1`, connecting a second peer causes the first (least-recently-seen) to be evicted; the second peer's packet is processed normally.
 - [ ] Relay allowlist: a Relay frame from an IP not in the allowlist is dropped and never forwarded.
 - [ ] Relay table cap: a Relay frame that would add a new destination beyond `max_relay_entries` is dropped.
+- [ ] Fragment bomb: Fragment frame with `frag_total > 1024` is rejected; no slot array is allocated.
+- [ ] Concurrent assembly cap: more than 64 incomplete assemblies per (peer, stream) causes the oldest to be dropped.
+- [ ] Send buffer cap: after `MAX_SENT_FRAMES_PER_STREAM` (1024) frames on one stream, the oldest entry is evicted rather than growing unboundedly.
+- [ ] `EngineStats.dropped_peer_cap` increments on each LRU eviction.
+- [ ] `EngineStats.dropped_rate_limited` increments on each rate-limited packet.
+- [ ] `PeerStats.rx_bytes` and `tx_bytes` grow as expected after sends and recvs.
 
 ### Congestion control (unit)
 - [ ] `on_rtt_sample` with a constant RTT produces stable srtt ≈ that value.
@@ -351,3 +371,16 @@ Do not mark the implementation done until every item passes.
 - **Pacing new sends (latency-sensitive).** The token bucket applies only to retransmits.  New
   game sends must never block on CC — games require bounded latency on the outbound path.  The
   65 KB burst allowance is sized so typical game state syncs send without any delay.
+- **Not capping the send buffer.** A fast sender over a slow or lossy path accumulates unbounded
+  `BTreeMap` entries that are never pruned fast enough.  Always enforce `MAX_SENT_FRAMES_PER_STREAM`
+  (1 024) by evicting the oldest entry before inserting a new one at cap.
+- **Allocating a slot array before validating `frag_total`.** A Fragment frame with `frag_total = 65535`
+  pre-allocates 65 535 × pointer-size bytes per incomplete assembly, and an attacker can open 64+
+  assemblies simultaneously.  Validate `frag_total <= MAX_FRAG_RECV` (1 024) and reject the frame
+  before any allocation; reject the assembly if `MAX_CONCURRENT_ASSEMBLIES` (64) is already reached.
+- **Blocking the recv loop on inbound channel full.** If the application is slow to consume, a
+  blocking send into the inbound channel stalls packet reception for all peers.  Always use
+  non-blocking (`try_send`) and drop frames with a warning when the channel is full.
+- **Spawning unlimited retransmit tasks.** Each NACK batch spawns a task that may sleep for pacing.
+  Without a cap (`MAX_RETRANSMIT_TASKS = 32`), a NACK flood spawns tasks faster than they drain,
+  exhausting the task pool.  Check pool size before spawning and drop the NACK batch if full.

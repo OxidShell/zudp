@@ -39,6 +39,8 @@ All multi-byte integers are **big-endian**.
 | `0x08` | Beacon | 13 B + meta |
 | `0x09` | Handshake | variable (32–96 B) |
 | `0x0A` | Secure | 9 B + AEAD tag (16 B) |
+| `0x0B` | MtuProbe | 3 B + padding |
+| `0x0C` | MtuAck | 3 B |
 
 ---
 
@@ -192,6 +194,31 @@ A Noise-encrypted data frame. The `ciphertext` is the output of `ChaCha20-Poly13
 - NACK retransmits re-encrypt the original plaintext with a **fresh nonce** to avoid nonce reuse. The old nonce must not be reused even if the ciphertext is identical.
 - Anti-replay: a 64-bit sliding window (`highest` + bitmask) rejects nonces already seen within the last 64 slots of the highest received nonce. Nonces more than 64 behind the window are rejected unconditionally.
 
+### MtuProbe — `0x0B`
+
+Path-MTU discovery probe.  The frame is padded with zero bytes so the total datagram is exactly the size being probed.  The receiver responds with MtuAck (`0x0C`) — a tiny 3-byte frame that always gets through regardless of path MTU.
+
+```
+[zeros: padding bytes] [probe_id: u16] [0x0B]
+```
+
+Total wire size: `padding + 3` bytes.
+
+- `probe_id`: 16-bit monotonically increasing counter per (socket, peer) pair; the matching MtuAck carries the same value back.
+- `padding`: chosen by the binary-search probe algorithm so the datagram tests a specific MTU size.
+- All non-probe fields are zero to avoid probe frames being confused with real data if misdelivered.
+
+### MtuAck — `0x0C`
+
+Path-MTU discovery acknowledgement.  Always exactly 3 bytes.
+
+```
+[probe_id: u16] [0x0C]
+```
+
+- `probe_id`: mirrors the value from the corresponding MtuProbe.
+- Receivers always respond to MtuProbe with MtuAck, regardless of whether a Noise channel is established. (MtuAck is sent plaintext from the responder side; if a channel exists on the probing side, MtuAck is wrapped in Secure so the probe_id is not exposed.)
+
 ### Probe — `0x07` *(feature: `discovery`)*
 
 LAN discovery broadcast. Sent to the broadcast address `255.255.255.255` on the discovery port. Any node that is advertising the same `app_id` and `proto_ver` must reply with a Beacon.
@@ -256,9 +283,17 @@ Nacks are sent immediately on gap detection; there is no delayed-NACK timer.
 |---|---|
 | `MAX_NACK_SEQS` | 128 sequence numbers per Nack frame |
 | `MAX_FRAGMENTS` | 65 535 fragments per message (`u16::MAX`) |
+| `MAX_FRAG_RECV` | 1 024 — `frag_total` values above this are rejected (fragment bomb mitigation) |
+| `MAX_CONCURRENT_ASSEMBLIES` | 64 — max concurrent incomplete fragment assemblies per (peer, stream) |
+| `MAX_SENT_FRAMES_PER_STREAM` | 1 024 — per-stream send buffer cap; oldest frame evicted when full |
+| `MAX_RETRANSMIT_TASKS` | 32 — max concurrent NACK retransmit tasks; overflow batches are dropped |
+| `INBOUND_CAP` | 8 192 — bounded inbound channel slots; frames dropped when full (`try_send`) |
 | Default MTU | 1 400 B |
 | Default `sent_prune_age` | 10 s |
 | Default `keepalive_interval` | 5 s |
+| Default `max_peers` | 1 024 |
+| Default `max_pps_per_ip` | 1 000 (burst: 200) |
+| Default `max_relay_entries` | 256 |
 | Socket send/recv buffer | 4 MiB each |
 | Recv read buffer | 64 KiB (max UDP datagram) |
 
@@ -394,7 +429,9 @@ A token-bucket rate limiter is maintained per source IP address. Tokens refill a
 
 ### Peer table cap
 
-The engine tracks at most `max_peers` distinct remote addresses in its peer table. Connection attempts from new addresses beyond the cap are silently ignored (their packets are dropped before peer state is allocated). This prevents unbounded memory growth from address-scanning attacks.
+The engine tracks at most `max_peers` distinct remote addresses in its peer table. When a packet arrives from an unknown address and the table is at capacity, the **least-recently-seen** peer is evicted (LRU by `last_seen` timestamp) to make room, and the new peer is inserted normally. The `dropped_peer_cap` counter is incremented each time an eviction occurs; it is accessible via `EngineStats`.
+
+This bounds memory usage at any load while preserving service to genuinely active peers — idle peers are displaced before active ones.
 
 - Default: `max_peers = 1 024`.
 
@@ -516,6 +553,67 @@ When a Ping arrives from an **unknown source address** `new_addr`:
 | Client (any NAT) → Server (public IP) | ✓ migration works |
 | Client configured with relay | ✓ relay table updates on first Ping from new addr |
 | P2P both behind NAT (no relay) | ✗ new NAT mappings needed — use relay or re-initiate hole punching |
+
+---
+
+## Path MTU Discovery (PLPMTUD)
+
+ZUDP probes the actual path MTU between two peers using a binary-search algorithm driven by `MtuProbe` / `MtuAck` frames.  The goal is to send frames as large as the path allows without IP fragmentation, which would cause the entire datagram to be lost if any fragment is dropped.
+
+### When probing runs
+
+- On **first contact**: `spawn_mtu_probe()` is called when a new peer is registered (both on the server side when it first receives a Ping, and on the client side inside `connect()`).
+- On **address migration**: when a peer migrates to a new address, the effective MTU is reset to zero and probing restarts for the new path.
+
+### Algorithm
+
+The probe starts at the configured application MTU and binary-searches downward until it finds the largest size that receives an MtuAck within the timeout.
+
+Each probe is a `MtuProbe` frame padded so the total datagram equals the size under test (including ZUDP and UDP/IP headers).
+
+| Parameter | Value |
+|---|---|
+| Per-probe timeout | 200 ms |
+| Total probe cap (`connect()`) | 5 s |
+| Fallback on timeout | configured `mtu` (no change) |
+
+### Effective MTU
+
+The discovered value is stored atomically per peer (`effective_mtu: AtomicU32`).  Senders read it on every `send_msg()` call to determine whether to send a single Stream frame or fragment.  Until discovery completes (or if it times out), the configured `mtu` is used.
+
+On MtuAck receipt, the engine wakes the probe task via a `oneshot::Sender<()>` registered per `probe_id` in `PeerState.probe_acks`.
+
+---
+
+## Observability
+
+The engine exposes monotonically-increasing atomic counters and per-peer snapshots that carry zero lock contention in steady state.
+
+### Per-peer stats (`PeerStats`)
+
+Available via `ZudpSocket::peer_stats(addr)` and `ZudpConn::peer_stats()`.
+
+| Field | Type | Description |
+|---|---|---|
+| `srtt` | `Option<Duration>` | Smoothed RTT; `None` until first Pong |
+| `congestion_factor` | `Option<f64>` | `srtt / min_rtt`; near 1.0 = clear path |
+| `pacing_rate_bps` | `u64` | Current BBR-lite pacing rate in bytes/second |
+| `rx_bytes` | `u64` | Application payload bytes received from this peer |
+| `tx_bytes` | `u64` | Application payload bytes sent to this peer |
+| `retransmit_count` | `u64` | Frames retransmitted due to NACKs |
+
+### Engine-wide stats (`EngineStats`)
+
+Available via `ZudpSocket::engine_stats()` and `ZudpConn::engine_stats()`.
+
+| Field | Type | Description |
+|---|---|---|
+| `dropped_rate_limited` | `u64` | Packets dropped by the per-IP rate limiter |
+| `dropped_peer_cap` | `u64` | Times the peer table was full and an LRU eviction occurred |
+| `dropped_relay_blocked` | `u64` | Relay frames from IPs not in the allowlist |
+| `dropped_relay_cap` | `u64` | Relay frames dropped because the routing table was full |
+
+All counters are read with `Ordering::Relaxed`; they may lag by one instruction reorder but are never negative or wrapping in practice over a socket's lifetime.
 
 ---
 

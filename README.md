@@ -33,6 +33,11 @@ Zudp::default()
     .keepalive_interval(Duration::from_secs(5))
     .relay(relay_addr)                       // wrap every packet in a relay header
     .security(Keypair::generate())           // enable Noise XX encryption
+    .pin_remote_key(server_keypair.public_key().clone()) // reject peers with wrong key
+    .max_peers(1024)                         // LRU-evict oldest peer at cap
+    .rate_limit(1000.0)                      // per-IP token-bucket PPS (0.0 = off)
+    .relay_allowlist(vec![trusted_ip])       // restrict who may use this node as relay
+    .max_relay_entries(256)                  // relay routing table cap
     .listen::<Msg>()                         // ZudpSocket<Msg>  — multi-peer
     .connect::<Msg>(peer)                    // ZudpConn<Msg>    — single-peer
 ```
@@ -76,6 +81,49 @@ if let Some(factor) = conn.congestion_factor() {
 if let Some(rtt) = socket.peer_srtt(peer_addr) { /* … */ }
 ```
 
+## Observability
+
+`ZudpSocket` and `ZudpConn` expose live stats with no lock contention (all atomics):
+
+```rust
+// Per-peer snapshot — None if the peer is not in the table.
+if let Some(stats) = socket.peer_stats(peer_addr) {
+    println!("RTT {:?}  pacing {} B/s", stats.srtt, stats.pacing_rate_bps);
+    println!("rx {} B  tx {} B  retransmits {}", stats.rx_bytes, stats.tx_bytes, stats.retransmit_count);
+}
+
+// Engine-wide drop counters (monotonically increasing since socket creation).
+let e = socket.engine_stats();
+println!("rate-limited {} / peer-cap {} / relay-blocked {} / relay-cap {}",
+    e.dropped_rate_limited, e.dropped_peer_cap, e.dropped_relay_blocked, e.dropped_relay_cap);
+```
+
+`dropped_peer_cap` increments each time the peer table is full and an LRU eviction occurs.
+`dropped_rate_limited`, `dropped_relay_blocked`, `dropped_relay_cap` are self-explanatory.
+
+## Hardening
+
+All limits are enforced on the receive path, require no peer cooperation, and are configurable at build time:
+
+```rust
+// Per-IP rate limit — token bucket, default 1000 pps / 200 burst.
+// Set to 0.0 to disable.
+Zudp::default().rate_limit(500.0) …
+
+// Peer table cap — evicts least-recently-seen peer when full.
+Zudp::default().max_peers(512) …
+
+// Relay allowlist — empty means open relay (default); non-empty restricts relay use.
+Zudp::default()
+    .relay_allowlist(vec!["10.0.0.0".parse()?, "10.0.0.1".parse()?])
+    .max_relay_entries(64) …
+
+// Update relay policy at runtime without rebinding the socket.
+socket.set_relay_policy(new_allowlist, new_max_entries);
+```
+
+Fragment bombs are also capped: `frag_total > 1 024` and more than 64 concurrent assemblies per (peer, stream) are rejected at the engine level before any allocation occurs.
+
 ## End-to-end encryption
 
 Requires `features = ["security"]`. Uses Noise XX with X25519 DH, ChaCha20-Poly1305 AEAD, and BLAKE2s — the same cryptography as WireGuard. Mutual authentication: both sides verify each other's public key.
@@ -105,7 +153,7 @@ conn.send(Msg::Ping).await?;
 let pkt = conn.recv().await?;
 ```
 
-All three Noise handshake messages complete inside `connect()` — the channel is encrypted and ready before the first `send()`. Reliable frames (Stream, Fragment) are encrypted; keepalive Ping/Pong and Nack frames are not. NACK retransmits re-encrypt with a fresh nonce to prevent nonce reuse.
+All three Noise handshake messages complete inside `connect()` — the channel is encrypted and ready before the first `send()`. Once the channel is established, **all** frame types are wrapped in `Secure` except Datagram (unreliable fire-and-forget) and routing/discovery frames (Relay, Probe, Beacon, Handshake). This includes Ping/Pong keepalives (which carry session IDs) and Nack frames (which expose sequence timing) — encrypting them prevents replay-based migration attacks and traffic analysis. NACK retransmits re-encrypt the original plaintext with a fresh nonce; the old ciphertext is never re-sent.
 
 ## LAN discovery
 
