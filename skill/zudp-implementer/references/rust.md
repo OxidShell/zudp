@@ -10,11 +10,11 @@ implementing the wire protocol; that is in `SKILL.md` and `PROTOCOL.md`.
 
 ```toml
 [dependencies]
-zudp = "0.1"                                                        # bitcode codec (default)
-zudp = { version = "0.1", features = ["security"] }                 # + Noise XX encryption
-zudp = { version = "0.1", features = ["discovery"] }                # + LAN peer discovery
-zudp = { version = "0.1", features = ["security", "discovery"] }    # both
-zudp = { version = "0.1", default-features = false, features = ["serde"] } # postcard codec
+zudp = "0.2"                                                        # bitcode codec (default)
+zudp = { version = "0.2", features = ["security"] }                 # + Noise XX encryption
+zudp = { version = "0.2", features = ["discovery"] }                # + LAN peer discovery
+zudp = { version = "0.2", features = ["security", "discovery"] }    # both
+zudp = { version = "0.2", default-features = false, features = ["serde"] } # postcard codec
 ```
 
 ---
@@ -64,8 +64,14 @@ let mut socket = Zudp::default()
     .listen::<Msg>()
     .await?;
 
-// recv returns (message, sender_addr, stream_id)
-let (msg, from, stream_id) = socket.recv().await?;
+// recv returns a Packet<M> with named fields
+let pkt = socket.recv().await?;
+// pkt.msg   — the decoded message
+// pkt.from  — sender address
+// pkt.stream — stream ID (0 = DEFAULT_STREAM)
+
+// destructure if preferred
+let zudp::Packet { msg, from, stream } = socket.recv().await?;
 
 // send reliable (NACK-tracked) message to a specific peer on stream 0
 socket.send(Msg::Pong, from).await?;
@@ -90,7 +96,7 @@ let mut conn = Zudp::default()
     .await?;
 
 conn.send(Msg::Ping).await?;
-let (reply, stream_id) = conn.recv().await?;  // returns (M, stream_id)
+let pkt = conn.recv().await?;   // pkt.msg, pkt.from, pkt.stream
 
 // send on a named stream
 conn.send_stream(Msg::Ping, 1).await?;
@@ -128,12 +134,13 @@ Each connection supports up to 65 535 independent reliable streams (IDs 0–65 5
 socket.send_stream(Msg::Command(cmd), peer, 0).await?;    // stream 0 — commands
 socket.send_stream(Msg::Snapshot(data), peer, 1).await?;  // stream 1 — snapshots
 
-// recv carries the stream_id
-let (msg, from, stream_id) = socket.recv().await?;
+// recv returns Packet<M>; pkt.stream is the stream_id
+let pkt = socket.recv().await?;
+socket.send_stream(reply, pkt.from, pkt.stream).await?;
 
 // ZudpConn
 conn.send_stream(msg, 1).await?;
-let (reply, stream_id) = conn.recv().await?;
+let pkt = conn.recv().await?;   // pkt.stream tells which stream delivered
 ```
 
 `DEFAULT_STREAM = 0`. `send()` / `recv()` use stream 0 — all existing code continues to work.
@@ -189,23 +196,52 @@ Maximum message size: `mtu * 65535` bytes.
 
 ## Relay / NAT traversal
 
-Configure a relay node on the client; the relay is a plain `ZudpSocket` with no special setup.
+The relay is **stateful and bidirectional** — no special configuration needed.  When the client sends through it, the relay records a routing table entry and automatically forwards server replies back to the client.
 
 ```rust
-// client — wraps every packet in a Relay frame addressed to the relay node
+// client — wraps every packet via relay
 let conn = Zudp::default()
     .port(0)
     .relay("relay.example.com:7800".parse()?)
     .connect::<Msg>(server_addr)
     .await?;
 
-// relay node — just a normal listening socket; forwards Relay frames automatically
-let mut relay = Zudp::default().port(7800).listen::<Msg>().await?;
-// (relay doesn't need to recv() — the engine handles forwarding internally)
+// relay node — plain ZudpSocket; bidirectional routing table maintained by the engine
+let _relay = Zudp::default().port(7800).listen::<()>().await?;
+// relay does NOT need to call recv() — engine handles all forwarding internally
 ```
 
-The server sees `from == relay_addr`, not the original client address.
-NACK retransmission still works end-to-end (client retransmits to relay; relay re-forwards).
+- Server sees `from == relay_addr`, not the real client address.
+- NACK retransmission is end-to-end (client retransmits to relay; relay re-forwards).
+- When client migrates to a new IP, the relay table updates automatically on the next outbound packet.
+- Encrypted traffic (`security` feature) flows through relay transparently — raw bytes are forwarded before decoding.
+
+## Network migration
+
+Sessions persist across network changes automatically.  No application-level code required.
+
+```rust
+// client — after network change (WiFi → mobile, DHCP renew, etc.) the connection continues
+let mut conn = Zudp::default()
+    .port(0)
+    .connect::<Msg>(server_addr)
+    .await?;
+
+// send and recv work uninterrupted even after the local IP changes
+conn.send(Msg::Ping).await?;
+let pkt = conn.recv().await?;
+
+// conn.peer() returns the server's current address (auto-updated if server migrates too)
+println!("peer is now {}", conn.peer());
+```
+
+**How it works**: each peer has a random session ID sent in every Ping/Pong.  On network change, the engine rebinds the socket and sends Pings to all known peers.  Each peer recognises the session ID from the new address and updates its routing table.
+
+**Works for:**
+- Client (behind any NAT) → Server (public IP)
+- Client configured with `.relay(...)` — relay table updates automatically
+
+**Does not work for:** P2P where both peers are behind NAT without a relay (NAT mappings expire on network change).
 
 ---
 
@@ -342,7 +378,7 @@ Discovery::advertise(("my-game", 7700, GameInfo { … }))?
 use zudp::Error;
 
 match socket.recv().await {
-    Ok((msg, from)) => { /* … */ }
+    Ok(pkt) => { /* pkt.msg, pkt.from, pkt.stream */ }
     Err(Error::ChannelClosed) => { /* engine stopped — socket is dead */ }
     Err(Error::Io(e)) => { /* OS I/O error */ }
     Err(e) => { eprintln!("recv error: {e}"); }
@@ -380,9 +416,9 @@ println!("bound on {}", socket.local_addr()?);
 ```rust
 let mut server = Zudp::default().port(7700).listen::<ClientMsg>().await?;
 loop {
-    let (msg, from) = server.recv().await?;
-    let response = process(msg);
-    server.send(response, from).await?;
+    let pkt = server.recv().await?;
+    let response = process(pkt.msg);
+    server.send(response, pkt.from).await?;
 }
 ```
 

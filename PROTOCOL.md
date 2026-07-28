@@ -31,8 +31,8 @@ All multi-byte integers are **big-endian**.
 | `0x00` | Datagram | 1 B |
 | `0x01` | Stream | 11 B |
 | `0x02` | Nack | 3 B + N×8 B |
-| `0x03` | Ping | 9 B |
-| `0x04` | Pong | 9 B |
+| `0x03` | Ping | 17 B |
+| `0x04` | Pong | 17 B |
 | `0x05` | Fragment | 19 B |
 | `0x06` | Relay | 8 B (IPv4) / 20 B (IPv6) |
 | `0x07` | Probe | 11 B |
@@ -84,23 +84,25 @@ Negative acknowledgement. Requests retransmission of one or more sequence number
 
 ### Ping — `0x03`
 
-Keepalive probe. The `echo` value is an arbitrary token (typically the current Unix timestamp in milliseconds).
+Keepalive probe.  `echo` is an arbitrary token (typically the current Unix timestamp in milliseconds).  `session_id` is the **sender's own** randomly-generated session identifier, sent so the receiver can recognise this node if its network address changes between Pings.
 
 ```
-[echo: u64] [0x03]
+[echo: u64] [session_id: u64] [0x03]
 ```
 
-Sent when no outbound frame has been sent to a peer for `keepalive_interval` (default 5 s). The keepalive tick runs at `keepalive_interval / 4`.
+Sent when no outbound frame has been sent to a peer for `keepalive_interval` (default 5 s).  The keepalive tick runs at `keepalive_interval / 4`.
+
+On receipt the engine stores `session_id` in its per-peer session registry.  If a Ping arrives from an **unknown address** but carries a **known `session_id`**, the peer's address is migrated transparently (see *Network Migration* below).
 
 ### Pong — `0x04`
 
-Reply to a Ping. Mirrors the `echo` value unchanged.
+Reply to a Ping.  Mirrors `echo` unchanged; carries the **replier's** own `session_id`.
 
 ```
-[echo: u64] [0x04]
+[echo: u64] [session_id: u64] [0x04]
 ```
 
-Receiving any frame from a peer updates `last_seen`. Neither Ping nor Pong carry sequence numbers; they are not tracked for retransmission.
+Receiving any frame from a peer updates `last_seen`.  Neither Ping nor Pong carry sequence numbers; they are not tracked for retransmission.
 
 ### Fragment — `0x05`
 
@@ -120,7 +122,7 @@ Reassembly uses a pre-allocated `Vec<Option<Bytes>>` of length `frag_total`. Whe
 
 ### Relay — `0x06`
 
-Relay forwarding request. The sending node wraps an inner frame and addresses it to a relay node; the relay node strips the outer header and forwards `inner` verbatim to `dest`.
+Relay forwarding request.  The sending node wraps an inner frame and addresses it to a relay node; the relay node strips the outer header and forwards `inner` verbatim to `dest`.
 
 **IPv4 format** (addr tag `0x00`):
 
@@ -134,9 +136,25 @@ Relay forwarding request. The sending node wraps an inner frame and addresses it
 [inner bytes] [port: u16] [ip: 16 bytes] [0x01] [0x06]
 ```
 
-- The relay node is a plain ZUDP socket with no special configuration; it forwards any Relay frame it receives.
-- The destination sees `from == relay_addr`, not the originator's address. Return traffic must also be routed through the relay if the originator is behind NAT.
-- Reliable frames can be relayed, but NACK-triggered retransmission is end-to-end: the originator retransmits to the relay, which forwards again.
+- The relay node is a plain ZUDP socket with no special configuration; it handles both client→server and server→client routing automatically.
+- The destination sees `from == relay_addr`, not the originator's address.
+- Reliable frames can be relayed; NACK-triggered retransmission is end-to-end (originator retransmits to relay, relay re-forwards).
+
+#### Stateful relay (bidirectional routing)
+
+Every ZUDP engine that receives Relay frames automatically maintains a **relay routing table**:
+
+```
+relay_table: HashMap<server_addr, client_addr>
+```
+
+**Client → Server**: when a Relay frame arrives from `client_addr` destined for `server_addr`, the engine records `relay_table[server_addr] = client_addr` and forwards `inner` to `server_addr`.
+
+**Server → Client**: when any frame arrives from `server_addr` (which appears in `relay_table`), the relay engine forwards the **raw bytes** to `relay_table[server_addr]` without decoding.  This happens before Frame::decode, so encrypted, opaque, and partially-formed frames are forwarded transparently.
+
+**Migration**: if the client migrates to a new address and sends a Relay frame from the new address, `relay_table[server_addr]` is updated automatically.  Future server replies are delivered to the new address with no relay reconfiguration.
+
+The routing table is maintained per relay-engine instance and is not persisted across restarts.  One server address maps to exactly one client address (the most recent sender); for multi-client scenarios a dedicated relay with per-session allocation is required.
 
 ### Handshake — `0x09` *(feature: `security`)*
 
@@ -349,6 +367,52 @@ The initiator is always the node that called `Zudp::connect()`. The responder is
 ### Nonce exhaustion
 
 The send nonce is a monotonically increasing `u64` starting from 0. At a rate of one million messages per second it takes ~585 000 years to exhaust. No special handling is needed.
+
+---
+
+## Network Migration
+
+When a node changes its local network interface (WiFi → mobile, DHCP renew, VPN toggle), its UDP socket becomes invalid and the far end's peer table still points to the old address.  ZUDP recovers transparently via session IDs embedded in Ping/Pong frames.
+
+### Session IDs
+
+Each `PeerState` is assigned a random 64-bit `my_session_id` on creation.  This value is:
+
+- Included in every outbound Ping and Pong as the sender's session identifier.
+- Stored as `their_session_id` by the receiver the first time it arrives.
+- Registered in a `sessions: HashMap<u64, PeerState>` index for O(1) lookup by session ID.
+
+### Client-side rebind
+
+When `recv_from()` returns an unrecoverable I/O error (e.g. `ENETUNREACH` after an interface disappears):
+
+1. Engine creates a new UDP socket bound to the same local address (fallback: port 0).
+2. Engine replaces `EngineInner.socket` so all future sends use the new interface.
+3. Engine immediately sends Ping to every known peer, carrying `peer.my_session_id`, from the new socket.
+
+### Server-side migration detection
+
+When a Ping arrives from an **unknown source address** `new_addr`:
+
+1. Engine looks up `sessions[session_id]`.
+2. If found and `old_addr != new_addr`:
+   - `peer.migrate_to(new_addr)` — updates the live address Arc.
+   - `peers.remove(old_addr); peers.insert(new_addr, peer)` — re-keys the peer map.
+   - All `recv_states[(old_addr, stream_id)]` entries are moved to `(new_addr, stream_id)`.
+   - Logging: `"peer address migrated" old=… new=…`.
+3. Subsequent data frames from `new_addr` are routed correctly.
+
+### `ZudpConn` tracking
+
+`ZudpConn.peer` is an `Arc<RwLock<SocketAddr>>` that shares storage with `PeerState.addr`.  When the remote peer migrates, `ZudpConn.peer()` automatically returns the new address and `recv()` accepts frames from it — no reconnect needed.
+
+### Limitations
+
+| Topology | After network change |
+|---|---|
+| Client (any NAT) → Server (public IP) | ✓ migration works |
+| Client configured with relay | ✓ relay table updates on first Ping from new addr |
+| P2P both behind NAT (no relay) | ✗ new NAT mappings needed — use relay or re-initiate hole punching |
 
 ---
 

@@ -62,6 +62,9 @@ async fn run(
 ) {
     // Keyed by (peer_addr, stream_id) so each stream has independent reorder + reassembly.
     let mut recv_states: HashMap<(SocketAddr, u16), (RecvState, FragAssembler)> = HashMap::new();
+    // Stateful relay table: maps server_addr → client_addr.
+    // Populated when a Relay frame arrives; used to forward server replies back to the client.
+    let mut relay_table: HashMap<SocketAddr, SocketAddr> = HashMap::new();
     let keepalive_interval = inner.config.keepalive_interval;
     let sent_prune_age = inner.config.sent_prune_age;
 
@@ -77,7 +80,10 @@ async fn run(
             result = recv_sock.recv_from() => {
                 match result {
                     Ok((data, from)) => {
-                        handle_incoming(data, from, &inner, &inbound_tx, &mut recv_states).await;
+                        handle_incoming(
+                            data, from, &inner, &inbound_tx,
+                            &mut recv_states, &mut relay_table,
+                        ).await;
                     }
                     Err(e) => {
                         tracing::warn!(target: "zudp::engine", "recv error: {e} — attempting socket rebind");
@@ -141,7 +147,19 @@ async fn handle_incoming(
     inner: &Arc<EngineInner>,
     inbound_tx: &mpsc::UnboundedSender<(Bytes, SocketAddr, u16)>,
     recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
+    relay_table: &mut HashMap<SocketAddr, SocketAddr>,
 ) {
+    // Stateful relay pass-through: if `from` is a server we're relaying for, forward its raw
+    // reply bytes directly to the mapped client without decoding.  This is checked before
+    // Frame::decode so that encrypted and opaque frames are forwarded transparently.
+    if let Some(&client_addr) = relay_table.get(&from) {
+        tracing::trace!(target: "zudp::engine", server = %from, client = %client_addr, "relay ← server → client");
+        if let Err(e) = inner.get_socket().send_to(&data, client_addr).await {
+            tracing::warn!(target: "zudp::engine", client = %client_addr, "relay forward to client failed: {e}");
+        }
+        return;
+    }
+
     let frame = match Frame::decode(data) {
         Ok(f) => f,
         Err(e) => {
@@ -184,14 +202,14 @@ async fn handle_incoming(
                         return;
                     }
                 };
-                dispatch_frame(inner_frame, from, inner, inbound_tx, recv_states).await;
+                dispatch_frame(inner_frame, from, inner, inbound_tx, recv_states, relay_table).await;
             }
-            frame => dispatch_frame(frame, from, inner, inbound_tx, recv_states).await,
+            frame => dispatch_frame(frame, from, inner, inbound_tx, recv_states, relay_table).await,
         }
     }
 
     #[cfg(not(feature = "security"))]
-    dispatch_frame(frame, from, inner, inbound_tx, recv_states).await;
+    dispatch_frame(frame, from, inner, inbound_tx, recv_states, relay_table).await;
 }
 
 async fn dispatch_frame(
@@ -200,6 +218,7 @@ async fn dispatch_frame(
     inner: &Arc<EngineInner>,
     inbound_tx: &mpsc::UnboundedSender<(Bytes, SocketAddr, u16)>,
     recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
+    relay_table: &mut HashMap<SocketAddr, SocketAddr>,
 ) {
     match frame {
         Frame::Datagram(payload) => {
@@ -295,6 +314,10 @@ async fn dispatch_frame(
             dest,
             inner: payload,
         } => {
+            // Record client→server mapping so replies from `dest` can be routed back to `from`.
+            // Upsert handles client address migrations transparently.
+            relay_table.insert(dest, from);
+            tracing::trace!(target: "zudp::engine", client = %from, server = %dest, "relay client → server");
             if let Err(e) = inner.get_socket().send_to(&payload, dest).await {
                 tracing::warn!(target: "zudp::engine", %dest, "relay forward failed: {e}");
             }

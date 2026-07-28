@@ -135,15 +135,33 @@ zudp = { version = "0.1", default-features = false, features = ["serde"] }
 ## Relay
 
 The relay node is a plain `ZudpSocket` — no special configuration needed.
-The client wraps every packet in a `Frame::Relay` header; the relay forwards the
-inner bytes to the real destination. The server sees `from == relay_addr`.
+The relay is **stateful and bidirectional**: when a client sends through it, the relay records a routing table entry so server replies are automatically forwarded back to the client.
 
 ```rust
+// client — wrap every packet via relay
 let conn = Zudp::default()
     .relay("relay.example.com:7800".parse()?)
     .connect::<Msg>(server_addr)
     .await?;
+
+// relay node — just a listening socket; routing table maintained automatically by the engine
+let _relay = Zudp::default().port(7800).listen::<()>().await?;
+// (relay doesn't need to call recv() — the engine handles all forwarding internally)
 ```
+
+Server replies flow back through the relay to the client without any extra configuration.
+When the client migrates to a new network, the relay table is updated automatically on the next outbound packet.
+
+## Network migration
+
+When the local interface changes (WiFi → mobile, DHCP renew, VPN toggle), ZUDP restores the session automatically:
+
+1. Engine detects the socket error and rebinds to a new interface.
+2. Engine sends keepalive Pings carrying a per-peer session ID to all known peers.
+3. Each peer recognises the session ID and migrates the client's address in its peer table.
+4. Traffic resumes — no reconnect, no application-level handling required.
+
+Works for client→server topologies where the server has a public IP.  P2P connections where both peers are behind NAT require a relay.
 
 ## License
 

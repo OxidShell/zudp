@@ -64,8 +64,8 @@ All multi-byte integers are **big-endian**.  No exceptions.
 Datagram  (0x00): [payload]                                                                  + [0x00]
 Stream    (0x01): [payload] [seq:u64] [stream_id:u16]                                        + [0x01]
 Nack      (0x02): [seq_0:u64] … [seq_N:u64] [stream_id:u16]                                  + [0x02]
-Ping      (0x03): [echo:u64]                                                                 + [0x03]
-Pong      (0x04): [echo:u64]                                                                 + [0x04]
+Ping      (0x03): [echo:u64] [session_id:u64]                                                + [0x03]
+Pong      (0x04): [echo:u64] [session_id:u64]                                                + [0x04]
 Fragment  (0x05): [payload] [msg_id:u32] [frag_total:u16] [frag_idx:u16] [seq:u64] [stream_id:u16] + [0x05]
 Relay/v4  (0x06): [inner]   [port:u16]  [ip:4B]  [0x00]                                     + [0x06]
 Relay/v6  (0x06): [inner]   [port:u16]  [ip:16B] [0x01]                                     + [0x06]
@@ -134,15 +134,28 @@ on recv(stream_id, seq, payload):
 
 ### Keepalives
 - Send Ping when no outbound frame has been sent for `keepalive_interval` (default 5 s).
-- Reply to every Ping with Pong mirroring the `echo` value unchanged.
+- Ping carries `session_id` = sender's own random u64 session identifier.
+- Reply to every Ping with Pong mirroring `echo`; Pong carries the **replier's** `session_id`.
 - The keepalive tick fires at `keepalive_interval / 4` to avoid missing the threshold.
+- On first receipt of a Ping/Pong, store the remote's `session_id` in a `sessions` map keyed by that ID; this enables migration detection (see below).
 
-### Relay
-- The relay node is a plain ZUDP socket.  On receiving a `Frame::Relay`, forward `inner`
-  verbatim to `dest`; do not wrap or modify.
-- The server sees `from == relay_addr`, not the original sender's IP.
-- Reliable framing works end-to-end: the originator retransmits to the relay on Nack;
-  the relay re-forwards.
+### Relay (stateful, bidirectional)
+- The relay node is a plain ZUDP socket — no special configuration flag.
+- On receiving `Frame::Relay { dest, inner }` from `client_addr`:
+  1. Update routing table: `relay_table[dest] = client_addr` (upsert, handles migration).
+  2. Forward `inner` verbatim to `dest`.
+- Before decoding any incoming frame, check if `from` is in `relay_table`.  If so, forward the **raw bytes** to `relay_table[from]` and return — do not decode.  This ensures encrypted or opaque server replies are forwarded transparently.
+- The server sees `from == relay_addr`.  Reliable framing is end-to-end.
+
+### Network Migration
+- Each peer has a random `my_session_id` included in every outgoing Ping/Pong.
+- Maintain `sessions: HashMap<session_id, peer>`.  On Ping/Pong, store `their_session_id`.
+- On Ping from unknown address `new_addr` with known `session_id`:
+  1. Look up peer via `sessions[session_id]`.
+  2. `peer.addr = new_addr`.  Re-key `peers` map and `recv_states` map from `old_addr` to `new_addr`.
+  3. Log: "peer address migrated old=… new=…".
+- On socket recv error: rebind to same port (or port 0), then Ping all known peers to trigger migration on their side.
+- Limitation: P2P both-behind-NAT requires relay or re-hole-punch after migration.
 
 ---
 
