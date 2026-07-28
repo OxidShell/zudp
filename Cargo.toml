@@ -78,3 +78,12 @@ path = "examples/server.rs"
 [[example]]
 name = "client"
 path = "examples/client.rs"
+
+[[example]]
+name = "observability"
+path = "examples/observability.rs"
+
+[[example]]
+name = "key_pinning"
+path = "examples/key_pinning.rs"
+required-features = ["security"]
