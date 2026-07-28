@@ -17,6 +17,8 @@ const MTU_MIN: usize = 576;
 const MTU_MAX: usize = 9000;
 /// Per-probe timeout.  200 ms is enough for any reasonable LAN/WAN path.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+/// Maximum outstanding `MtuProbe` frames per peer.  Prevents unbounded `probe_acks` growth.
+const MAX_CONCURRENT_PROBES: usize = 8;
 
 static PROBE_ID: AtomicU16 = AtomicU16::new(1);
 
@@ -62,7 +64,13 @@ async fn probe_once(inner: &Arc<EngineInner>, peer_addr: SocketAddr, size: usize
     let (tx, rx) = oneshot::channel::<()>();
 
     let peer = inner.get_or_create_peer(peer_addr);
-    peer.probe_acks.lock().insert(probe_id, tx);
+    {
+        let mut acks = peer.probe_acks.lock();
+        if acks.len() >= MAX_CONCURRENT_PROBES {
+            return false;
+        }
+        acks.insert(probe_id, tx);
+    }
 
     let padding = size - 3;
     let wire = Frame::MtuProbe { probe_id, padding }.encode();

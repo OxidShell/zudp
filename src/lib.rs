@@ -36,6 +36,7 @@ mod frag;
 mod frame;
 mod mtu;
 mod peer;
+mod rate;
 #[cfg(feature = "security")]
 mod security;
 mod socket;
@@ -132,6 +133,18 @@ pub struct Config {
     /// Noise X25519 keypair; when set, all data frames are encrypted end-to-end.
     #[cfg(feature = "security")]
     pub(crate) security: Option<security::Keypair>,
+    /// Pinned remote static public key; handshakes presenting a different key are aborted.
+    #[cfg(feature = "security")]
+    pub(crate) remote_key: Option<[u8; 32]>,
+    /// Maximum number of tracked peers.  New peers beyond this limit are handled
+    /// ephemerally (not inserted into the peer table) to cap memory usage.
+    pub(crate) max_peers: usize,
+    /// Per-IP packet rate limit in packets per second (token bucket).  0 = disabled.
+    pub(crate) max_pps_per_ip: f64,
+    /// IP allowlist for relay requests.  Empty = allow all (open relay, current behaviour).
+    pub(crate) relay_allowlist: Vec<IpAddr>,
+    /// Maximum number of entries in the relay routing table.
+    pub(crate) max_relay_entries: usize,
 }
 
 impl Default for Config {
@@ -146,6 +159,12 @@ impl Default for Config {
             relay_addr: None,
             #[cfg(feature = "security")]
             security: None,
+            #[cfg(feature = "security")]
+            remote_key: None,
+            max_peers: 1_024,
+            max_pps_per_ip: 1_000.0,
+            relay_allowlist: vec![],
+            max_relay_entries: 256,
         }
     }
 }
@@ -230,6 +249,59 @@ impl Zudp {
     #[must_use]
     pub fn security(mut self, keypair: Keypair) -> Self {
         self.config.security = Some(keypair);
+        self
+    }
+
+    /// Require the remote peer's X25519 static key to equal `key`.
+    ///
+    /// Pass `keypair.public_key()` from the server's [`Keypair`].  Without this,
+    /// any peer that completes a valid Noise XX handshake is accepted (opportunistic
+    /// encryption only).  Mismatched keys cause the handshake to be silently
+    /// aborted; [`connect`](Self::connect) will time out.
+    #[cfg(feature = "security")]
+    #[must_use]
+    pub fn pin_remote_key(mut self, key: [u8; 32]) -> Self {
+        self.config.remote_key = Some(key);
+        self
+    }
+
+    /// Maximum number of tracked peers (default: 1 024).
+    ///
+    /// Peers beyond this limit are still reachable but their state is not stored,
+    /// capping per-socket memory use under large fan-in.
+    #[must_use]
+    pub fn max_peers(mut self, n: usize) -> Self {
+        self.config.max_peers = n;
+        self
+    }
+
+    /// Per-IP inbound packet rate limit in packets per second (default: 1 000).
+    ///
+    /// Uses a token-bucket algorithm with a burst of `max_pps / 5`.
+    /// Set to `0.0` to disable rate limiting.
+    #[must_use]
+    pub fn rate_limit(mut self, max_pps: f64) -> Self {
+        self.config.max_pps_per_ip = max_pps;
+        self
+    }
+
+    /// IP allowlist for relay requests (default: empty = open relay).
+    ///
+    /// When non-empty, only packets whose source IP is in the list are allowed
+    /// to use this socket as a relay node.  All others are silently dropped.
+    #[must_use]
+    pub fn relay_allowlist(mut self, ips: Vec<IpAddr>) -> Self {
+        self.config.relay_allowlist = ips;
+        self
+    }
+
+    /// Maximum number of entries in the relay routing table (default: 256).
+    ///
+    /// New relay destinations beyond this cap are dropped; existing routes
+    /// continue to function.
+    #[must_use]
+    pub fn max_relay_entries(mut self, n: usize) -> Self {
+        self.config.max_relay_entries = n;
         self
     }
 

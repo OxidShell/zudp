@@ -39,9 +39,17 @@ impl EngineInner {
             }
         }
         let mut w = self.peers.write();
-        w.entry(addr)
-            .or_insert_with(|| Arc::new(PeerState::new(addr)))
-            .clone()
+        // Re-check under write lock; another task may have inserted it.
+        if let Some(p) = w.get(&addr) {
+            return p.clone();
+        }
+        if w.len() >= self.config.max_peers {
+            tracing::warn!(target: "zudp::engine", "peer table full — handling {addr} ephemerally");
+            return Arc::new(PeerState::new(addr));
+        }
+        let peer = Arc::new(PeerState::new(addr));
+        w.insert(addr, peer.clone());
+        peer
     }
 }
 
@@ -62,11 +70,27 @@ async fn run(
 ) {
     // Keyed by (peer_addr, stream_id) so each stream has independent reorder + reassembly.
     let mut recv_states: HashMap<(SocketAddr, u16), (RecvState, FragAssembler)> = HashMap::new();
-    // Stateful relay table: maps server_addr → client_addr.
-    // Populated when a Relay frame arrives; used to forward server replies back to the client.
-    let mut relay_table: HashMap<SocketAddr, SocketAddr> = HashMap::new();
+    // Stateful relay table: maps server_addr → (client_addr, last_seen_gen).
+    // `last_seen_gen` is the relay_gen value at the last Frame::Relay from that client.
+    // Entries pruned when (relay_gen - last_seen_gen) >= relay_ttl_ticks.
+    // No Instant/syscall in the hot path — generation counter is a u32 store.
+    let mut relay_table: HashMap<SocketAddr, (SocketAddr, u32)> = HashMap::new();
+    // Monotonic counter incremented once per background tick.  Wrapping arithmetic
+    // is intentional: correct for the ~170-year lifetime of a u32 at 240 ticks/5 min.
+    let mut relay_gen: u32 = 0;
+    // TTL expressed as a tick delta: 5 minutes / tick_interval.
+    let relay_ttl_ticks = {
+        let tick_secs = inner.config.keepalive_interval.as_secs_f64() / 4.0;
+        (300.0_f64 / tick_secs).ceil() as u32
+    };
+
     let keepalive_interval = inner.config.keepalive_interval;
     let sent_prune_age = inner.config.sent_prune_age;
+
+    let mut rate_limiter = crate::rate::RateLimiter::new(
+        inner.config.max_pps_per_ip,
+        (inner.config.max_pps_per_ip / 5.0).max(1.0),
+    );
 
     // Local recv socket; replaced in-place when the socket is rebound.
     let mut recv_sock = inner.get_socket();
@@ -80,9 +104,15 @@ async fn run(
             result = recv_sock.recv_from() => {
                 match result {
                     Ok((data, from)) => {
+                        if inner.config.max_pps_per_ip > 0.0
+                            && !rate_limiter.allow(from.ip())
+                        {
+                            tracing::trace!(target: "zudp::engine", %from, "rate limited");
+                            continue;
+                        }
                         handle_incoming(
                             data, from, &inner, &inbound_tx,
-                            &mut recv_states, &mut relay_table,
+                            &mut recv_states, &mut relay_table, relay_gen,
                         ).await;
                     }
                     Err(e) => {
@@ -103,7 +133,10 @@ async fn run(
             }
 
             _ = ticker.tick() => {
-                run_background(&inner, &mut recv_states, keepalive_interval, sent_prune_age).await;
+                run_background(
+                    &inner, &mut recv_states, &mut relay_table, &mut relay_gen,
+                    relay_ttl_ticks, &mut rate_limiter, keepalive_interval, sent_prune_age,
+                ).await;
             }
         }
     }
@@ -134,7 +167,7 @@ async fn ping_all_peers(inner: &Arc<EngineInner>, sock: &RawSocket) {
     let now_ms = now_micros();
     let peers: Vec<Arc<PeerState>> = inner.peers.read().values().cloned().collect();
     for peer in peers {
-        let ping = Frame::Ping { echo: now_ms, session_id: peer.my_session_id }.encode();
+        let ping = secure_frame(&peer, Frame::Ping { echo: now_ms, session_id: peer.my_session_id });
         if let Err(e) = sock.send_to(&ping, peer.addr()).await {
             tracing::warn!(target: "zudp::engine", peer = %peer.addr(), "post-rebind ping failed: {e}");
         }
@@ -147,12 +180,13 @@ async fn handle_incoming(
     inner: &Arc<EngineInner>,
     inbound_tx: &mpsc::UnboundedSender<(Bytes, SocketAddr, u16)>,
     recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
-    relay_table: &mut HashMap<SocketAddr, SocketAddr>,
+    relay_table: &mut HashMap<SocketAddr, (SocketAddr, u32)>,
+    relay_gen: u32,
 ) {
     // Stateful relay pass-through: if `from` is a server we're relaying for, forward its raw
     // reply bytes directly to the mapped client without decoding.  This is checked before
     // Frame::decode so that encrypted and opaque frames are forwarded transparently.
-    if let Some(&client_addr) = relay_table.get(&from) {
+    if let Some(&(client_addr, _)) = relay_table.get(&from) {
         tracing::trace!(target: "zudp::engine", server = %from, client = %client_addr, "relay ← server → client");
         if let Err(e) = inner.get_socket().send_to(&data, client_addr).await {
             tracing::warn!(target: "zudp::engine", client = %client_addr, "relay forward to client failed: {e}");
@@ -202,14 +236,14 @@ async fn handle_incoming(
                         return;
                     }
                 };
-                dispatch_frame(inner_frame, from, inner, inbound_tx, recv_states, relay_table).await;
+                dispatch_frame(inner_frame, from, inner, inbound_tx, recv_states, relay_table, relay_gen).await;
             }
-            frame => dispatch_frame(frame, from, inner, inbound_tx, recv_states, relay_table).await,
+            frame => dispatch_frame(frame, from, inner, inbound_tx, recv_states, relay_table, relay_gen).await,
         }
     }
 
     #[cfg(not(feature = "security"))]
-    dispatch_frame(frame, from, inner, inbound_tx, recv_states, relay_table).await;
+    dispatch_frame(frame, from, inner, inbound_tx, recv_states, relay_table, relay_gen).await;
 }
 
 async fn dispatch_frame(
@@ -218,7 +252,8 @@ async fn dispatch_frame(
     inner: &Arc<EngineInner>,
     inbound_tx: &mpsc::UnboundedSender<(Bytes, SocketAddr, u16)>,
     recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
-    relay_table: &mut HashMap<SocketAddr, SocketAddr>,
+    relay_table: &mut HashMap<SocketAddr, (SocketAddr, u32)>,
+    relay_gen: u32,
 ) {
     match frame {
         Frame::Datagram(payload) => {
@@ -277,7 +312,7 @@ async fn dispatch_frame(
 
         Frame::Ping { echo, session_id } => {
             let peer = find_or_migrate_peer(from, session_id, inner, recv_states);
-            let pong = Frame::Pong { echo, session_id: peer.my_session_id }.encode();
+            let pong = secure_frame(&peer, Frame::Pong { echo, session_id: peer.my_session_id });
             if let Err(e) = inner.get_socket().send_to(&pong, from).await {
                 tracing::warn!(target: "zudp::engine", peer = %from, "pong failed: {e}");
             }
@@ -348,9 +383,29 @@ async fn dispatch_frame(
             dest,
             inner: payload,
         } => {
+            // Allowlist check: if non-empty, only listed IPs may use this node as a relay.
+            if !inner.config.relay_allowlist.is_empty()
+                && !inner.config.relay_allowlist.contains(&from.ip())
+            {
+                tracing::warn!(target: "zudp::engine", %from, "relay denied — not in allowlist");
+                return;
+            }
+            // Cap relay table size to prevent unbounded memory growth under abuse.
+            if !relay_table.contains_key(&dest)
+                && relay_table.len() >= inner.config.max_relay_entries
+            {
+                tracing::warn!(target: "zudp::engine", "relay table full — dropping entry for {dest}");
+                return;
+            }
             // Record client→server mapping so replies from `dest` can be routed back to `from`.
-            // Upsert handles client address migrations transparently.
-            relay_table.insert(dest, from);
+            // Upsert refreshes the generation counter — zero syscall cost.
+            relay_table
+                .entry(dest)
+                .and_modify(|(stored_from, last_gen)| {
+                    *stored_from = from;
+                    *last_gen = relay_gen;
+                })
+                .or_insert((from, relay_gen));
             tracing::trace!(target: "zudp::engine", client = %from, server = %dest, "relay client → server");
             if let Err(e) = inner.get_socket().send_to(&payload, dest).await {
                 tracing::warn!(target: "zudp::engine", %dest, "relay forward failed: {e}");
@@ -359,7 +414,12 @@ async fn dispatch_frame(
 
         Frame::MtuProbe { probe_id, .. } => {
             // Reflect probe_id in a tiny MtuAck — always gets through regardless of path MTU.
-            let ack = Frame::MtuAck { probe_id }.encode();
+            let ack_frame = Frame::MtuAck { probe_id };
+            let ack = if let Some(peer) = inner.peers.read().get(&from).cloned() {
+                secure_frame(&peer, ack_frame)
+            } else {
+                ack_frame.encode()
+            };
             if let Err(e) = inner.get_socket().send_to(&ack, from).await {
                 tracing::warn!(target: "zudp::engine", peer = %from, "mtu ack send failed: {e}");
             }
@@ -462,6 +522,16 @@ fn spawn_mtu_probe(inner: &Arc<EngineInner>, peer_addr: SocketAddr) {
     });
 }
 
+/// Encode `frame` and encrypt it for `peer` if an established Noise channel exists.
+///
+/// Falls back to plaintext when called before the handshake completes or when the
+/// `security` feature is disabled.  All post-handshake control frames (Ping, Pong,
+/// Nack, `MtuAck`) go through this so passive observers cannot read session metadata.
+fn secure_frame(peer: &PeerState, frame: Frame) -> Bytes {
+    let plain = frame.encode();
+    encrypt_or_plain(peer, &plain)
+}
+
 /// If the peer has an established Noise channel, re-encrypt the plain frame; otherwise send as-is.
 ///
 /// Used for NACK-triggered retransmits: each retransmit gets a fresh nonce to avoid reuse.
@@ -495,8 +565,13 @@ async fn send_nack_if_needed(
         return;
     }
     tracing::debug!(target: "zudp::engine", peer = %to, count = nack_seqs.len(), stream_id, "sending NACK");
-    let frame = Frame::Nack { stream_id, seqs: nack_seqs }.encode();
-    if let Err(e) = inner.get_socket().send_to(&frame, to).await {
+    let nack = Frame::Nack { stream_id, seqs: nack_seqs };
+    let wire = if let Some(peer) = inner.peers.read().get(&to).cloned() {
+        secure_frame(&peer, nack)
+    } else {
+        nack.encode()
+    };
+    if let Err(e) = inner.get_socket().send_to(&wire, to).await {
         tracing::warn!(target: "zudp::engine", peer = %to, "nack send failed: {e}");
     }
 }
@@ -504,6 +579,10 @@ async fn send_nack_if_needed(
 async fn run_background(
     inner: &Arc<EngineInner>,
     recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
+    relay_table: &mut HashMap<SocketAddr, (SocketAddr, u32)>,
+    relay_gen: &mut u32,
+    relay_ttl_ticks: u32,
+    rate_limiter: &mut crate::rate::RateLimiter,
     keepalive_interval: Duration,
     sent_prune_age: Duration,
 ) {
@@ -514,7 +593,7 @@ async fn run_background(
 
     for peer in peers {
         if peer.secs_since_sent() >= keepalive_threshold {
-            let ping = Frame::Ping { echo: now_ms, session_id: peer.my_session_id }.encode();
+            let ping = secure_frame(&peer, Frame::Ping { echo: now_ms, session_id: peer.my_session_id });
             if let Err(e) = inner.get_socket().send_to(&ping, peer.addr()).await {
                 tracing::warn!(target: "zudp::engine", peer = %peer.addr(), "keepalive failed: {e}");
             }
@@ -526,6 +605,16 @@ async fn run_background(
     for (_, frag_assembler) in recv_states.values_mut() {
         frag_assembler.prune(sent_prune_age);
     }
+
+    // Advance the relay generation counter and prune stale entries.
+    // Wrapping arithmetic is intentional — correct over the ~170-year u32 lifetime.
+    *relay_gen = relay_gen.wrapping_add(1);
+    let current_gen = *relay_gen;
+    relay_table.retain(|_, (_, last_seen_gen)| {
+        current_gen.wrapping_sub(*last_seen_gen) < relay_ttl_ticks
+    });
+
+    rate_limiter.tick_prune();
 }
 
 fn now_micros() -> u64 {
@@ -540,6 +629,9 @@ fn now_micros() -> u64 {
 /// - If a handshake already exists (initiator stored it before sending msg1), reads the
 ///   incoming message and, if it's the initiator's turn, writes the next message.
 /// - When both sides finish all three messages, transitions to `StatelessTransportState`.
+/// - If `inner.config.remote_key` is set, the remote's static key is verified after the
+///   handshake finishes.  A mismatch silently aborts — no channel is established and
+///   `connect()` will time out on the other side.
 #[cfg(feature = "security")]
 async fn handle_handshake(payload: Bytes, from: SocketAddr, inner: &Arc<EngineInner>) {
     use crate::security::{SecureChannel, build_responder};
@@ -566,7 +658,8 @@ async fn handle_handshake(payload: Bytes, from: SocketAddr, inner: &Arc<EngineIn
     }
 
     // Process the incoming message; determine if we need to reply and/or finish.
-    let outcome = {
+    // Returns (optional reply, optional finished handshake, key_mismatch).
+    let outcome = 'step: {
         let mut guard = peer.handshake.lock();
         let hs = guard.as_mut().expect("initialised above");
 
@@ -580,41 +673,51 @@ async fn handle_handshake(payload: Bytes, from: SocketAddr, inner: &Arc<EngineIn
         let finished_after_read = hs.is_handshake_finished();
 
         if finished_after_read {
-            // Take the state before releasing the guard.
+            // Key pinning check — must happen before consuming state.
+            if !check_pinned_key(hs, inner, from) {
+                let _ = guard.take();
+                break 'step (None::<Bytes>, None, true);
+            }
             let hs_owned = guard.take().unwrap();
-            (None::<Bytes>, Some(hs_owned))
-        } else {
-            // Still our turn to write (msg2 for responder, msg3 for initiator).
-            let mut wbuf = vec![0u8; 1024];
-            let n = match hs.write_message(&[], &mut wbuf) {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::warn!(target: "zudp::engine", peer = %from, "handshake write: {e}");
-                    return;
-                }
-            };
-            wbuf.truncate(n);
-            let reply = Bytes::from(wbuf);
-
-            // After writing, check again (initiator finishes on msg3 write).
-            let finished_after_write = hs.is_handshake_finished();
-            let hs_owned = if finished_after_write {
-                guard.take()
-            } else {
-                None
-            };
-
-            (Some(reply), hs_owned)
+            break 'step (None, Some(hs_owned), false);
         }
+
+        // Still our turn to write (msg2 for responder, msg3 for initiator).
+        let mut wbuf = vec![0u8; 1024];
+        let n = match hs.write_message(&[], &mut wbuf) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(target: "zudp::engine", peer = %from, "handshake write: {e}");
+                return;
+            }
+        };
+        wbuf.truncate(n);
+        let reply = Bytes::from(wbuf);
+
+        // After writing, check again (initiator finishes on msg3 write).
+        let finished_after_write = hs.is_handshake_finished();
+        if finished_after_write {
+            // Key pinning check — must happen before consuming state.
+            if !check_pinned_key(hs, inner, from) {
+                let _ = guard.take();
+                // Don't send msg3 either — abort silently.
+                break 'step (None, None, true);
+            }
+        }
+
+        let hs_owned = if finished_after_write { guard.take() } else { None };
+        (Some(reply), hs_owned, false)
     }; // handshake lock released
 
-    let (reply, finished_hs) = outcome;
+    let (reply, finished_hs, key_mismatch) = outcome;
+
+    if key_mismatch {
+        tracing::warn!(target: "zudp::security", peer = %from, "handshake aborted — key mismatch");
+        return;
+    }
 
     if let Some(reply_bytes) = reply {
-        let wire = Frame::Handshake {
-            payload: reply_bytes,
-        }
-        .encode();
+        let wire = Frame::Handshake { payload: reply_bytes }.encode();
         if let Err(e) = inner.get_socket().send_to(&wire, from).await {
             tracing::warn!(target: "zudp::engine", peer = %from, "handshake send: {e}");
         }
@@ -631,6 +734,33 @@ async fn handle_handshake(payload: Bytes, from: SocketAddr, inner: &Arc<EngineIn
             Err(e) => {
                 tracing::error!(target: "zudp::engine", peer = %from, "into_transport_mode: {e}");
             }
+        }
+    }
+}
+
+/// Check the remote's static key against the pinned key in config.
+///
+/// Returns `true` if the key is acceptable (no pinning, or pinned key matches).
+/// Returns `false` and logs a warning if the key is pinned and doesn't match.
+/// Must be called while the `HandshakeState` is still active (before consuming it).
+#[cfg(feature = "security")]
+fn check_pinned_key(
+    hs: &snow::HandshakeState,
+    inner: &Arc<EngineInner>,
+    from: SocketAddr,
+) -> bool {
+    let Some(expected) = &inner.config.remote_key else {
+        return true;
+    };
+    match hs.get_remote_static() {
+        Some(remote) if remote == expected.as_slice() => true,
+        Some(_) => {
+            tracing::warn!(target: "zudp::security", peer = %from, "key mismatch — remote key does not match pinned key");
+            false
+        }
+        None => {
+            tracing::warn!(target: "zudp::security", peer = %from, "key pinning: remote static not available");
+            false
         }
     }
 }

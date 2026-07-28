@@ -64,6 +64,13 @@ pub enum Error {
     /// Noise protocol error (handshake or AEAD failure).
     #[cfg(feature = "security")]
     Security(snow::Error),
+
+    /// Remote's X25519 key didn't match the pinned key.
+    #[cfg(feature = "security")]
+    KeyMismatch,
+
+    /// Packet dropped — source IP exceeded configured rate limit.
+    Throttled,
 }
 
 impl fmt::Display for Error {
@@ -110,6 +117,9 @@ impl fmt::Display for Error {
             }
             #[cfg(feature = "security")]
             Self::Security(e) => write!(f, "security: {e}"),
+            #[cfg(feature = "security")]
+            Self::KeyMismatch => f.write_str("security: remote key does not match pinned key"),
+            Self::Throttled => f.write_str("packet dropped: rate limit exceeded"),
         }
     }
 }

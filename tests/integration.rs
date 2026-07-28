@@ -1,10 +1,11 @@
-use std::{collections::HashMap, net::IpAddr, net::Ipv4Addr, time::Duration};
+use std::{net::IpAddr, net::Ipv4Addr, time::Duration};
+use std::collections::HashMap;
 
 use tokio::time::timeout;
 use zudp::Zudp;
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
-const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 macro_rules! recv {
     ($socket:expr) => {
@@ -133,4 +134,231 @@ async fn multiple_messages_in_order() {
         let pkt = recv!(server);
         assert_eq!(pkt.msg, expected, "out-of-order delivery on stream 0");
     }
+}
+
+// ── Item 1: Remote key pinning ────────────────────────────────────────────────
+
+#[cfg(feature = "security")]
+#[tokio::test]
+async fn key_pinning_correct_key_allowed() {
+    use zudp::Keypair;
+
+    let server_kp = Keypair::generate();
+    let client_kp = Keypair::generate();
+
+    let mut server: zudp::ZudpSocket<Vec<u8>> = Zudp::default()
+        .bind_ip(LOOPBACK)
+        .port(0)
+        .security(server_kp.clone())
+        .listen()
+        .await
+        .unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    let client = Zudp::default()
+        .bind_ip(LOOPBACK)
+        .port(0)
+        .security(client_kp)
+        .pin_remote_key(*server_kp.public_key())
+        .connect::<Vec<u8>>(server_addr)
+        .await
+        .unwrap();
+
+    client.send(b"pinned ok".to_vec()).await.unwrap();
+    let pkt = recv!(server);
+    assert_eq!(pkt.msg, b"pinned ok".to_vec());
+}
+
+#[cfg(feature = "security")]
+#[tokio::test]
+async fn key_pinning_wrong_key_rejected() {
+    use zudp::Keypair;
+
+    let server_kp = Keypair::generate();
+    let client_kp = Keypair::generate();
+    let wrong_kp = Keypair::generate();
+
+    let server: zudp::ZudpSocket<Vec<u8>> = Zudp::default()
+        .bind_ip(LOOPBACK)
+        .port(0)
+        .security(server_kp)
+        .listen()
+        .await
+        .unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    // connect() blocks until channel_ready fires; with a wrong pinned key it never fires.
+    let result = timeout(
+        Duration::from_secs(2),
+        Zudp::default()
+            .bind_ip(LOOPBACK)
+            .port(0)
+            .security(client_kp)
+            .pin_remote_key(*wrong_kp.public_key())
+            .connect::<Vec<u8>>(server_addr),
+    )
+    .await;
+
+    assert!(result.is_err(), "connect() should time out with a wrong pinned key");
+}
+
+#[cfg(feature = "security")]
+#[tokio::test]
+async fn key_pinning_none_allows_any() {
+    use zudp::Keypair;
+
+    let server_kp = Keypair::generate();
+    let client_kp = Keypair::generate();
+
+    let mut server: zudp::ZudpSocket<Vec<u8>> = Zudp::default()
+        .bind_ip(LOOPBACK)
+        .port(0)
+        .security(server_kp)
+        .listen()
+        .await
+        .unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    // No pin_remote_key — any valid peer should be accepted.
+    let client = Zudp::default()
+        .bind_ip(LOOPBACK)
+        .port(0)
+        .security(client_kp)
+        .connect::<Vec<u8>>(server_addr)
+        .await
+        .unwrap();
+
+    client.send(b"no pin ok".to_vec()).await.unwrap();
+    let pkt = recv!(server);
+    assert_eq!(pkt.msg, b"no pin ok".to_vec());
+}
+
+// ── Item 3: Rate limiting + peer cap ─────────────────────────────────────────
+
+#[tokio::test]
+async fn rate_limit_throttled() {
+    // max_pps=10 → burst=max(10/5,1)=2 tokens initially.
+    // Sending 10 packets instantly should let through at most burst (2) + ~0 refill.
+    let mut server: zudp::ZudpSocket<Vec<u8>> = Zudp::default()
+        .bind_ip(LOOPBACK)
+        .port(0)
+        .rate_limit(10.0)
+        .listen()
+        .await
+        .unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    let client = lo().port(0).connect::<Vec<u8>>(server_addr).await.unwrap();
+
+    for _ in 0..10u8 {
+        client.send(vec![0u8]).await.unwrap();
+    }
+
+    // Collect what arrives within a short window.
+    let mut received = 0usize;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    while let Ok(Ok(_)) = tokio::time::timeout_at(deadline, server.recv()).await {
+        received += 1;
+    }
+
+    // Rate limiter drops most packets; at most burst+small-refill worth should arrive.
+    assert!(received >= 1, "at least the burst should get through, got {received}");
+    assert!(received <= 5, "rate limiter should have throttled most, got {received}");
+}
+
+#[tokio::test]
+async fn peer_table_cap() {
+    let mut server: zudp::ZudpSocket<Vec<u8>> = Zudp::default()
+        .bind_ip(LOOPBACK)
+        .port(0)
+        .max_peers(2)
+        .listen()
+        .await
+        .unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    let c1 = lo().port(0).connect::<Vec<u8>>(server_addr).await.unwrap();
+    let c2 = lo().port(0).connect::<Vec<u8>>(server_addr).await.unwrap();
+    let c3 = lo().port(0).connect::<Vec<u8>>(server_addr).await.unwrap();
+
+    c1.send(vec![1]).await.unwrap();
+    c2.send(vec![2]).await.unwrap();
+    c3.send(vec![3]).await.unwrap();
+
+    // At least 2 messages should arrive (from the 2 tracked peers).
+    let pkt1 = recv!(server);
+    let pkt2 = recv!(server);
+    assert!(!pkt1.msg.is_empty());
+    assert!(!pkt2.msg.is_empty());
+}
+
+// ── Item 4: Relay abuse protection ────────────────────────────────────────────
+
+#[tokio::test]
+async fn relay_allowlist_blocks_unauthorized() {
+    let mut real_server: zudp::ZudpSocket<Vec<u8>> = lo().port(0).listen().await.unwrap();
+    let real_server_addr = real_server.local_addr().unwrap();
+
+    // Relay node allows only 127.0.0.2 — our loopback (127.0.0.1) is not in the list.
+    let relay: zudp::ZudpSocket<Vec<u8>> = Zudp::default()
+        .bind_ip(LOOPBACK)
+        .port(0)
+        .relay_allowlist(vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))])
+        .listen()
+        .await
+        .unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+
+    let client = lo()
+        .port(0)
+        .relay(relay_addr)
+        .connect::<Vec<u8>>(real_server_addr)
+        .await
+        .unwrap();
+
+    client.send(b"blocked".to_vec()).await.unwrap();
+
+    let result = timeout(Duration::from_millis(500), real_server.recv()).await;
+    assert!(result.is_err(), "relay should have blocked the unauthorized sender");
+}
+
+#[tokio::test]
+async fn relay_table_cap() {
+    let mut server1: zudp::ZudpSocket<Vec<u8>> = lo().port(0).listen().await.unwrap();
+    let server1_addr = server1.local_addr().unwrap();
+    let mut server2: zudp::ZudpSocket<Vec<u8>> = lo().port(0).listen().await.unwrap();
+    let server2_addr = server2.local_addr().unwrap();
+
+    // Relay with table cap = 1: only one destination may be tracked at a time.
+    let relay: zudp::ZudpSocket<Vec<u8>> = Zudp::default()
+        .bind_ip(LOOPBACK)
+        .port(0)
+        .max_relay_entries(1)
+        .listen()
+        .await
+        .unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+
+    let client1 = lo()
+        .port(0)
+        .relay(relay_addr)
+        .connect::<Vec<u8>>(server1_addr)
+        .await
+        .unwrap();
+    let client2 = lo()
+        .port(0)
+        .relay(relay_addr)
+        .connect::<Vec<u8>>(server2_addr)
+        .await
+        .unwrap();
+
+    // First client's route should be established.
+    client1.send(b"via relay".to_vec()).await.unwrap();
+    let pkt = recv!(server1);
+    assert_eq!(pkt.msg, b"via relay".to_vec());
+
+    // Second client's destination is a new relay entry, but cap=1 is full.
+    client2.send(b"should be dropped".to_vec()).await.unwrap();
+    let result = timeout(Duration::from_millis(500), server2.recv()).await;
+    assert!(result.is_err(), "relay table should be full — second route dropped");
 }
