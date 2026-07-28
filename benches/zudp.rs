@@ -86,5 +86,81 @@ fn bench_loopback(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_encode_decode, bench_loopback);
+// ── encrypted loopback (Noise XX) ────────────────────────────────────────────
+
+fn bench_encrypted_loopback(c: &mut Criterion) {
+    #[cfg(feature = "security")]
+    {
+        use zudp::Keypair;
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (msg_tx, msg_rx) = std::sync::mpsc::sync_channel::<()>(64);
+        let (addr_tx, addr_rx) = std::sync::mpsc::sync_channel::<std::net::SocketAddr>(1);
+
+        let server_kp = Keypair::generate();
+        rt.spawn(async move {
+            let mut server: zudp::ZudpSocket<Vec<u8>> = Zudp::default()
+                .port(0)
+                .security(server_kp)
+                .listen()
+                .await
+                .unwrap();
+            addr_tx.send(server.local_addr().unwrap()).unwrap();
+            loop {
+                match server.recv().await {
+                    Ok(_) => {
+                        if msg_tx.send(()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let server_addr = addr_rx.recv().unwrap();
+        let client_kp = Keypair::generate();
+        let client = rt
+            .block_on(
+                Zudp::default()
+                    .port(0)
+                    .security(client_kp)
+                    .connect::<Vec<u8>>(server_addr),
+            )
+            .unwrap();
+
+        let mut g = c.benchmark_group("encrypted_loopback");
+
+        let small = vec![0u8; 64];
+        g.throughput(Throughput::Bytes(64));
+        g.bench_function("small_64B", |b| {
+            b.iter(|| {
+                rt.block_on(client.send(small.clone())).unwrap();
+                msg_rx.recv().unwrap();
+            })
+        });
+
+        let medium = vec![0u8; 1400];
+        g.throughput(Throughput::Bytes(1400));
+        g.bench_function("mtu_1400B", |b| {
+            b.iter(|| {
+                rt.block_on(client.send(medium.clone())).unwrap();
+                msg_rx.recv().unwrap();
+            })
+        });
+
+        g.finish();
+    }
+
+    #[cfg(not(feature = "security"))]
+    {
+        let _ = c;
+    }
+}
+
+criterion_group!(benches, bench_encode_decode, bench_loopback, bench_encrypted_loopback);
 criterion_main!(benches);

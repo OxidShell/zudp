@@ -127,3 +127,108 @@ pub fn fragment(data: &Bytes, mtu: usize) -> Result<Vec<Bytes>, crate::Error> {
         .collect();
     Ok(chunks)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use bytes::Bytes;
+
+    use super::*;
+
+    #[test]
+    fn single_fragment_completes_immediately() {
+        let mut fa = FragAssembler::new();
+        let data = Bytes::from_static(b"hello");
+        let result = fa.insert(0, 0, 1, data.clone());
+        assert_eq!(result.unwrap(), data);
+        assert!(fa.in_flight.is_empty(), "completed assembly must be removed");
+    }
+
+    #[test]
+    fn out_of_order_fragments_reassemble_correctly() {
+        let mut fa = FragAssembler::new();
+        let a = Bytes::from_static(b"hello");
+        let b = Bytes::from_static(b" world");
+        // frag 1 arrives before frag 0.
+        assert!(fa.insert(1, 1, 2, b).is_none());
+        let result = fa.insert(1, 0, 2, a);
+        assert_eq!(result.unwrap(), Bytes::from_static(b"hello world"));
+    }
+
+    #[test]
+    fn fragment_bomb_above_max_rejected() {
+        let mut fa = FragAssembler::new();
+        let result = fa.insert(99, 0, MAX_FRAG_RECV + 1, Bytes::from_static(b"evil"));
+        assert!(result.is_none(), "frag_total > MAX_FRAG_RECV must be rejected");
+        assert!(fa.in_flight.is_empty(), "no slot should be allocated for rejected frames");
+    }
+
+    #[test]
+    fn fragment_zero_total_rejected() {
+        let mut fa = FragAssembler::new();
+        let result = fa.insert(0, 0, 0, Bytes::from_static(b"bad"));
+        assert!(result.is_none());
+        assert!(fa.in_flight.is_empty());
+    }
+
+    #[test]
+    fn frag_idx_out_of_bounds_rejected() {
+        let mut fa = FragAssembler::new();
+        // frag_idx == frag_total is invalid (must be < frag_total).
+        let result = fa.insert(0, 3, 3, Bytes::from_static(b"bad"));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn concurrent_assembly_cap_enforced() {
+        let mut fa = FragAssembler::new();
+        // Fill exactly MAX_CONCURRENT_ASSEMBLIES incomplete assemblies.
+        for id in 0..(MAX_CONCURRENT_ASSEMBLIES as u32) {
+            let result = fa.insert(id, 0, 2, Bytes::from_static(b"x"));
+            assert!(result.is_none(), "incomplete assembly should not complete on frag 0");
+        }
+        assert_eq!(fa.in_flight.len(), MAX_CONCURRENT_ASSEMBLIES);
+
+        // One more distinct msg_id must be rejected.
+        #[allow(clippy::cast_possible_truncation)]
+        let overflow_id = MAX_CONCURRENT_ASSEMBLIES as u32;
+        let result = fa.insert(overflow_id, 0, 2, Bytes::from_static(b"overflow"));
+        assert!(result.is_none(), "assembly beyond cap must be rejected");
+        assert_eq!(
+            fa.in_flight.len(),
+            MAX_CONCURRENT_ASSEMBLIES,
+            "cap must not be exceeded"
+        );
+    }
+
+    #[test]
+    fn duplicate_fragment_does_not_double_count() {
+        let mut fa = FragAssembler::new();
+        let piece = Bytes::from_static(b"chunk");
+        let _ = fa.insert(1, 0, 2, piece.clone());
+        let _ = fa.insert(1, 0, 2, piece.clone()); // duplicate of frag 0
+        // Assembly should still be waiting for frag 1 — received must be 1, not 2.
+        let asm = fa.in_flight.get(&1).expect("assembly should be in flight");
+        assert_eq!(asm.received, 1, "duplicate must not increment received count");
+    }
+
+    #[test]
+    fn prune_keeps_fresh_assemblies() {
+        let mut fa = FragAssembler::new();
+        let _ = fa.insert(0, 0, 2, Bytes::from_static(b"piece0"));
+        fa.prune(Duration::from_hours(1)); // huge max_age — nothing should be pruned
+        assert_eq!(fa.in_flight.len(), 1, "fresh assembly must survive prune");
+    }
+
+    #[test]
+    fn prune_removes_stale_assemblies() {
+        let mut fa = FragAssembler::new();
+        let _ = fa.insert(0, 0, 2, Bytes::from_static(b"piece0"));
+        // Sleep past the max_age threshold so the assembly is considered stale.
+        std::thread::sleep(Duration::from_millis(5));
+        fa.prune(Duration::from_millis(1));
+        assert_eq!(fa.in_flight.len(), 0, "stale assembly must be removed by prune");
+    }
+}

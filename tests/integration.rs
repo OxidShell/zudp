@@ -292,6 +292,163 @@ async fn peer_table_cap() {
     assert!(!pkt2.msg.is_empty());
 }
 
+// ── Item 2: Observability (PeerStats / EngineStats) ──────────────────────────
+
+#[tokio::test]
+async fn peer_stats_tracks_rx_and_tx_bytes() {
+    let mut server: zudp::ZudpSocket<Vec<u8>> = lo().port(0).listen().await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    let client = lo().port(0).connect::<Vec<u8>>(server_addr).await.unwrap();
+    let client_addr = client.local_addr().unwrap();
+
+    let payload = vec![0xAAu8; 256];
+    client.send(payload.clone()).await.unwrap();
+    let _ = recv!(server);
+
+    // Server must have recorded non-zero rx_bytes from the client.
+    // (rx_bytes tracks encoded payload bytes, not raw message size.)
+    let srv = server
+        .peer_stats(client_addr)
+        .expect("client should be in server peer table");
+    assert!(
+        srv.rx_bytes > 0,
+        "server rx_bytes should be non-zero, got {}",
+        srv.rx_bytes
+    );
+
+    // Client must have recorded non-zero tx_bytes to the server.
+    // (tx_bytes tracks plain-frame bytes including stream header overhead.)
+    let cli = client.peer_stats().expect("server should be in client peer table");
+    assert!(
+        cli.tx_bytes > 0,
+        "client tx_bytes should be non-zero, got {}",
+        cli.tx_bytes
+    );
+}
+
+#[tokio::test]
+async fn engine_stats_rate_limited_counter_increments() {
+    // max_pps=1 → burst=max(0.2,1)=1 token; firing 20 packets instantly saturates it quickly.
+    let server: zudp::ZudpSocket<Vec<u8>> = Zudp::default()
+        .bind_ip(LOOPBACK)
+        .port(0)
+        .rate_limit(1.0)
+        .listen()
+        .await
+        .unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    let client = lo().port(0).connect::<Vec<u8>>(server_addr).await.unwrap();
+    for _ in 0..20u8 {
+        client.send(vec![0u8]).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let stats = server.engine_stats();
+    assert!(
+        stats.dropped_rate_limited >= 1,
+        "dropped_rate_limited should be non-zero under burst, got {}",
+        stats.dropped_rate_limited
+    );
+}
+
+#[tokio::test]
+async fn engine_stats_peer_cap_counter_increments() {
+    // max_peers=1: a second distinct peer causes an LRU eviction and increments the counter.
+    let server: zudp::ZudpSocket<Vec<u8>> = Zudp::default()
+        .bind_ip(LOOPBACK)
+        .port(0)
+        .max_peers(1)
+        .listen()
+        .await
+        .unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    let c1 = lo().port(0).connect::<Vec<u8>>(server_addr).await.unwrap();
+    c1.send(vec![1]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let c2 = lo().port(0).connect::<Vec<u8>>(server_addr).await.unwrap();
+    c2.send(vec![2]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let stats = server.engine_stats();
+    assert!(
+        stats.dropped_peer_cap >= 1,
+        "dropped_peer_cap should increment on LRU eviction, got {}",
+        stats.dropped_peer_cap
+    );
+}
+
+#[tokio::test]
+async fn engine_stats_relay_blocked_counter_increments() {
+    // Relay only allows 127.0.0.2; our loopback client is 127.0.0.1 — blocked.
+    let relay: zudp::ZudpSocket<Vec<u8>> = Zudp::default()
+        .bind_ip(LOOPBACK)
+        .port(0)
+        .relay_allowlist(vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))])
+        .listen()
+        .await
+        .unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let server: zudp::ZudpSocket<Vec<u8>> = lo().port(0).listen().await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    let client = lo()
+        .port(0)
+        .relay(relay_addr)
+        .connect::<Vec<u8>>(server_addr)
+        .await
+        .unwrap();
+    client.send(b"blocked".to_vec()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let stats = relay.engine_stats();
+    assert!(
+        stats.dropped_relay_blocked >= 1,
+        "dropped_relay_blocked should increment, got {}",
+        stats.dropped_relay_blocked
+    );
+}
+
+// ── Item 5: LRU eviction correctness ─────────────────────────────────────────
+
+#[tokio::test]
+async fn lru_eviction_keeps_most_recently_active_peer() {
+    // max_peers=1: when c2 arrives it evicts c1 (c1 is LRU at that moment).
+    let server: zudp::ZudpSocket<Vec<u8>> = Zudp::default()
+        .bind_ip(LOOPBACK)
+        .port(0)
+        .max_peers(1)
+        .listen()
+        .await
+        .unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    let c1 = lo().port(0).connect::<Vec<u8>>(server_addr).await.unwrap();
+    let c2 = lo().port(0).connect::<Vec<u8>>(server_addr).await.unwrap();
+    let c1_addr = c1.local_addr().unwrap();
+    let c2_addr = c2.local_addr().unwrap();
+
+    // c1 sends first — gets inserted into the table.
+    c1.send(vec![1]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // c2 sends — c1 is the only (and thus least-recently-seen) peer, so c1 is evicted.
+    c2.send(vec![2]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert!(
+        server.peer_stats(c1_addr).is_none(),
+        "c1 should have been evicted as the LRU peer"
+    );
+    assert!(
+        server.peer_stats(c2_addr).is_some(),
+        "c2 should be in the peer table after evicting c1"
+    );
+}
+
 // ── Item 4: Relay abuse protection ────────────────────────────────────────────
 
 #[tokio::test]

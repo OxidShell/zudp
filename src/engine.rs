@@ -340,9 +340,8 @@ async fn dispatch_frame(
 ) {
     match frame {
         Frame::Datagram(payload) => {
-            if let Some(peer) = inner.peers.read().get(&from).cloned() {
-                peer.rx_bytes.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            }
+            let peer = inner.get_or_create_peer(from);
+            peer.rx_bytes.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
             if inbound_tx.try_send((payload, from, 0)).is_err() {
                 tracing::warn!(target: "zudp::engine", %from, "inbound channel full — dropping datagram");
             }
@@ -359,12 +358,10 @@ async fn dispatch_frame(
 
             let (ready, nack_seqs) = recv.ingest(seq, Inbound::Data(payload));
             send_nack_if_needed(nack_seqs, stream_id, from, inner).await;
-            let peer = inner.peers.read().get(&from).cloned();
+            let peer = inner.get_or_create_peer(from);
             for item in ready {
                 if let Inbound::Data(bytes) = item {
-                    if let Some(p) = &peer {
-                        p.rx_bytes.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    peer.rx_bytes.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     if inbound_tx.try_send((bytes, from, stream_id)).is_err() {
                         tracing::warn!(target: "zudp::engine", %from, stream_id, "inbound channel full — dropping stream frame");
                     }
@@ -467,6 +464,7 @@ async fn dispatch_frame(
             let (ready, nack_seqs) = recv.ingest(seq, inbound);
             send_nack_if_needed(nack_seqs, stream_id, from, inner).await;
 
+            let peer = inner.get_or_create_peer(from);
             for item in ready {
                 if let Inbound::Fragment {
                     msg_id,
@@ -477,9 +475,7 @@ async fn dispatch_frame(
                     && let Some(complete) =
                         frag_assembler.insert(msg_id, frag_idx, frag_total, data)
                 {
-                    if let Some(peer) = inner.peers.read().get(&from).cloned() {
-                        peer.rx_bytes.fetch_add(complete.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    peer.rx_bytes.fetch_add(complete.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     if inbound_tx.try_send((complete, from, stream_id)).is_err() {
                         tracing::warn!(target: "zudp::engine", %from, stream_id, "inbound channel full — dropping reassembled fragment");
                     }
