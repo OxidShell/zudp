@@ -90,6 +90,7 @@ pub use ::serde;
 pub use ::postcard;
 
 use std::{
+    collections::HashMap,
     marker::PhantomData,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
@@ -102,8 +103,8 @@ use std::{
 use bytes::Bytes;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
-
 use engine::EngineInner;
+
 use frag::fragment;
 use frame::Frame;
 use peer::PeerState;
@@ -251,11 +252,14 @@ impl Zudp {
     /// Returns `Err` if the OS refuses to bind the requested address/port.
     pub async fn connect<M>(self, peer: SocketAddr) -> Result<ZudpConn<M>, Error> {
         let socket = ZudpSocket::new(self.config).await?;
+        // Pre-create the peer entry so ZudpConn can share the live-address Arc.
+        let peer_state = socket.inner.get_or_create_peer(peer);
+        let peer_addr = peer_state.addr_arc();
         #[cfg(feature = "security")]
         if socket.inner.config.security.is_some() {
             socket.inner.initiate_handshake(peer).await?;
         }
-        Ok(ZudpConn { socket, peer })
+        Ok(ZudpConn { socket, peer: peer_addr })
     }
 }
 
@@ -275,8 +279,9 @@ impl Inner {
         let socket = RawSocket::bind(addr).await?;
         let config = Arc::new(config);
         let engine = Arc::new(EngineInner {
-            socket,
-            peers: RwLock::new(std::collections::HashMap::new()),
+            socket: RwLock::new(socket),
+            peers: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(HashMap::new()),
             config: config.clone(),
             #[cfg(feature = "security")]
             keypair: config.security.clone(),
@@ -313,7 +318,7 @@ impl Inner {
             payload: Bytes::from(buf),
         }
         .encode();
-        self.engine.socket.send_to(&wire, peer_addr).await?;
+        self.engine.get_socket().send_to(&wire, peer_addr).await?;
 
         let peer = self.get_or_create_peer(peer_addr);
         *peer.handshake.lock() = Some(hs);
@@ -385,7 +390,7 @@ impl Inner {
             } else {
                 inner_wire
             };
-            self.engine.socket.send_to(&wire, actual_dest).await?;
+            self.engine.get_socket().send_to(&wire, actual_dest).await?;
             peer.record_sent(stream_id, seq, plain_frame);
         } else if wrap_relay {
             let frame = Frame::Datagram(payload).encode();
@@ -394,13 +399,13 @@ impl Inner {
                 inner: frame,
             }
             .encode();
-            self.engine.socket.send_to(&wire, actual_dest).await?;
+            self.engine.get_socket().send_to(&wire, actual_dest).await?;
         } else {
             // Scatter-gather: send payload + 1-byte type tag without copying payload.
             // (Unreliable datagrams are not encrypted — no peer channel tracking for these.)
             let type_tag = [frame::TYPE_DATAGRAM];
             self.engine
-                .socket
+                .get_socket()
                 .send_to_vectored(
                     &[
                         std::io::IoSlice::new(&payload),
@@ -451,7 +456,7 @@ impl Inner {
             } else {
                 inner_wire
             };
-            self.engine.socket.send_to(&wire, actual_dest).await?;
+            self.engine.get_socket().send_to(&wire, actual_dest).await?;
             peer.record_sent(stream_id, seq, plain_frame);
         }
         Ok(())
@@ -502,7 +507,7 @@ impl<M> ZudpSocket<M> {
     /// Returns `Err` if the OS cannot retrieve the socket's local address.
     #[must_use = "the address is returned, not printed"]
     pub fn local_addr(&self) -> Result<SocketAddr, Error> {
-        self.inner.engine.socket.local_addr()
+        self.inner.engine.get_socket().local_addr()
     }
 
     /// Send a reliable, ordered message to `peer` on stream 0.
@@ -573,16 +578,22 @@ impl<M> ZudpSocket<M> {
 ///
 /// Created by [`Zudp::connect`].
 /// `send()` and `recv()` target `peer` exclusively.
+///
+/// The peer's address is tracked dynamically: if the remote migrates to a new network interface
+/// the session continues transparently — `peer()` returns the current address after migration.
 pub struct ZudpConn<M> {
     socket: ZudpSocket<M>,
-    peer: SocketAddr,
+    /// Shared with `PeerState.addr`; updated in-place when the remote migrates.
+    peer: Arc<RwLock<SocketAddr>>,
 }
 
 impl<M> ZudpConn<M> {
-    /// Remote peer address.
+    /// Current remote peer address.
+    ///
+    /// Updated automatically when the peer migrates to a new network interface.
     #[must_use]
     pub fn peer(&self) -> SocketAddr {
-        self.peer
+        *self.peer.read()
     }
 
     /// Local address this socket is bound to.
@@ -602,7 +613,7 @@ impl<M> ZudpConn<M> {
     where
         M: Encode,
     {
-        self.socket.send(msg, self.peer).await
+        self.socket.send(msg, self.peer()).await
     }
 
     /// Send a reliable, ordered message to the bound peer on `stream_id`.
@@ -616,7 +627,7 @@ impl<M> ZudpConn<M> {
     where
         M: Encode,
     {
-        self.socket.send_stream(msg, self.peer, stream_id).await
+        self.socket.send_stream(msg, self.peer(), stream_id).await
     }
 
     /// Send an unreliable datagram to the bound peer.
@@ -627,13 +638,13 @@ impl<M> ZudpConn<M> {
     where
         M: Encode,
     {
-        self.socket.send_unreliable(msg, self.peer).await
+        self.socket.send_unreliable(msg, self.peer()).await
     }
 
     /// Receive the next message from the bound peer on any stream.
     ///
-    /// `pkt.from` is always equal to [`ZudpConn::peer`]. Messages from other peers
-    /// are silently discarded.
+    /// `pkt.from` reflects the peer's current address (updated after a network migration).
+    /// Messages from unrelated peers are silently discarded.
     ///
     /// # Errors
     /// Returns `Err(Error::ChannelClosed)` if the engine task has stopped.
@@ -643,13 +654,14 @@ impl<M> ZudpConn<M> {
     {
         loop {
             let pkt = self.socket.recv().await?;
-            if pkt.from == self.peer {
+            let current = *self.peer.read();
+            if pkt.from == current {
                 return Ok(pkt);
             }
             tracing::debug!(
                 target: "zudp",
                 unexpected = %pkt.from,
-                expected = %self.peer,
+                expected = %current,
                 "dropping message from unexpected peer"
             );
         }

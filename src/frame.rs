@@ -13,8 +13,8 @@ pub const MAX_NACK_SEQS: usize = 128;
 /// Datagram  : [payload][0x00]                                                     (1 byte)
 /// Stream    : [payload][seq: u64 BE][stream_id: u16 BE][0x01]                     (11 bytes)
 /// Nack      : [seq0: u64 BE]...[stream_id: u16 BE][0x02]                          (3 + N*8 bytes)
-/// Ping      : [echo: u64 BE][0x03]                                                (9 bytes)
-/// Pong      : [echo: u64 BE][0x04]                                                (9 bytes)
+/// Ping      : [echo: u64 BE][session_id: u64 BE][0x03]                            (17 bytes)
+/// Pong      : [echo: u64 BE][session_id: u64 BE][0x04]                            (17 bytes)
 /// Fragment  : [payload][msg_id: u32 BE][frag_total: u16 BE][frag_idx: u16 BE]
 ///                      [seq: u64 BE][stream_id: u16 BE][0x05]                     (19 bytes)
 /// Relay(v4) : [inner][port: u16 BE][ip: 4 bytes][0x00][0x06]                     (8 bytes)
@@ -54,10 +54,11 @@ pub enum Frame {
     },
     /// Negative acknowledgement — request retransmission of the listed sequences on a stream.
     Nack { stream_id: u16, seqs: Vec<u64> },
-    /// Keepalive probe carrying an echo token.
-    Ping { echo: u64 },
-    /// Keepalive reply mirroring the probe token.
-    Pong { echo: u64 },
+    /// Keepalive probe.  `session_id` is the sender's own session ID so the receiver can
+    /// recognise this peer if it migrates to a new address before the next Ping arrives.
+    Ping { echo: u64, session_id: u64 },
+    /// Keepalive reply.  `session_id` is the *replier's* session ID.
+    Pong { echo: u64, session_id: u64 },
     /// One slice of a fragmented reliable message, on a specific stream.
     Fragment {
         msg_id: u32,
@@ -119,15 +120,17 @@ impl Frame {
                 buf.put_u8(TYPE_NACK);
                 buf.freeze()
             }
-            Frame::Ping { echo } => {
-                let mut buf = BytesMut::with_capacity(9);
+            Frame::Ping { echo, session_id } => {
+                let mut buf = BytesMut::with_capacity(17);
                 buf.put_u64(echo);
+                buf.put_u64(session_id);
                 buf.put_u8(TYPE_PING);
                 buf.freeze()
             }
-            Frame::Pong { echo } => {
-                let mut buf = BytesMut::with_capacity(9);
+            Frame::Pong { echo, session_id } => {
+                let mut buf = BytesMut::with_capacity(17);
                 buf.put_u64(echo);
+                buf.put_u64(session_id);
                 buf.put_u8(TYPE_PONG);
                 buf.freeze()
             }
@@ -241,19 +244,27 @@ impl Frame {
             }
 
             TYPE_PING => {
+                let session_id = pop_u64(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "ping",
+                    field: "session_id",
+                })?;
                 let echo = pop_u64(&mut data).ok_or(Error::FrameTruncated {
                     frame: "ping",
                     field: "echo",
                 })?;
-                Ok(Frame::Ping { echo })
+                Ok(Frame::Ping { echo, session_id })
             }
 
             TYPE_PONG => {
+                let session_id = pop_u64(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "pong",
+                    field: "session_id",
+                })?;
                 let echo = pop_u64(&mut data).ok_or(Error::FrameTruncated {
                     frame: "pong",
                     field: "echo",
                 })?;
-                Ok(Frame::Pong { echo })
+                Ok(Frame::Pong { echo, session_id })
             }
 
             TYPE_FRAGMENT => {

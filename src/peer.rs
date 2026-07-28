@@ -2,12 +2,17 @@
 use std::sync::OnceLock;
 use std::{
     collections::{BTreeMap, HashMap},
+    hash::{Hash, Hasher},
     net::SocketAddr,
-    time::{Duration, Instant},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime},
 };
 
 use bytes::Bytes;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 #[cfg(feature = "security")]
 use crate::security::SecureChannel;
@@ -22,7 +27,12 @@ pub struct SentPacket {
 
 /// Send-side state for one remote peer, shared between the caller and the engine task.
 pub struct PeerState {
-    pub addr: SocketAddr,
+    /// Current remote address; updated transparently on network migration.
+    addr: Arc<RwLock<SocketAddr>>,
+    /// Session ID we include in every Ping to this peer so they can migrate us if our IP changes.
+    pub my_session_id: u64,
+    /// Session ID the remote includes in their Pings; lets us recognise them from a new address.
+    their_session_id: Mutex<Option<u64>>,
     /// Per-stream sequence counters; each stream starts at 1 and advances independently.
     next_seqs: Mutex<HashMap<u16, u64>>,
     /// Per-stream send buffers for NACK-triggered retransmission.
@@ -42,7 +52,9 @@ impl PeerState {
     pub fn new(addr: SocketAddr) -> Self {
         let now = Instant::now();
         Self {
-            addr,
+            addr: Arc::new(RwLock::new(addr)),
+            my_session_id: gen_session_id(),
+            their_session_id: Mutex::new(None),
             next_seqs: Mutex::new(HashMap::new()),
             sent: Mutex::new(HashMap::new()),
             last_sent: Mutex::new(now),
@@ -51,6 +63,34 @@ impl PeerState {
             handshake: Mutex::new(None),
             #[cfg(feature = "security")]
             channel: OnceLock::new(),
+        }
+    }
+
+    /// Current remote address.
+    pub fn addr(&self) -> SocketAddr {
+        *self.addr.read()
+    }
+
+    /// Shared handle to the live address so `ZudpConn` tracks migrations automatically.
+    pub fn addr_arc(&self) -> Arc<RwLock<SocketAddr>> {
+        self.addr.clone()
+    }
+
+    /// Update the stored address after the remote migrates to a new network.
+    pub fn migrate_to(&self, new_addr: SocketAddr) {
+        *self.addr.write() = new_addr;
+    }
+
+    /// Record the session ID received from the remote's Pings.
+    ///
+    /// Returns `true` if this is the first time the ID is learned (caller should register in sessions map).
+    pub fn store_their_session_id(&self, id: u64) -> bool {
+        let mut guard = self.their_session_id.lock();
+        if guard.is_none() {
+            *guard = Some(id);
+            true
+        } else {
+            false
         }
     }
 
@@ -98,6 +138,24 @@ impl PeerState {
     pub fn secs_since_sent(&self) -> u64 {
         self.last_sent.lock().elapsed().as_secs()
     }
+}
+
+/// Generate a non-cryptographic but sufficiently unique session ID without adding dependencies.
+fn gen_session_id() -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let mut h = DefaultHasher::new();
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .hash(&mut h);
+    SEQ.fetch_add(1, Ordering::Relaxed).hash(&mut h);
+    // Stack address adds a bit of process-specific entropy.
+    let addr: u64 = (&h as *const _ as usize) as u64;
+    addr.hash(&mut h);
+    h.finish()
 }
 
 // ── Receive-side ─────────────────────────────────────────────────────────────

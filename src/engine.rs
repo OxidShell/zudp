@@ -14,8 +14,11 @@ use crate::{
 
 /// State shared between the engine task and the [`crate::ZudpSocket`] / [`crate::ZudpConn`] handles.
 pub(crate) struct EngineInner {
-    pub socket: RawSocket,
+    /// Current socket; replaced atomically on rebind.  Use [`get_socket`] to obtain a cheap clone.
+    pub socket: RwLock<RawSocket>,
     pub peers: RwLock<HashMap<SocketAddr, Arc<PeerState>>>,
+    /// Reverse index: remote's `my_session_id` → peer, for detecting address migrations.
+    pub sessions: RwLock<HashMap<u64, Arc<PeerState>>>,
     pub config: Arc<Config>,
     /// Noise keypair for the `security` feature; `None` when security is disabled.
     #[cfg(feature = "security")]
@@ -23,6 +26,11 @@ pub(crate) struct EngineInner {
 }
 
 impl EngineInner {
+    /// Cheap handle to the current socket (clones the inner `Arc<UdpSocket>`).
+    pub fn get_socket(&self) -> RawSocket {
+        self.socket.read().clone()
+    }
+
     pub fn get_or_create_peer(self: &Arc<Self>, addr: SocketAddr) -> Arc<PeerState> {
         {
             let r = self.peers.read();
@@ -57,20 +65,33 @@ async fn run(
     let keepalive_interval = inner.config.keepalive_interval;
     let sent_prune_age = inner.config.sent_prune_age;
 
+    // Local recv socket; replaced in-place when the socket is rebound.
+    let mut recv_sock = inner.get_socket();
+
     let mut ticker = time::interval(keepalive_interval / 4);
 
     loop {
         tokio::select! {
             biased;
 
-            result = inner.socket.recv_from() => {
+            result = recv_sock.recv_from() => {
                 match result {
                     Ok((data, from)) => {
                         handle_incoming(data, from, &inner, &inbound_tx, &mut recv_states).await;
                     }
                     Err(e) => {
-                        tracing::error!(target: "zudp::engine", "recv error: {e}");
-                        break;
+                        tracing::warn!(target: "zudp::engine", "recv error: {e} — attempting socket rebind");
+                        match rebind_socket(&inner).await {
+                            Ok(new_sock) => {
+                                recv_sock = new_sock;
+                                // Ping all known peers so they can migrate our address.
+                                ping_all_peers(&inner, &recv_sock).await;
+                            }
+                            Err(bind_err) => {
+                                tracing::error!(target: "zudp::engine", "rebind failed: {bind_err}");
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -82,6 +103,36 @@ async fn run(
     }
 
     tracing::warn!(target: "zudp::engine", "engine task exited");
+}
+
+/// Try to bind a new socket on the same local address (same port if available, else port 0).
+///
+/// On success, replaces `inner.socket` so future `send_to` calls use the new interface.
+async fn rebind_socket(inner: &Arc<EngineInner>) -> Result<RawSocket, crate::Error> {
+    let old_local = inner.get_socket().local_addr()?;
+    let new_sock = match RawSocket::bind(old_local).await {
+        Ok(s) => s,
+        Err(_) => {
+            let any = SocketAddr::new(old_local.ip(), 0);
+            RawSocket::bind(any).await?
+        }
+    };
+    let new_addr = new_sock.local_addr()?;
+    *inner.socket.write() = new_sock.clone();
+    tracing::info!(target: "zudp::engine", old = %old_local, new = %new_addr, "socket rebound");
+    Ok(new_sock)
+}
+
+/// Send a Ping carrying our session ID to every known peer so they update our address.
+async fn ping_all_peers(inner: &Arc<EngineInner>, sock: &RawSocket) {
+    let now_ms = now_millis();
+    let peers: Vec<Arc<PeerState>> = inner.peers.read().values().cloned().collect();
+    for peer in peers {
+        let ping = Frame::Ping { echo: now_ms, session_id: peer.my_session_id }.encode();
+        if let Err(e) = sock.send_to(&ping, peer.addr()).await {
+            tracing::warn!(target: "zudp::engine", peer = %peer.addr(), "post-rebind ping failed: {e}");
+        }
+    }
 }
 
 async fn handle_incoming(
@@ -180,17 +231,27 @@ async fn dispatch_frame(
                 for (seq, plain_frame) in to_retransmit {
                     let wire = encrypt_or_plain(&peer, &plain_frame);
                     tracing::debug!(target: "zudp::engine", peer = %from, seq, stream_id, "retransmit on NACK");
-                    if let Err(e) = inner.socket.send_to(&wire, from).await {
+                    if let Err(e) = inner.get_socket().send_to(&wire, from).await {
                         tracing::warn!(target: "zudp::engine", peer = %from, "retransmit failed: {e}");
                     }
                 }
             }
         }
 
-        Frame::Ping { echo } => {
-            let pong = Frame::Pong { echo }.encode();
-            if let Err(e) = inner.socket.send_to(&pong, from).await {
+        Frame::Ping { echo, session_id } => {
+            let peer = find_or_migrate_peer(from, session_id, inner, recv_states);
+            let pong = Frame::Pong { echo, session_id: peer.my_session_id }.encode();
+            if let Err(e) = inner.get_socket().send_to(&pong, from).await {
                 tracing::warn!(target: "zudp::engine", peer = %from, "pong failed: {e}");
+            }
+        }
+
+        Frame::Pong { session_id, .. } => {
+            // Learn the remote's session ID from their Pong if not yet known.
+            if let Some(peer) = inner.peers.read().get(&from).cloned() {
+                if peer.store_their_session_id(session_id) {
+                    inner.sessions.write().insert(session_id, peer);
+                }
             }
         }
 
@@ -234,17 +295,73 @@ async fn dispatch_frame(
             dest,
             inner: payload,
         } => {
-            if let Err(e) = inner.socket.send_to(&payload, dest).await {
+            if let Err(e) = inner.get_socket().send_to(&payload, dest).await {
                 tracing::warn!(target: "zudp::engine", %dest, "relay forward failed: {e}");
             }
         }
 
-        Frame::Pong { .. } | Frame::Probe { .. } | Frame::Beacon { .. } => {}
+        Frame::Probe { .. } | Frame::Beacon { .. } => {}
 
         // Handshake and Secure are handled before dispatch_frame is called.
         #[cfg(feature = "security")]
         Frame::Handshake { .. } | Frame::Secure { .. } => {}
     }
+}
+
+/// Locate the peer for an incoming Ping, handling first contact, familiar address, and migration.
+///
+/// Migration: if `session_id` matches a known peer but `from` differs, the peer's address is
+/// updated, the `peers` map is re-keyed, and all `recv_states` entries are moved to the new key.
+fn find_or_migrate_peer(
+    from: SocketAddr,
+    session_id: u64,
+    inner: &Arc<EngineInner>,
+    recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
+) -> Arc<PeerState> {
+    // Fast path: familiar address.
+    if let Some(peer) = inner.peers.read().get(&from).cloned() {
+        if peer.store_their_session_id(session_id) {
+            inner.sessions.write().insert(session_id, peer.clone());
+        }
+        return peer;
+    }
+
+    // Migration: known session but new address.
+    if let Some(peer) = inner.sessions.read().get(&session_id).cloned() {
+        let old_addr = peer.addr();
+        if old_addr != from {
+            tracing::info!(
+                target: "zudp::engine",
+                old = %old_addr,
+                new = %from,
+                "peer address migrated"
+            );
+            peer.migrate_to(from);
+            {
+                let mut peers = inner.peers.write();
+                peers.remove(&old_addr);
+                peers.insert(from, peer.clone());
+            }
+            // Move all recv_states from old key to new key.
+            let stream_ids: Vec<u16> = recv_states
+                .keys()
+                .filter(|(a, _)| *a == old_addr)
+                .map(|(_, s)| *s)
+                .collect();
+            for sid in stream_ids {
+                if let Some(state) = recv_states.remove(&(old_addr, sid)) {
+                    recv_states.insert((from, sid), state);
+                }
+            }
+        }
+        return peer;
+    }
+
+    // First contact: create peer and register session.
+    let peer = inner.get_or_create_peer(from);
+    peer.store_their_session_id(session_id);
+    inner.sessions.write().insert(session_id, peer.clone());
+    peer
 }
 
 /// If the peer has an established Noise channel, re-encrypt the plain frame; otherwise send as-is.
@@ -281,7 +398,7 @@ async fn send_nack_if_needed(
     }
     tracing::debug!(target: "zudp::engine", peer = %to, count = nack_seqs.len(), stream_id, "sending NACK");
     let frame = Frame::Nack { stream_id, seqs: nack_seqs }.encode();
-    if let Err(e) = inner.socket.send_to(&frame, to).await {
+    if let Err(e) = inner.get_socket().send_to(&frame, to).await {
         tracing::warn!(target: "zudp::engine", peer = %to, "nack send failed: {e}");
     }
 }
@@ -293,19 +410,17 @@ async fn run_background(
     sent_prune_age: Duration,
 ) {
     let keepalive_threshold = keepalive_interval.as_secs();
-    let now_millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0u64, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let now_ms = now_millis();
 
     let peers: Vec<Arc<PeerState>> = inner.peers.read().values().cloned().collect();
 
     for peer in peers {
         if peer.secs_since_sent() >= keepalive_threshold {
-            let ping = Frame::Ping { echo: now_millis }.encode();
-            if let Err(e) = inner.socket.send_to(&ping, peer.addr).await {
-                tracing::warn!(target: "zudp::engine", peer = %peer.addr, "keepalive failed: {e}");
+            let ping = Frame::Ping { echo: now_ms, session_id: peer.my_session_id }.encode();
+            if let Err(e) = inner.get_socket().send_to(&ping, peer.addr()).await {
+                tracing::warn!(target: "zudp::engine", peer = %peer.addr(), "keepalive failed: {e}");
             }
-            tracing::trace!(target: "zudp::engine", peer = %peer.addr, "sent keepalive ping");
+            tracing::trace!(target: "zudp::engine", peer = %peer.addr(), "sent keepalive ping");
         }
         peer.prune_sent(sent_prune_age);
     }
@@ -313,6 +428,12 @@ async fn run_background(
     for (_, frag_assembler) in recv_states.values_mut() {
         frag_assembler.prune(sent_prune_age);
     }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u64, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Drive a Noise XX handshake step on behalf of the engine.
@@ -396,7 +517,7 @@ async fn handle_handshake(payload: Bytes, from: SocketAddr, inner: &Arc<EngineIn
             payload: reply_bytes,
         }
         .encode();
-        if let Err(e) = inner.socket.send_to(&wire, from).await {
+        if let Err(e) = inner.get_socket().send_to(&wire, from).await {
             tracing::warn!(target: "zudp::engine", peer = %from, "handshake send: {e}");
         }
     }
