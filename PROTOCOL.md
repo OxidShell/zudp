@@ -29,11 +29,11 @@ All multi-byte integers are **big-endian**.
 | Tag | Name | Total overhead |
 |-----|------|---------------|
 | `0x00` | Datagram | 1 B |
-| `0x01` | Stream | 9 B |
-| `0x02` | Nack | 0 B (no payload) |
+| `0x01` | Stream | 11 B |
+| `0x02` | Nack | 3 B + N×8 B |
 | `0x03` | Ping | 9 B |
 | `0x04` | Pong | 9 B |
-| `0x05` | Fragment | 17 B |
+| `0x05` | Fragment | 19 B |
 | `0x06` | Relay | 8 B (IPv4) / 20 B (IPv6) |
 | `0x07` | Probe | 11 B |
 | `0x08` | Beacon | 13 B + meta |
@@ -56,28 +56,30 @@ The unreliable fast path avoids copying the payload: when no relay is configured
 
 ### Stream — `0x01`
 
-Reliable, ordered delivery. Carries a monotonically increasing sequence number.
+Reliable, in-order delivery on a specific stream. Each stream has an independent sequence space, so loss on one stream never delays delivery on another.
 
 ```
-[payload bytes] [seq: u64] [0x01]
+[payload bytes] [seq: u64] [stream_id: u16] [0x01]
 ```
 
-- `seq` starts at 1 per peer (0 is reserved/unused).
-- Sequence numbers are per-**sender**; each side of a connection maintains its own counter.
-- The receiver buffers out-of-order arrivals and delivers them in order.
-- Missing sequence numbers trigger a Nack (see below).
+- `stream_id`: identifies which logical stream this frame belongs to (`0` = default stream). Values 0–65 534 are available.
+- `seq` starts at 1 per (peer, stream) pair (0 is reserved/unused).
+- Sequence numbers are per-**sender** and per-**stream**; each side of each stream maintains its own counter independently.
+- The receiver buffers out-of-order arrivals per stream and delivers them in order within each stream.
+- Missing sequence numbers trigger a Nack for that stream (see below).
 
 ### Nack — `0x02`
 
-Negative acknowledgement. Requests retransmission of one or more sequence numbers.
+Negative acknowledgement. Requests retransmission of one or more sequence numbers **on a specific stream**.
 
 ```
-[seq_0: u64] [seq_1: u64] ... [seq_N: u64] [0x02]
+[seq_0: u64] [seq_1: u64] ... [seq_N: u64] [stream_id: u16] [0x02]
 ```
 
-- Body must be a multiple of 8 bytes; each 8-byte group is one `u64` sequence number.
+- `stream_id`: identifies which stream's sequence space the listed numbers belong to.
+- The `seq` body must be a multiple of 8 bytes; each 8-byte group is one `u64` sequence number.
 - Maximum sequences per Nack: 128 (`MAX_NACK_SEQS`).
-- Nacks are sent immediately when a gap is detected in the received sequence space.
+- Nacks are sent immediately when a gap is detected in the received sequence space for a stream.
 - The sender retransmits the buffered encoded frame for each requested sequence number. Frames older than `sent_prune_age` (default 10 s) have been pruned and cannot be retransmitted.
 
 ### Ping — `0x03`
@@ -102,16 +104,17 @@ Receiving any frame from a peer updates `last_seen`. Neither Ping nor Pong carry
 
 ### Fragment — `0x05`
 
-One slice of a fragmented reliable message. Messages exceeding the configured MTU (default 1 400 B) are split into at most `u16::MAX` fragments before transmission.
+One slice of a fragmented reliable message on a specific stream. Messages exceeding the configured MTU (default 1 400 B) are split into at most `u16::MAX` fragments before transmission.
 
 ```
-[payload bytes] [msg_id: u32] [frag_total: u16] [frag_idx: u16] [seq: u64] [0x05]
+[payload bytes] [msg_id: u32] [frag_total: u16] [frag_idx: u16] [seq: u64] [stream_id: u16] [0x05]
 ```
 
+- `stream_id`: the stream on which this fragment is delivered; matches the Stream frame semantics.
 - `msg_id`: monotonically increasing per-socket counter identifying the original message; wraps at `u32::MAX`.
 - `frag_total`: total number of fragments for this message.
 - `frag_idx`: zero-based index of this fragment within the message (0 ≤ `frag_idx` < `frag_total`).
-- `seq`: each fragment occupies its own slot in the reliable sequence space, just like a Stream frame. The reassembler is triggered only after all `frag_total` sequence numbers have been delivered in order.
+- `seq`: each fragment occupies its own slot in the per-stream reliable sequence space, just like a Stream frame. The reassembler is triggered only after all `frag_total` sequence numbers have been delivered in order on the stream.
 
 Reassembly uses a pre-allocated `Vec<Option<Bytes>>` of length `frag_total`. When all slots are filled the fragments are concatenated in index order. Incomplete assemblies are pruned after `sent_prune_age`.
 
@@ -196,18 +199,31 @@ LAN discovery reply. Sent as a unicast response to a Probe, back to the probe's 
 
 ### Sequence space
 
-Stream and Fragment frames share a single per-peer send-side sequence counter, starting at 1. Each frame consumes one sequence number regardless of type. The sequence number 0 is never allocated.
+Each (peer, stream_id) pair has an independent send-side sequence counter, starting at 1. Stream and Fragment frames on the same stream share that stream's counter. A frame with `stream_id = 0` is the default stream; higher values are additional independent streams.
+
+The sequence number 0 is never allocated on any stream.
+
+### Multiple streams
+
+Up to 65 535 independent reliable streams are supported per peer pair (stream IDs 0–65 534). Each stream has its own:
+
+- Send-side sequence counter
+- Send buffer (`BTreeMap<seq, (plain_frame, sent_at)>`)
+- Receive reorder buffer + `expected_seq`
+- FragAssembler for large message reassembly
+
+**No head-of-line blocking**: packet loss on stream 1 does not affect delivery on stream 0. NACKs carry the `stream_id` so retransmission is targeted to the correct stream's send buffer.
 
 ### Send buffer
 
-The sender keeps a `BTreeMap<seq, (plain_frame, sent_at)>` per peer. Entries are inserted on send and pruned when older than `sent_prune_age` (default 10 s). The **plain** (pre-encryption) wire frame is stored, so NACK retransmits can re-encrypt with a fresh nonce (nonce reuse is forbidden).
+The sender keeps a `BTreeMap<seq, (plain_frame, sent_at)>` per (peer, stream). Entries are inserted on send and pruned when older than `sent_prune_age` (default 10 s). The **plain** (pre-encryption) wire frame is stored, so NACK retransmits can re-encrypt with a fresh nonce (nonce reuse is forbidden).
 
 ### Receive reorder buffer
 
-The receiver keeps a `BTreeMap<seq, Inbound>` per peer and an `expected_seq` counter (starts at 1):
+The receiver keeps a `BTreeMap<seq, Inbound>` per (peer, stream) and an `expected_seq` counter (starts at 1) per stream:
 
 - Frame at `seq == expected_seq`: deliver immediately, then drain consecutive buffered entries.
-- Frame at `seq > expected_seq`: NACK all gaps `[expected_seq, seq)`, buffer this frame.
+- Frame at `seq > expected_seq`: NACK all gaps `[expected_seq, seq)` on this stream, buffer this frame.
 - Frame at `seq < expected_seq`: duplicate — silently discard.
 
 Nacks are sent immediately on gap detection; there is no delayed-NACK timer.

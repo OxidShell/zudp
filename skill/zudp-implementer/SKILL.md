@@ -61,18 +61,18 @@ All multi-byte integers are **big-endian**.  No exceptions.
 ### Frame layouts (tail-first order — fields are written left-to-right, type byte last)
 
 ```
-Datagram  (0x00): [payload]                                                       + [0x00]
-Stream    (0x01): [payload] [seq:u64]                                             + [0x01]
-Nack      (0x02): [seq_0:u64] … [seq_N:u64]                                       + [0x02]
-Ping      (0x03): [echo:u64]                                                      + [0x03]
-Pong      (0x04): [echo:u64]                                                      + [0x04]
-Fragment  (0x05): [payload] [msg_id:u32] [frag_total:u16] [frag_idx:u16] [seq:u64]+ [0x05]
-Relay/v4  (0x06): [inner]   [port:u16]  [ip:4B]  [0x00]                          + [0x06]
-Relay/v6  (0x06): [inner]   [port:u16]  [ip:16B] [0x01]                          + [0x06]
-Probe     (0x07): [app_id:u64] [proto_ver:u16]                                    + [0x07]
-Beacon    (0x08): [meta]   [data_port:u16] [proto_ver:u16] [app_id:u64]           + [0x08]
-Handshake (0x09): [noise_msg]                                                     + [0x09]  ← security feature
-Secure    (0x0A): [ciphertext] [nonce:u64]                                        + [0x0A]  ← security feature
+Datagram  (0x00): [payload]                                                                  + [0x00]
+Stream    (0x01): [payload] [seq:u64] [stream_id:u16]                                        + [0x01]
+Nack      (0x02): [seq_0:u64] … [seq_N:u64] [stream_id:u16]                                  + [0x02]
+Ping      (0x03): [echo:u64]                                                                 + [0x03]
+Pong      (0x04): [echo:u64]                                                                 + [0x04]
+Fragment  (0x05): [payload] [msg_id:u32] [frag_total:u16] [frag_idx:u16] [seq:u64] [stream_id:u16] + [0x05]
+Relay/v4  (0x06): [inner]   [port:u16]  [ip:4B]  [0x00]                                     + [0x06]
+Relay/v6  (0x06): [inner]   [port:u16]  [ip:16B] [0x01]                                     + [0x06]
+Probe     (0x07): [app_id:u64] [proto_ver:u16]                                               + [0x07]
+Beacon    (0x08): [meta]   [data_port:u16] [proto_ver:u16] [app_id:u64]                      + [0x08]
+Handshake (0x09): [noise_msg]                                                                + [0x09]  ← security feature
+Secure    (0x0A): [ciphertext] [nonce:u64]                                                   + [0x0A]  ← security feature
 ```
 
 **Parsing is always from the tail.**  To decode a datagram:
@@ -88,36 +88,39 @@ These are the properties a correct ZUDP implementation MUST satisfy.  Violating 
 breaks interoperability.
 
 ### Sequence numbers
-- Per-sender, per-peer counter.  Each side has its own counter; they are completely independent.
-- Start at **1**.  Zero is never allocated.
-- Stream and Fragment frames share the same counter on the sending side.
-- The receiver tracks one `expected_seq` per remote peer.
+- Per-sender, per-peer, **per-stream** counter.  Each (sender, peer, stream_id) triple has its own counter; they are completely independent.
+- Start at **1** per stream.  Zero is never allocated.
+- Stream and Fragment frames on the same stream share that stream's counter.
+- The receiver tracks one `expected_seq` per (remote peer, stream_id) pair.
+- `stream_id = 0` is the default stream.  Stream IDs 0–65 534 are valid.
 
 ### NACK semantics
 - Send a Nack **immediately** when a gap is detected — there is no delayed-ACK timer.
-- Gap detection: you received `seq = N` but `expected = M` where `M < N`.
-  NACK every value in `[M, N)`.
-- A Nack body must be a multiple of 8 bytes.  Each 8-byte group is one `u64` sequence number.
+- Gap detection per stream: you received `seq = N` on stream `S` but `expected[S] = M` where `M < N`.
+  NACK every value in `[M, N)` on stream `S`.
+- A Nack body carries `stream_id: u16` (after the seq list, before the type byte), then the seq list.  The seq list must be a multiple of 8 bytes; each 8-byte group is one `u64`.
 - Maximum 128 sequence numbers per Nack frame.
-- On receiving a Nack, retransmit the stored encoded frames for the listed sequence numbers.
+- On receiving a Nack for stream `S`, retransmit frames from the stream-`S` send buffer for the listed seqs.
   If a sequence has already been pruned from the send buffer, silently skip it.
 
 ### Send buffer
-- Keep the fully-encoded wire bytes for every reliable frame sent, keyed by sequence number.
-- Use a sorted map (BTreeMap / SortedDict / TreeMap) so pruning old entries is O(log n).
-- Prune entries older than `sent_prune_age` (default 10 s) on a background tick.
+- Keep the fully-encoded wire bytes for every reliable frame sent, keyed by `(stream_id, seq)`.
+- Use one sorted map per stream (BTreeMap / SortedDict / TreeMap) so pruning old entries is O(log n).
+- Prune all stream buffers older than `sent_prune_age` (default 10 s) on a background tick.
 
 ### Reorder buffer
+One reorder buffer per `(peer, stream_id)` pair:
 ```
-on recv(seq, payload):
+on recv(stream_id, seq, payload):
+    expected = expected_seq[stream_id]   # starts at 1
     if seq < expected:         drop (duplicate)
-    if seq > expected:         buffer[seq] = payload; NACK [expected, seq)
+    if seq > expected:         buffer[seq] = payload; NACK stream_id [expected, seq)
     if seq == expected:
         deliver payload
-        expected += 1
-        while buffer[expected] exists:
-            deliver buffer.pop(expected)
-            expected += 1
+        expected_seq[stream_id] += 1
+        while buffer[expected_seq[stream_id]] exists:
+            deliver buffer.pop(expected_seq[stream_id])
+            expected_seq[stream_id] += 1
 ```
 
 ### Fragmentation
@@ -243,8 +246,9 @@ Do not mark the implementation done until every item passes.
 - **Forgetting Fragment uses `seq`.** Fragment frames enter the reliability/reorder buffer just
   like Stream frames.  Reassembly only starts after the reliability layer has delivered all
   fragments in order.  Do not bypass the reorder buffer for Fragment.
-- **Global sequence counter.** The sequence number is per-peer, per-direction.  If A sends to
-  B and C, B and C each have their own independent sequence counter.
+- **Global sequence counter.** The sequence number is per-peer, per-direction, **per-stream**.
+  If A sends to B on streams 0 and 1, those two streams each have their own counter.
+  If A sends to B and C, B and C also each have their own per-stream counters.
 - **NACK on every gap re-receipt.** The receiver should NACK only when it first detects a gap
   (when the out-of-order packet arrives).  Don't re-NACK on every subsequent receive.
 - **Relay forwarding the outer frame.** The relay forwards `inner` — the already-encoded inner

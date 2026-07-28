@@ -64,11 +64,14 @@ let mut socket = Zudp::default()
     .listen::<Msg>()
     .await?;
 
-// recv returns (message, sender_addr)
-let (msg, from) = socket.recv().await?;
+// recv returns (message, sender_addr, stream_id)
+let (msg, from, stream_id) = socket.recv().await?;
 
-// send reliable (NACK-tracked) message to a specific peer
+// send reliable (NACK-tracked) message to a specific peer on stream 0
 socket.send(Msg::Pong, from).await?;
+
+// send on a specific stream (independent sequence space, no HoL blocking)
+socket.send_stream(Msg::Data(bytes), from, 1).await?;
 
 // send unreliable datagram (fire-and-forget, zero overhead)
 socket.send_unreliable(Msg::Data(bytes), from).await?;
@@ -87,7 +90,10 @@ let mut conn = Zudp::default()
     .await?;
 
 conn.send(Msg::Ping).await?;
-let reply = conn.recv().await?;  // returns M, not (M, addr)
+let (reply, stream_id) = conn.recv().await?;  // returns (M, stream_id)
+
+// send on a named stream
+conn.send_stream(Msg::Ping, 1).await?;
 ```
 
 ---
@@ -110,6 +116,27 @@ Zudp::default()
 
 All builder methods take `self` and return `Self`, so they chain freely.
 `listen` and `connect` are async and return `Result<_, zudp::Error>`.
+
+---
+
+## Multiple streams
+
+Each connection supports up to 65 535 independent reliable streams (IDs 0–65 534). Streams have separate sequence spaces, so loss on one stream never delays delivery on another.
+
+```rust
+// send on named streams
+socket.send_stream(Msg::Command(cmd), peer, 0).await?;    // stream 0 — commands
+socket.send_stream(Msg::Snapshot(data), peer, 1).await?;  // stream 1 — snapshots
+
+// recv carries the stream_id
+let (msg, from, stream_id) = socket.recv().await?;
+
+// ZudpConn
+conn.send_stream(msg, 1).await?;
+let (reply, stream_id) = conn.recv().await?;
+```
+
+`DEFAULT_STREAM = 0`. `send()` / `recv()` use stream 0 — all existing code continues to work.
 
 ---
 

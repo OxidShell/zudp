@@ -21,13 +21,13 @@ enum Msg { Ping, Pong }
 
 // listener — accepts any peer
 let mut socket = Zudp::default().port(5000).listen::<Msg>().await?;
-let (msg, from) = socket.recv().await?;
+let (msg, from, stream_id) = socket.recv().await?;  // stream_id = 0 for default stream
 socket.send(Msg::Pong, from).await?;
 
 // single-peer connection
 let mut conn = Zudp::default().port(0).connect::<Msg>(peer).await?;
 conn.send(Msg::Ping).await?;
-let reply = conn.recv().await?;
+let (reply, stream_id) = conn.recv().await?;
 ```
 
 ## Builder options
@@ -44,6 +44,23 @@ Zudp::default()
     .listen::<Msg>()                         // ZudpSocket<Msg>  — multi-peer
     .connect::<Msg>(peer)                    // ZudpConn<Msg>    — single-peer
 ```
+
+## Multiple streams
+
+Each reliable connection supports up to 65 535 independent ordered streams. Streams have separate sequence spaces, so packet loss on one stream never delays delivery on another (no head-of-line blocking).
+
+```rust
+// server: recv returns (message, peer_addr, stream_id)
+let (msg, from, stream_id) = socket.recv().await?;
+socket.send_stream(reply, from, stream_id).await?;   // reply on same stream
+
+// client: send to specific stream
+conn.send_stream(Msg::Command(cmd), 0).await?;         // stream 0 — commands
+conn.send_stream(Msg::Snapshot(data), 1).await?;       // stream 1 — snapshots
+let (msg, stream_id) = conn.recv().await?;             // from any stream
+```
+
+`DEFAULT_STREAM = 0`. `send()` / `recv()` target stream 0 — existing code continues to work unchanged.
 
 ## End-to-end encryption
 
