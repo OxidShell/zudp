@@ -58,6 +58,10 @@ pub struct PeerState {
     /// Established Noise transport channel; set exactly once after handshake completes.
     #[cfg(feature = "security")]
     pub channel: OnceLock<SecureChannel>,
+    /// The remote peer's X25519 static public key, extracted from the Noise handshake.
+    /// Set once when the handshake finishes; `None` until then.
+    #[cfg(feature = "security")]
+    pub remote_static_key: OnceLock<[u8; 32]>,
     /// Notified (via `notify_one`) when `channel` transitions from `None` to `Some`.
     /// `connect()` awaits this so it never returns before encryption is active.
     #[cfg(feature = "security")]
@@ -89,6 +93,8 @@ impl PeerState {
             handshake: Mutex::new(None),
             #[cfg(feature = "security")]
             channel: OnceLock::new(),
+            #[cfg(feature = "security")]
+            remote_static_key: OnceLock::new(),
             #[cfg(feature = "security")]
             channel_ready: tokio::sync::Notify::new(),
             rx_bytes: AtomicU64::new(0),
@@ -196,6 +202,15 @@ impl PeerState {
 
     pub fn set_effective_mtu(&self, mtu: usize) {
         self.effective_mtu.store(mtu as u32, Ordering::Relaxed);
+    }
+
+    /// The remote peer's X25519 static public key, extracted from the Noise handshake.
+    ///
+    /// Returns `None` until the handshake completes.
+    #[cfg(feature = "security")]
+    #[must_use]
+    pub fn remote_static_key(&self) -> Option<&[u8; 32]> {
+        self.remote_static_key.get()
     }
 }
 

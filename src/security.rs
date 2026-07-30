@@ -7,8 +7,8 @@ const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 /// A Noise X25519 keypair used to authenticate and encrypt ZUDP connections.
 #[derive(Clone)]
 pub struct Keypair {
-    pub(crate) public: [u8; 32],
-    pub(crate) private: [u8; 32],
+    pub public: [u8; 32],
+    pub private: [u8; 32],
 }
 
 impl Keypair {

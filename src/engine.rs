@@ -826,6 +826,13 @@ async fn handle_handshake(payload: Bytes, from: SocketAddr, inner: &Arc<EngineIn
     }
 
     if let Some(hs) = finished_hs {
+        // Extract and persist the remote static key before consuming the handshake state.
+        if let Some(remote) = hs.get_remote_static() {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(remote);
+            // `set` is a no-op if already initialised; safe to ignore the result.
+            let _ = peer.remote_static_key.set(key);
+        }
         match hs.into_stateless_transport_mode() {
             Ok(transport) => {
                 let _ = peer.channel.set(SecureChannel::new(transport));

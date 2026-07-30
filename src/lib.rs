@@ -54,6 +54,49 @@ pub use error::Error;
 #[cfg(feature = "security")]
 pub use security::Keypair;
 
+/// Raw byte passthrough codec. Encodes by copying the `Bytes` to a `Vec`;
+/// decodes by copying the slice into a new `Bytes`. Use this when you want
+/// to own the framing yourself and have zudp treat the payload as opaque.
+#[derive(Debug, Clone)]
+pub struct RawBytes(pub Bytes);
+
+impl Encode for RawBytes {
+    fn encode_to_bytes(&self) -> Result<Vec<u8>, Error> {
+        Ok(self.0.to_vec())
+    }
+}
+
+impl Decode for RawBytes {
+    fn decode_from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        Ok(RawBytes(Bytes::copy_from_slice(bytes)))
+    }
+}
+
+/// A clonable send handle for a [`ZudpSocket`].
+///
+/// Obtained via [`ZudpSocket::sender`]. Multiple `ZudpSender` instances share
+/// the same underlying socket through an [`Arc`], so they can be passed freely
+/// across tasks or threads.
+#[derive(Clone)]
+pub struct ZudpSender {
+    inner: Arc<Inner>,
+}
+
+impl ZudpSender {
+    /// Send `msg` to `peer` on `stream_id`.
+    ///
+    /// # Errors
+    /// Returns `Err` on I/O failure or if the message is too large to fragment.
+    pub async fn send_stream<M: Encode>(
+        &self,
+        msg: M,
+        peer: SocketAddr,
+        stream_id: u16,
+    ) -> Result<(), Error> {
+        self.inner.send_msg(&msg, peer, true, stream_id).await
+    }
+}
+
 /// Per-peer statistics snapshot.  Returned by [`ZudpSocket::peer_stats`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -712,6 +755,27 @@ impl<M> ZudpSocket<M> {
             dropped_relay_blocked: e.dropped_relay_blocked.load(Ordering::Relaxed),
             dropped_relay_cap: e.dropped_relay_cap.load(Ordering::Relaxed),
         }
+    }
+
+    /// Return a clonable send handle that shares this socket's underlying state.
+    ///
+    /// The returned [`ZudpSender`] can be cheaply cloned and sent across tasks.
+    #[must_use]
+    pub fn sender(&self) -> ZudpSender {
+        ZudpSender { inner: self.inner.clone() }
+    }
+
+    /// The remote peer's X25519 static public key as negotiated by the Noise
+    /// handshake.  Returns `None` if the peer is unknown or the handshake has
+    /// not yet completed.
+    #[cfg(feature = "security")]
+    #[must_use]
+    pub fn peer_remote_static_key(&self, peer: SocketAddr) -> Option<[u8; 32]> {
+        self.inner
+            .engine
+            .peers
+            .get(&peer)
+            .and_then(|p| p.remote_static_key().copied())
     }
 
     /// Update the relay access policy at runtime without rebinding the socket.
