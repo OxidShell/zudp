@@ -883,6 +883,15 @@ impl<M> ZudpConn<M> {
         *self.peer.read()
     }
 
+    /// Clonable send handle that shares this connection's underlying socket.
+    ///
+    /// Useful for splitting the send path across tasks while the receive
+    /// loop drives `recv()` exclusively.
+    #[must_use]
+    pub fn sender(&self) -> ZudpSender {
+        self.socket.sender()
+    }
+
     /// Local address this socket is bound to.
     ///
     /// # Errors
