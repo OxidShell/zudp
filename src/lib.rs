@@ -223,6 +223,12 @@ pub struct Config {
     pub(crate) relay_allowlist: Vec<IpAddr>,
     /// Maximum number of entries in the relay routing table.
     pub(crate) max_relay_entries: usize,
+    /// Per-stream sent-frame buffer cap for NACK retransmission.
+    ///
+    /// Each frame slot holds one UDP fragment (~MTU bytes).  At 1 400 B/frame the default
+    /// of 1 024 covers ~1.4 MB per stream; raise this for high-bitrate streams (e.g. set
+    /// to 8 192 for 30 fps H.264 video at 5 Mbps, which generates ~450 frags/s).
+    pub(crate) sent_buffer_frames: usize,
 }
 
 impl Default for Config {
@@ -243,6 +249,7 @@ impl Default for Config {
             max_pps_per_ip: 1_000.0,
             relay_allowlist: vec![],
             max_relay_entries: 256,
+            sent_buffer_frames: 1_024,
         }
     }
 }
@@ -378,6 +385,21 @@ impl Zudp {
     #[must_use]
     pub fn max_relay_entries(mut self, n: usize) -> Self {
         self.config.max_relay_entries = n;
+        self
+    }
+
+    /// Per-stream sent-frame buffer cap for NACK retransmission (default: 1 024).
+    ///
+    /// Each slot holds one UDP fragment (~MTU bytes).  Raise this for high-bitrate
+    /// streams so frames are never evicted before `sent_prune_age` expires — an evicted
+    /// frame that the receiver NACKs cannot be retransmitted, causing the receive-side
+    /// reorder buffer to stall permanently until the gap timeout fires.
+    ///
+    /// Rule of thumb: `max_frags_per_second × sent_prune_age_secs × 1.2`.
+    /// For 30 fps H.264 at 5 Mbps (≈ 450 frags/s, 10 s prune age): 5 400 → use 8 192.
+    #[must_use]
+    pub fn sent_buffer(mut self, frames: usize) -> Self {
+        self.config.sent_buffer_frames = frames;
         self
     }
 
@@ -589,7 +611,7 @@ impl Inner {
             // Track token usage; new sends are never delayed (latency budget).
             peer.cc.lock().consume(wire.len());
             self.engine.get_socket().send_to(&wire, actual_dest).await?;
-            peer.record_sent(stream_id, seq, plain_frame);
+            peer.record_sent(stream_id, seq, plain_frame, self.config.sent_buffer_frames);
         } else if wrap_relay {
             let frame = Frame::Datagram(payload).encode();
             let wire = Frame::Relay {
@@ -658,7 +680,7 @@ impl Inner {
             // covers typical game state syncs without any pacing delay).
             peer.cc.lock().consume(wire.len());
             self.engine.get_socket().send_to(&wire, actual_dest).await?;
-            peer.record_sent(stream_id, seq, plain_frame);
+            peer.record_sent(stream_id, seq, plain_frame, self.config.sent_buffer_frames);
         }
         Ok(())
     }

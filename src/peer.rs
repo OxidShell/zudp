@@ -20,11 +20,6 @@ use parking_lot::{Mutex, RwLock};
 use crate::security::SecureChannel;
 use crate::cc::CongestionCtrl;
 
-/// Per-stream send-buffer frame cap.
-///
-/// At 1 400 B/frame and 1 024 frames, this is ~1.4 MB per stream per peer before pruning
-/// starts.  Frames are dropped in sequence order (oldest first) via `BTreeMap::pop_first`.
-const MAX_SENT_FRAMES_PER_STREAM: usize = 1_024;
 
 /// A fully encoded frame retained for NACK-triggered retransmission.
 pub struct SentPacket {
@@ -140,19 +135,18 @@ impl PeerState {
         seq
     }
 
-    pub fn record_sent(&self, stream_id: u16, seq: u64, frame: Bytes) {
+    pub fn record_sent(&self, stream_id: u16, seq: u64, frame: Bytes, max_frames: usize) {
         self.tx_bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
         let mut map = self.sent.lock();
         let stream_buf = map.entry(stream_id).or_default();
-        // Evict the oldest frame before inserting if the per-stream cap is reached.
-        if stream_buf.len() >= MAX_SENT_FRAMES_PER_STREAM
+        if stream_buf.len() >= max_frames
             && let Some((evicted_seq, _)) = stream_buf.pop_first()
         {
             tracing::warn!(
                 target: "zudp::peer",
                 stream_id,
                 evicted_seq,
-                cap = MAX_SENT_FRAMES_PER_STREAM,
+                cap = max_frames,
                 "sent buffer full — evicting oldest frame (NACK for it will not retransmit)"
             );
         }
@@ -250,6 +244,10 @@ pub enum Inbound {
 pub struct RecvState {
     pub expected_seq: u64,
     buf: BTreeMap<u64, Inbound>,
+    /// When a sequence gap was first detected.  Used by [`prune_gap`](Self::prune_gap)
+    /// to discard the backlog when the missing fragment can no longer be retransmitted
+    /// (i.e. the sender evicted it from its sent buffer and never NACKed it back).
+    gap_since: Option<Instant>,
 }
 
 impl RecvState {
@@ -258,6 +256,7 @@ impl RecvState {
         Self {
             expected_seq: 1,
             buf: BTreeMap::new(),
+            gap_since: None,
         }
     }
 
@@ -272,18 +271,46 @@ impl RecvState {
         }
 
         if seq > self.expected_seq {
+            if self.gap_since.is_none() {
+                self.gap_since = Some(Instant::now());
+            }
             let nack_seqs: Vec<u64> = (self.expected_seq..seq).collect();
             self.buf.insert(seq, payload);
             return (vec![], nack_seqs);
         }
 
         // In-order: deliver immediately and drain any consecutive buffered entries.
+        self.gap_since = None;
         let mut ready = vec![payload];
         self.expected_seq += 1;
         while let Some(next) = self.buf.remove(&self.expected_seq) {
             ready.push(next);
             self.expected_seq += 1;
         }
+        // If buf still has buffered entries there is a new gap ahead; start timing it now.
+        if !self.buf.is_empty() {
+            self.gap_since = Some(Instant::now());
+        }
         (ready, vec![])
+    }
+
+    /// Advance past a gap that has been unresolved for longer than `max_age`.
+    ///
+    /// Called periodically by the engine background task.  Returns `true` when a skip
+    /// occurred so the caller can emit a warning.  Discards the entire backlog — the
+    /// stream resyncs on the next in-order delivery (H.264 picks up from the next
+    /// I-frame; other streams tolerate a small discontinuity).
+    pub fn prune_gap(&mut self, max_age: Duration) -> bool {
+        let Some(since) = self.gap_since else { return false };
+        if since.elapsed() < max_age {
+            return false;
+        }
+        // Gap timed out — discard buffered backlog and advance expected_seq past everything.
+        if let Some((&last_seq, _)) = self.buf.last_key_value() {
+            self.expected_seq = last_seq + 1;
+            self.buf.clear();
+        }
+        self.gap_since = None;
+        true
     }
 }

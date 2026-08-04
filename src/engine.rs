@@ -704,8 +704,16 @@ fn run_background(
         peer.prune_sent(sent_prune_age);
     }
 
-    for (_, frag_assembler) in recv_states.values_mut() {
+    for ((addr, stream_id), (recv, frag_assembler)) in recv_states.iter_mut() {
         frag_assembler.prune(sent_prune_age);
+        if recv.prune_gap(sent_prune_age) {
+            tracing::warn!(
+                target: "zudp::engine",
+                peer = %addr,
+                stream_id,
+                "gap timeout — missing seq discarded, stream resyncing"
+            );
+        }
     }
 
     // Advance the relay generation counter and prune stale entries.
