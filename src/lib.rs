@@ -534,7 +534,7 @@ impl Inner {
 
         // Fast path: channel already established (extremely unlikely in practice but correct).
         // Slow path: yield until the engine calls `notify_one` after msg3.
-        if peer.channel.get().is_none() {
+        if peer.channel.read().is_none() {
             notified.await;
         }
 
@@ -691,13 +691,16 @@ impl Inner {
 #[allow(clippy::unnecessary_wraps)]
 fn maybe_encrypt(peer: &PeerState, plain: &Bytes) -> Result<Bytes, Error> {
     #[cfg(feature = "security")]
-    if let Some(channel) = peer.channel.get() {
-        let (nonce, ct) = channel.encrypt(plain)?;
-        return Ok(Frame::Secure {
-            nonce,
-            ciphertext: Bytes::from(ct),
+    {
+        let guard = peer.channel.read();
+        if let Some(channel) = guard.as_ref() {
+            let (nonce, ct) = channel.encrypt(plain)?;
+            return Ok(Frame::Secure {
+                nonce,
+                ciphertext: Bytes::from(ct),
+            }
+            .encode());
         }
-        .encode());
     }
     let _ = peer;
     Ok(plain.clone())

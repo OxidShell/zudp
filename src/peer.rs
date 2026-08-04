@@ -50,9 +50,10 @@ pub struct PeerState {
     /// In-progress Noise XX handshake state; `None` once the channel is established.
     #[cfg(feature = "security")]
     pub handshake: Mutex<Option<snow::HandshakeState>>,
-    /// Established Noise transport channel; set exactly once after handshake completes.
+    /// Established Noise transport channel; replaced on every completed handshake so
+    /// reconnecting peers get fresh keys instead of silently reusing stale ones.
     #[cfg(feature = "security")]
-    pub channel: OnceLock<SecureChannel>,
+    pub channel: RwLock<Option<SecureChannel>>,
     /// The remote peer's X25519 static public key, extracted from the Noise handshake.
     /// Set once when the handshake finishes; `None` until then.
     #[cfg(feature = "security")]
@@ -87,7 +88,7 @@ impl PeerState {
             #[cfg(feature = "security")]
             handshake: Mutex::new(None),
             #[cfg(feature = "security")]
-            channel: OnceLock::new(),
+            channel: RwLock::new(None),
             #[cfg(feature = "security")]
             remote_static_key: OnceLock::new(),
             #[cfg(feature = "security")]

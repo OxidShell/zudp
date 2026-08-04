@@ -287,7 +287,8 @@ async fn handle_incoming(
                     tracing::warn!(target: "zudp::engine", peer = %from, "secure frame from unknown peer");
                     return;
                 };
-                let Some(channel) = peer.channel.get() else {
+                let channel_guard = peer.channel.read();
+                let Some(channel) = channel_guard.as_ref() else {
                     tracing::warn!(target: "zudp::engine", peer = %from, "secure frame but no channel yet");
                     return;
                 };
@@ -632,17 +633,20 @@ fn secure_frame(peer: &PeerState, frame: Frame) -> Bytes {
 #[allow(unused_variables)]
 fn encrypt_or_plain(peer: &PeerState, plain: &Bytes) -> Bytes {
     #[cfg(feature = "security")]
-    if let Some(channel) = peer.channel.get() {
-        match channel.encrypt(plain) {
-            Ok((nonce, ct)) => {
-                return Frame::Secure {
-                    nonce,
-                    ciphertext: Bytes::from(ct),
+    {
+        let guard = peer.channel.read();
+        if let Some(channel) = guard.as_ref() {
+            match channel.encrypt(plain) {
+                Ok((nonce, ct)) => {
+                    return Frame::Secure {
+                        nonce,
+                        ciphertext: Bytes::from(ct),
+                    }
+                    .encode();
                 }
-                .encode();
-            }
-            Err(e) => {
-                tracing::warn!(target: "zudp::engine", "retransmit encrypt failed: {e}");
+                Err(e) => {
+                    tracing::warn!(target: "zudp::engine", "retransmit encrypt failed: {e}");
+                }
             }
         }
     }
@@ -843,7 +847,7 @@ async fn handle_handshake(payload: Bytes, from: SocketAddr, inner: &Arc<EngineIn
         }
         match hs.into_stateless_transport_mode() {
             Ok(transport) => {
-                let _ = peer.channel.set(SecureChannel::new(transport));
+                *peer.channel.write() = Some(SecureChannel::new(transport));
                 // Unblock connect() which may be waiting for encryption to be active.
                 peer.channel_ready.notify_one();
                 tracing::info!(target: "zudp::engine", peer = %from, "Noise XX handshake complete");
