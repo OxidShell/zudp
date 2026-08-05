@@ -74,7 +74,9 @@ impl EngineInner {
             return p.value().clone();
         }
         if self.peers.len() >= self.config.max_peers {
-            let evict_addr = self.peers.iter()
+            let evict_addr = self
+                .peers
+                .iter()
                 .min_by_key(|r| *r.value().last_seen.lock())
                 .map(|r| *r.key());
             if let Some(evict) = evict_addr {
@@ -88,7 +90,8 @@ impl EngineInner {
             }
             self.dropped_peer_cap.fetch_add(1, Ordering::Relaxed);
         }
-        self.peers.entry(addr)
+        self.peers
+            .entry(addr)
             .or_insert_with(|| Arc::new(PeerState::new(addr)))
             .value()
             .clone()
@@ -234,7 +237,13 @@ async fn ping_all_peers(inner: &Arc<EngineInner>, sock: &RawSocket) {
     let now_ms = now_micros();
     let peers: Vec<Arc<PeerState>> = inner.peers.iter().map(|r| r.value().clone()).collect();
     for peer in peers {
-        let ping = secure_frame(&peer, Frame::Ping { echo: now_ms, session_id: peer.my_session_id });
+        let ping = secure_frame(
+            &peer,
+            Frame::Ping {
+                echo: now_ms,
+                session_id: peer.my_session_id,
+            },
+        );
         if let Err(e) = sock.send_to(&ping, peer.addr()).await {
             tracing::warn!(target: "zudp::engine", peer = %peer.addr(), "post-rebind ping failed: {e}");
         }
@@ -287,17 +296,20 @@ async fn handle_incoming(
                     tracing::warn!(target: "zudp::engine", peer = %from, "secure frame from unknown peer");
                     return;
                 };
-                let channel_guard = peer.channel.read();
-                let Some(channel) = channel_guard.as_ref() else {
-                    tracing::warn!(target: "zudp::engine", peer = %from, "secure frame but no channel yet");
-                    return;
-                };
-                let plain = match channel.decrypt(nonce, &ciphertext) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(target: "zudp::engine", peer = %from, "decrypt failed: {e}");
+                let plain = {
+                    let channel_guard = peer.channel.read();
+                    let Some(channel) = channel_guard.as_ref() else {
+                        tracing::warn!(target: "zudp::engine", peer = %from, "secure frame but no channel yet");
                         return;
+                    };
+                    match channel.decrypt(nonce, &ciphertext) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(target: "zudp::engine", peer = %from, "decrypt failed: {e}");
+                            return;
+                        }
                     }
+                    // channel_guard dropped here, before the dispatch_frame await below
                 };
                 let inner_frame = match Frame::decode(BytesMut::from(plain.as_slice())) {
                     Ok(f) => f,
@@ -306,14 +318,46 @@ async fn handle_incoming(
                         return;
                     }
                 };
-                dispatch_frame(inner_frame, from, inner, inbound_tx, recv_states, relay_table, relay_gen, retransmit_tasks).await;
+                dispatch_frame(
+                    inner_frame,
+                    from,
+                    inner,
+                    inbound_tx,
+                    recv_states,
+                    relay_table,
+                    relay_gen,
+                    retransmit_tasks,
+                )
+                .await;
             }
-            frame => dispatch_frame(frame, from, inner, inbound_tx, recv_states, relay_table, relay_gen, retransmit_tasks).await,
+            frame => {
+                dispatch_frame(
+                    frame,
+                    from,
+                    inner,
+                    inbound_tx,
+                    recv_states,
+                    relay_table,
+                    relay_gen,
+                    retransmit_tasks,
+                )
+                .await
+            }
         }
     }
 
     #[cfg(not(feature = "security"))]
-    dispatch_frame(frame, from, inner, inbound_tx, recv_states, relay_table, relay_gen, retransmit_tasks).await;
+    dispatch_frame(
+        frame,
+        from,
+        inner,
+        inbound_tx,
+        recv_states,
+        relay_table,
+        relay_gen,
+        retransmit_tasks,
+    )
+    .await;
 }
 
 // All parameters are genuinely distinct state that the frame dispatch needs to mutate or read;
@@ -332,7 +376,8 @@ async fn dispatch_frame(
     match frame {
         Frame::Datagram(payload) => {
             let peer = inner.get_or_create_peer(from);
-            peer.rx_bytes.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            peer.rx_bytes
+                .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
             if inbound_tx.try_send((payload, from, 0)).is_err() {
                 tracing::warn!(target: "zudp::engine", %from, "inbound channel full — dropping datagram");
             }
@@ -352,7 +397,8 @@ async fn dispatch_frame(
             let peer = inner.get_or_create_peer(from);
             for item in ready {
                 if let Inbound::Data(bytes) = item {
-                    peer.rx_bytes.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    peer.rx_bytes
+                        .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     if inbound_tx.try_send((bytes, from, stream_id)).is_err() {
                         tracing::warn!(target: "zudp::engine", %from, stream_id, "inbound channel full — dropping stream frame");
                     }
@@ -403,7 +449,13 @@ async fn dispatch_frame(
 
         Frame::Ping { echo, session_id } => {
             let peer = find_or_migrate_peer(from, session_id, inner, recv_states);
-            let pong = secure_frame(&peer, Frame::Pong { echo, session_id: peer.my_session_id });
+            let pong = secure_frame(
+                &peer,
+                Frame::Pong {
+                    echo,
+                    session_id: peer.my_session_id,
+                },
+            );
             if let Err(e) = inner.get_socket().send_to(&pong, from).await {
                 tracing::warn!(target: "zudp::engine", peer = %from, "pong failed: {e}");
             }
@@ -466,7 +518,8 @@ async fn dispatch_frame(
                     && let Some(complete) =
                         frag_assembler.insert(msg_id, frag_idx, frag_total, data)
                 {
-                    peer.rx_bytes.fetch_add(complete.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    peer.rx_bytes
+                        .fetch_add(complete.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     if inbound_tx.try_send((complete, from, stream_id)).is_err() {
                         tracing::warn!(target: "zudp::engine", %from, stream_id, "inbound channel full — dropping reassembled fragment");
                     }
@@ -663,7 +716,10 @@ async fn send_nack_if_needed(
         return;
     }
     tracing::debug!(target: "zudp::engine", peer = %to, count = nack_seqs.len(), stream_id, "sending NACK");
-    let nack = Frame::Nack { stream_id, seqs: nack_seqs };
+    let nack = Frame::Nack {
+        stream_id,
+        seqs: nack_seqs,
+    };
     let wire = if let Some(peer) = inner.peers.get(&to).map(|r| r.value().clone()) {
         secure_frame(&peer, nack)
     } else {
@@ -698,7 +754,13 @@ fn run_background(
             let peer_clone = peer.clone();
             tokio::spawn(async move {
                 let addr = peer_clone.addr();
-                let ping = secure_frame(&peer_clone, Frame::Ping { echo: now_ms, session_id: peer_clone.my_session_id });
+                let ping = secure_frame(
+                    &peer_clone,
+                    Frame::Ping {
+                        echo: now_ms,
+                        session_id: peer_clone.my_session_id,
+                    },
+                );
                 if let Err(e) = sock.send_to(&ping, addr).await {
                     tracing::warn!(target: "zudp::engine", peer = %addr, "keepalive failed: {e}");
                 }
@@ -724,9 +786,8 @@ fn run_background(
     // Wrapping arithmetic is intentional — correct over the ~170-year u32 lifetime.
     *relay_gen = relay_gen.wrapping_add(1);
     let current_gen = *relay_gen;
-    relay_table.retain(|_, (_, last_seen_gen)| {
-        current_gen.wrapping_sub(*last_seen_gen) < relay_ttl_ticks
-    });
+    relay_table
+        .retain(|_, (_, last_seen_gen)| current_gen.wrapping_sub(*last_seen_gen) < relay_ttl_ticks);
 
     rate_limiter.tick_prune();
 }
@@ -819,7 +880,11 @@ async fn handle_handshake(payload: Bytes, from: SocketAddr, inner: &Arc<EngineIn
             }
         }
 
-        let hs_owned = if finished_after_write { guard.take() } else { None };
+        let hs_owned = if finished_after_write {
+            guard.take()
+        } else {
+            None
+        };
         (Some(reply), hs_owned, false)
     }; // handshake lock released
 
@@ -831,7 +896,10 @@ async fn handle_handshake(payload: Bytes, from: SocketAddr, inner: &Arc<EngineIn
     }
 
     if let Some(reply_bytes) = reply {
-        let wire = Frame::Handshake { payload: reply_bytes }.encode();
+        let wire = Frame::Handshake {
+            payload: reply_bytes,
+        }
+        .encode();
         if let Err(e) = inner.get_socket().send_to(&wire, from).await {
             tracing::warn!(target: "zudp::engine", peer = %from, "handshake send: {e}");
         }
@@ -865,11 +933,7 @@ async fn handle_handshake(payload: Bytes, from: SocketAddr, inner: &Arc<EngineIn
 /// Returns `false` and logs a warning if the key is pinned and doesn't match.
 /// Must be called while the `HandshakeState` is still active (before consuming it).
 #[cfg(feature = "security")]
-fn check_pinned_key(
-    hs: &snow::HandshakeState,
-    inner: &Arc<EngineInner>,
-    from: SocketAddr,
-) -> bool {
+fn check_pinned_key(hs: &snow::HandshakeState, inner: &Arc<EngineInner>, from: SocketAddr) -> bool {
     let Some(expected) = &inner.config.remote_key else {
         return true;
     };
