@@ -117,17 +117,22 @@ impl SecureChannel {
 
     /// Decrypt `ciphertext` authenticated with `nonce`.
     ///
-    /// Returns an error if the nonce is a replay or the authentication tag is wrong.
+    /// Returns an error if the authentication tag is wrong or the nonce is a replay.
+    ///
+    /// AEAD authentication is checked **before** the replay window is updated.  This
+    /// prevents stray packets from a previous session (wrong key → AEAD fail) from
+    /// advancing `highest` in the replay window and blocking the new session's nonces.
     pub fn decrypt(&self, nonce: u64, ciphertext: &[u8]) -> Result<Vec<u8>, snow::Error> {
-        if !self.replay.lock().check_and_update(nonce) {
-            return Err(snow::Error::Decrypt);
-        }
         let mut buf = vec![0u8; ciphertext.len()];
         let written = self
             .transport
             .lock()
             .read_message(nonce, ciphertext, &mut buf)?;
         buf.truncate(written);
+        // Packet authenticated — now record the nonce to reject true replays.
+        if !self.replay.lock().check_and_update(nonce) {
+            return Err(snow::Error::Decrypt);
+        }
         Ok(buf)
     }
 }
