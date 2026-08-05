@@ -50,6 +50,9 @@ pub fn build_responder(kp: &Keypair) -> Result<snow::HandshakeState, snow::Error
 ///
 /// Tracks which nonces have been seen in the last 64 slots relative to `highest`.
 /// Nonces more than 64 behind `highest` are unconditionally rejected.
+///
+/// Not used inside `SecureChannel` — ZUDP's own per-stream sequence tracking
+/// handles deduplication. Exported for callers that want an explicit window.
 #[derive(Default)]
 pub struct ReplayWindow {
     highest: u64,
@@ -86,10 +89,14 @@ impl ReplayWindow {
 ///
 /// Wraps `StatelessTransportState` so each send/recv carries an explicit nonce,
 /// which is necessary for UDP where packets may arrive out of order.
+///
+/// Replay deduplication is intentionally left to ZUDP's per-stream sequence
+/// layer (`RecvState`). A crypto-layer replay window sized for normal traffic
+/// rejects legitimate out-of-order fragments at high frame rates (e.g. >64
+/// packets behind at 446 frags/sec ≈ 143 ms of jitter → false reject).
 pub struct SecureChannel {
     transport: Mutex<snow::StatelessTransportState>,
     send_nonce: AtomicU64,
-    replay: Mutex<ReplayWindow>,
 }
 
 impl SecureChannel {
@@ -97,7 +104,6 @@ impl SecureChannel {
         Self {
             transport: Mutex::new(transport),
             send_nonce: AtomicU64::new(0),
-            replay: Mutex::new(ReplayWindow::default()),
         }
     }
 
@@ -117,11 +123,9 @@ impl SecureChannel {
 
     /// Decrypt `ciphertext` authenticated with `nonce`.
     ///
-    /// Returns an error if the authentication tag is wrong or the nonce is a replay.
-    ///
-    /// AEAD authentication is checked **before** the replay window is updated.  This
-    /// prevents stray packets from a previous session (wrong key → AEAD fail) from
-    /// advancing `highest` in the replay window and blocking the new session's nonces.
+    /// Returns an error only if the AEAD authentication tag is wrong (wrong key,
+    /// tampered payload, or mismatched nonce). True replay deduplication is
+    /// handled by ZUDP's sequence layer, not here.
     pub fn decrypt(&self, nonce: u64, ciphertext: &[u8]) -> Result<Vec<u8>, snow::Error> {
         let mut buf = vec![0u8; ciphertext.len()];
         let written = self
@@ -129,10 +133,6 @@ impl SecureChannel {
             .lock()
             .read_message(nonce, ciphertext, &mut buf)?;
         buf.truncate(written);
-        // Packet authenticated — now record the nonce to reject true replays.
-        if !self.replay.lock().check_and_update(nonce) {
-            return Err(snow::Error::Decrypt);
-        }
         Ok(buf)
     }
 }
@@ -216,32 +216,40 @@ mod tests {
     }
 
     #[test]
-    fn replay_detection_after_encrypt_decrypt() {
-        let kp_i = Keypair::generate();
-        let kp_r = Keypair::generate();
+    fn wrong_key_rejected() {
+        // Encrypting with one channel, decrypting with a different key → AEAD fail.
+        let kp_a = Keypair::generate();
+        let kp_b = Keypair::generate();
+        let kp_c = Keypair::generate();
 
-        // Fast-forward through handshake
-        let mut init = build_initiator(&kp_i).unwrap();
-        let mut resp = build_responder(&kp_r).unwrap();
-        let mut buf = vec![0u8; 256];
-        let mut tmp = vec![0u8; 256];
+        fn handshake(
+            kp_i: &Keypair,
+            kp_r: &Keypair,
+        ) -> (snow::StatelessTransportState, snow::StatelessTransportState) {
+            let mut init = build_initiator(kp_i).unwrap();
+            let mut resp = build_responder(kp_r).unwrap();
+            let mut buf = vec![0u8; 256];
+            let mut tmp = vec![0u8; 256];
+            let n = init.write_message(&[], &mut buf).unwrap();
+            resp.read_message(&buf[..n], &mut tmp).unwrap();
+            let n = resp.write_message(&[], &mut buf).unwrap();
+            init.read_message(&buf[..n], &mut tmp).unwrap();
+            let n = init.write_message(&[], &mut buf).unwrap();
+            resp.read_message(&buf[..n], &mut tmp).unwrap();
+            (
+                init.into_stateless_transport_mode().unwrap(),
+                resp.into_stateless_transport_mode().unwrap(),
+            )
+        }
 
-        let n = init.write_message(&[], &mut buf).unwrap();
-        let msg1 = buf[..n].to_vec();
-        resp.read_message(&msg1, &mut tmp).unwrap();
-        let n = resp.write_message(&[], &mut buf).unwrap();
-        let msg2 = buf[..n].to_vec();
-        init.read_message(&msg2, &mut tmp).unwrap();
-        let n = init.write_message(&[], &mut buf).unwrap();
-        let msg3 = buf[..n].to_vec();
-        resp.read_message(&msg3, &mut tmp).unwrap();
+        let (ti, _) = handshake(&kp_a, &kp_b);
+        let (_, tr_wrong) = handshake(&kp_a, &kp_c); // different session key
 
-        let ch_send = SecureChannel::new(init.into_stateless_transport_mode().unwrap());
-        let ch_recv = SecureChannel::new(resp.into_stateless_transport_mode().unwrap());
+        let ch_send = SecureChannel::new(ti);
+        let ch_recv_wrong = SecureChannel::new(tr_wrong);
 
-        let (nonce, ciphertext) = ch_send.encrypt(b"data").unwrap();
-        assert!(ch_recv.decrypt(nonce, &ciphertext).is_ok());
-        // Replay same (nonce, ciphertext) — must be rejected.
-        assert!(ch_recv.decrypt(nonce, &ciphertext).is_err());
+        let (nonce, ciphertext) = ch_send.encrypt(b"secret").unwrap();
+        // Wrong session key → AEAD tag mismatch → error.
+        assert!(ch_recv_wrong.decrypt(nonce, &ciphertext).is_err());
     }
 }
