@@ -14,6 +14,7 @@ use zudp::rkyv::{Archive, Deserialize, Serialize};
 use zudp::{Keypair, Zudp};
 
 #[derive(Debug, Archive, Serialize, Deserialize)]
+#[cfg_attr(feature = "serde", derive(zudp::serde::Serialize, zudp::serde::Deserialize))]
 enum Msg {
     Hello,
     Hi,

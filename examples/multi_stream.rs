@@ -19,6 +19,7 @@ const STREAM_COMMANDS: u16 = 0;
 const STREAM_STATE: u16 = 1;
 
 #[derive(Debug, Archive, Serialize, Deserialize)]
+#[cfg_attr(feature = "serde", derive(zudp::serde::Serialize, zudp::serde::Deserialize))]
 enum Command {
     Jump,
     Fire { target_id: u32 },
@@ -26,12 +27,14 @@ enum Command {
 }
 
 #[derive(Debug, Archive, Serialize, Deserialize)]
+#[cfg_attr(feature = "serde", derive(zudp::serde::Serialize, zudp::serde::Deserialize))]
 enum StateSnapshot {
     World { tick: u32, data: Vec<u8> },
 }
 
 // The server uses a single enum to receive from both streams.
 #[derive(Debug, Archive, Serialize, Deserialize)]
+#[cfg_attr(feature = "serde", derive(zudp::serde::Serialize, zudp::serde::Deserialize))]
 enum ServerMsg {
     Command(Command),
     State(StateSnapshot),

@@ -4,6 +4,7 @@ use zudp::rkyv::{Archive, Deserialize, Serialize};
 use zudp::{Discovery, DiscoveryConfig};
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[cfg_attr(feature = "serde", derive(zudp::serde::Serialize, zudp::serde::Deserialize))]
 struct GameInfo {
     name: String,
     players: u8,
