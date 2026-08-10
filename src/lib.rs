@@ -95,6 +95,13 @@ impl ZudpSender {
     ) -> Result<(), Error> {
         self.inner.send_msg(&msg, peer, true, stream_id).await
     }
+
+    /// Smoothed RTT to `peer` as measured by transport-level Ping/Pong.
+    /// Returns `None` until the first Pong has been received.
+    #[must_use]
+    pub fn peer_srtt(&self, peer: SocketAddr) -> Option<std::time::Duration> {
+        self.inner.engine.peers.get(&peer)?.cc.lock().srtt()
+    }
 }
 
 /// Per-peer statistics snapshot.  Returned by [`ZudpSocket::peer_stats`].
