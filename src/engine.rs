@@ -656,8 +656,9 @@ fn find_or_migrate_peer(
 fn spawn_mtu_probe(inner: &Arc<EngineInner>, peer_addr: SocketAddr) {
     let inner = inner.clone();
     let initial_mtu = inner.config.mtu;
+    let max_mtu = inner.config.max_mtu;
     let _mtu_probe = tokio::spawn(async move {
-        let discovered = crate::mtu::probe(&inner, peer_addr, initial_mtu).await;
+        let discovered = crate::mtu::probe(&inner, peer_addr, initial_mtu, max_mtu).await;
         if let Some(p) = inner.peers.get(&peer_addr) {
             p.set_effective_mtu(discovered);
         }

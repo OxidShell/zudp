@@ -77,6 +77,58 @@ async fn fragmented_message() {
     assert_eq!(pkt.msg, big);
 }
 
+async fn discovered_mtu(conn: &zudp::ZudpConn<Vec<u8>>) -> usize {
+    timeout(Duration::from_secs(6), async {
+        loop {
+            if let Some(mtu) = conn.effective_mtu() {
+                return mtu;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("mtu discovery timed out")
+}
+
+#[tokio::test]
+async fn mtu_discovery_defaults_to_a_safe_non_jumbo_ceiling() {
+    // Loopback has no real link MTU limit, so every probe up to 9000 bytes
+    // succeeds — exactly the condition that used to let discovery settle on
+    // a jumbo frame size that a real network path can't actually sustain.
+    // The default ceiling has to hold even here.
+    let mut server: zudp::ZudpSocket<Vec<u8>> = lo().port(0).listen().await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let client = lo().port(0).connect::<Vec<u8>>(server_addr).await.unwrap();
+    client.send(b"hi".to_vec()).await.unwrap();
+    recv!(server);
+
+    let mtu = discovered_mtu(&client).await;
+    assert!(
+        mtu <= 1472,
+        "discovery has to stay at or under the safe default ceiling, got {mtu}"
+    );
+}
+
+#[tokio::test]
+async fn max_mtu_lets_discovery_go_past_the_default_ceiling() {
+    let mut server: zudp::ZudpSocket<Vec<u8>> = lo().port(0).max_mtu(9000).listen().await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let client = lo()
+        .port(0)
+        .max_mtu(9000)
+        .connect::<Vec<u8>>(server_addr)
+        .await
+        .unwrap();
+    client.send(b"hi".to_vec()).await.unwrap();
+    recv!(server);
+
+    let mtu = discovered_mtu(&client).await;
+    assert!(
+        mtu > 1472,
+        "max_mtu(9000) should let discovery go past the default ceiling, got {mtu}"
+    );
+}
+
 #[tokio::test]
 async fn multi_stream() {
     let mut server: zudp::ZudpSocket<Vec<u8>> = lo().port(0).listen().await.unwrap();
