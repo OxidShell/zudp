@@ -82,6 +82,7 @@ pub struct DiscoveryConfig<M = ()> {
     pub(crate) data_port: u16,
     pub(crate) discovery_port: u16,
     pub(crate) probe_interval: Duration,
+    pub(crate) broadcast_addr: Ipv4Addr,
     pub(crate) meta: M,
 }
 
@@ -97,6 +98,7 @@ impl DiscoveryConfig<()> {
             data_port,
             discovery_port: DISCOVERY_PORT,
             probe_interval: Duration::from_secs(5),
+            broadcast_addr: Ipv4Addr::BROADCAST,
             meta: (),
         }
     }
@@ -120,6 +122,7 @@ impl<M> DiscoveryConfig<M> {
             data_port: self.data_port,
             discovery_port: self.discovery_port,
             probe_interval: self.probe_interval,
+            broadcast_addr: self.broadcast_addr,
             meta,
         }
     }
@@ -135,6 +138,17 @@ impl<M> DiscoveryConfig<M> {
     #[must_use]
     pub fn probe_interval(mut self, interval: Duration) -> Self {
         self.probe_interval = interval;
+        self
+    }
+
+    /// Override the IPv4 broadcast address probes are sent to (default: `255.255.255.255`).
+    ///
+    /// On Linux, limited broadcast (`255.255.255.255`) is not delivered to local sockets
+    /// on the same host. Use `127.255.255.255` (loopback broadcast) when both advertiser
+    /// and scanner run in the same process or on the same machine in a test environment.
+    #[must_use]
+    pub fn broadcast_addr(mut self, addr: Ipv4Addr) -> Self {
+        self.broadcast_addr = addr;
         self
     }
 }
@@ -241,7 +255,7 @@ impl<M: Decode> ScanStream<M> {
 /// LAN peer discovery service.
 ///
 /// All methods are associated functions — no shared state is held between calls.
-/// Each operation binds its own ephemeral discovery socket.
+/// Advertisers bind the well-known discovery port; scanners bind an ephemeral port.
 pub struct Discovery;
 
 impl Discovery {
@@ -295,7 +309,7 @@ impl Discovery {
         // only fans out on SO_REUSEPORT (no Windows). Advertisers still
         // listen on discovery_port so probes still reach them.
         let socket = Arc::new(bind_discovery_socket(0)?);
-        let broadcast_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), cfg.discovery_port);
+        let broadcast_addr = SocketAddr::new(IpAddr::V4(cfg.broadcast_addr), cfg.discovery_port);
 
         let probe = Frame::Probe {
             app_id: cfg.app_id.raw(),
@@ -332,7 +346,7 @@ impl Discovery {
         let cfg = config.into();
         // Same as scan_stream: bind our own port instead of discovery_port.
         let socket = bind_discovery_socket(0)?;
-        let broadcast_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), cfg.discovery_port);
+        let broadcast_addr = SocketAddr::new(IpAddr::V4(cfg.broadcast_addr), cfg.discovery_port);
         let app_id = cfg.app_id.raw();
 
         let probe = Frame::Probe {

@@ -1,3 +1,4 @@
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use zudp::rkyv::{Archive, Deserialize, Serialize};
@@ -12,9 +13,10 @@ struct Info {
     name: String,
 }
 
-/// Grabs a free UDP port so each test run uses its own discovery port.
+/// Grabs a free UDP port for a test-isolated discovery channel.
+/// The socket is dropped immediately; the TOCTOU window is negligible on loopback.
 fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
+    std::net::UdpSocket::bind("0.0.0.0:0")
         .unwrap()
         .local_addr()
         .unwrap()
@@ -32,7 +34,10 @@ async fn scan_once_finds_a_peer_advertised_from_the_same_process() {
         });
     let _advertise = Discovery::advertise(advertise_cfg).unwrap();
 
-    let scan_cfg = DiscoveryConfig::new("zudp-test", 0).discovery_port(discovery_port);
+    // 255.255.255.255 doesn't loop back to local sockets on Linux; use loopback broadcast.
+    let scan_cfg = DiscoveryConfig::new("zudp-test", 0)
+        .discovery_port(discovery_port)
+        .broadcast_addr(Ipv4Addr::new(127, 255, 255, 255));
     let peers = Discovery::scan_once::<Info>(scan_cfg, Duration::from_millis(500))
         .await
         .unwrap();
