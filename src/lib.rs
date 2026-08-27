@@ -213,6 +213,8 @@ pub struct Config {
     pub(crate) sent_prune_age: Duration,
     /// Application-level MTU: messages larger than this are fragmented.
     pub(crate) mtu: usize,
+    /// Ceiling for path MTU discovery (see [`Zudp::max_mtu`]).
+    pub(crate) max_mtu: usize,
     /// Optional relay node to route packets through for NAT traversal.
     pub(crate) relay_addr: Option<SocketAddr>,
     /// Noise X25519 keypair; when set, all data frames are encrypted end-to-end.
@@ -247,6 +249,7 @@ impl Default for Config {
             keepalive_interval: Duration::from_secs(5),
             sent_prune_age: Duration::from_secs(10),
             mtu: 1400,
+            max_mtu: mtu::DEFAULT_MTU_CEILING,
             relay_addr: None,
             #[cfg(feature = "security")]
             security: None,
@@ -318,6 +321,23 @@ impl Zudp {
     #[must_use]
     pub fn mtu(mut self, bytes: usize) -> Self {
         self.config.mtu = bytes;
+        self
+    }
+
+    /// Ceiling for path MTU discovery (default: 1472 bytes, standard
+    /// non-jumbo Ethernet — see the comment on `mtu::DEFAULT_MTU_CEILING`
+    /// for why that's the default and not something bigger).
+    ///
+    /// Raise this only on a network you know carries jumbo frames end to
+    /// end — every hop, not just the two machines talking. Discovery still
+    /// can't set the DF bit on its probes, so a path that only carries
+    /// jumbo frames some of the way can still make discovery settle on an
+    /// MTU that then drops packets under real traffic; this knob doesn't
+    /// change that risk, it just lets you accept it deliberately instead of
+    /// discovery opting you into it silently.
+    #[must_use]
+    pub fn max_mtu(mut self, bytes: usize) -> Self {
+        self.config.max_mtu = bytes;
         self
     }
 
@@ -444,10 +464,11 @@ impl Zudp {
         {
             let inner = socket.inner.engine.clone();
             let initial_mtu = socket.inner.config.mtu;
+            let max_mtu = socket.inner.config.max_mtu;
             tokio::spawn(async move {
                 let discovered = tokio::time::timeout(
                     Duration::from_secs(5),
-                    mtu::probe(&inner, peer, initial_mtu),
+                    mtu::probe(&inner, peer, initial_mtu, max_mtu),
                 )
                 .await
                 .unwrap_or(initial_mtu);

@@ -290,7 +290,11 @@ impl Discovery {
         M: Decode,
     {
         let cfg = config.into();
-        let socket = Arc::new(bind_discovery_socket(cfg.discovery_port)?);
+        // Bind our own port, not cfg.discovery_port: a node that also has
+        // advertise() running already owns that port, and a second bind
+        // only fans out on SO_REUSEPORT (no Windows). Advertisers still
+        // listen on discovery_port so probes still reach them.
+        let socket = Arc::new(bind_discovery_socket(0)?);
         let broadcast_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), cfg.discovery_port);
 
         let probe = Frame::Probe {
@@ -326,7 +330,8 @@ impl Discovery {
         M: Decode,
     {
         let cfg = config.into();
-        let socket = bind_discovery_socket(cfg.discovery_port)?;
+        // Same as scan_stream: bind our own port instead of discovery_port.
+        let socket = bind_discovery_socket(0)?;
         let broadcast_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), cfg.discovery_port);
         let app_id = cfg.app_id.raw();
 
