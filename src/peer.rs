@@ -1,7 +1,7 @@
 #[cfg(feature = "security")]
 use std::sync::OnceLock;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     hash::{Hash, Hasher},
     net::SocketAddr,
     sync::{
@@ -68,6 +68,8 @@ pub struct PeerState {
     pub tx_bytes: AtomicU64,
     /// Number of frames retransmitted due to NACKs from this peer.
     pub retransmit_count: AtomicU64,
+    /// Streams with a tail-loss probe task running (see `engine::arm_tail_probe`).
+    pub tail_probe_armed: Mutex<HashSet<u16>>,
 }
 
 impl PeerState {
@@ -96,6 +98,7 @@ impl PeerState {
             rx_bytes: AtomicU64::new(0),
             tx_bytes: AtomicU64::new(0),
             retransmit_count: AtomicU64::new(0),
+            tail_probe_armed: Mutex::new(HashSet::new()),
         }
     }
 
@@ -168,6 +171,13 @@ impl PeerState {
         self.retransmit_count
             .fetch_add(frames.len() as u64, Ordering::Relaxed);
         frames
+    }
+
+    /// The most recently sent frame still buffered on `stream_id`: `(seq, plain_frame, sent_at)`.
+    pub fn newest_sent(&self, stream_id: u16) -> Option<(u64, Bytes, Instant)> {
+        let map = self.sent.lock();
+        let (seq, packet) = map.get(&stream_id)?.last_key_value()?;
+        Some((*seq, packet.frame.clone(), packet.sent_at))
     }
 
     pub fn prune_sent(&self, max_age: Duration) {
@@ -265,7 +275,8 @@ impl RecvState {
     ///
     /// Returns:
     /// - `ready`: in-order payloads available for delivery (possibly multiple, after gap fills).
-    /// - `nack_seqs`: sequence numbers to NACK (gaps detected before `seq`).
+    /// - `nack_seqs`: sequence numbers still missing before `seq` (already-buffered ones
+    ///   are not asked for again).
     pub fn ingest(&mut self, seq: u64, payload: Inbound) -> (Vec<Inbound>, Vec<u64>) {
         if seq < self.expected_seq {
             return (vec![], vec![]);
@@ -275,7 +286,9 @@ impl RecvState {
             if self.gap_since.is_none() {
                 self.gap_since = Some(Instant::now());
             }
-            let nack_seqs: Vec<u64> = (self.expected_seq..seq).collect();
+            let nack_seqs: Vec<u64> = (self.expected_seq..seq)
+                .filter(|missing| !self.buf.contains_key(missing))
+                .collect();
             self.buf.insert(seq, payload);
             return (vec![], nack_seqs);
         }
@@ -313,5 +326,21 @@ impl RecvState {
         }
         self.gap_since = None;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nack_skips_seqs_already_buffered() {
+        let mut recv = RecvState::new();
+        let data = || Inbound::Data(Bytes::from_static(b"x"));
+        assert_eq!(recv.ingest(3, data()).1, vec![1, 2]);
+        assert_eq!(recv.ingest(5, data()).1, vec![1, 2, 4], "3 is buffered");
+        let (ready, nacks) = recv.ingest(1, data());
+        assert!(nacks.is_empty());
+        assert_eq!(ready.len(), 1, "2 still missing, so only 1 is delivered");
     }
 }

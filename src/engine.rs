@@ -35,6 +35,13 @@ pub struct RelayPolicy {
 /// prevents memory/CPU runaway when a peer floods NACKs faster than retransmits drain.
 const MAX_RETRANSMIT_TASKS: usize = 32;
 
+/// Tail-loss probes sent per idle period before giving up (backoff doubles each time).
+const TAIL_PROBES: u32 = 3;
+/// Probe timeout bounds: `2 × srtt`, clamped; [`TAIL_PROBE_DEFAULT`] before the first RTT sample.
+const TAIL_PROBE_MIN: Duration = Duration::from_millis(10);
+const TAIL_PROBE_MAX: Duration = Duration::from_secs(1);
+const TAIL_PROBE_DEFAULT: Duration = Duration::from_millis(100);
+
 /// Capacity of the bounded inbound channel between the engine task and the socket handle.
 ///
 /// At 1 400 B/frame and 8 192 slots this is ~11 MB peak backpressure before the engine
@@ -705,6 +712,85 @@ fn encrypt_or_plain(peer: &PeerState, plain: &Bytes) -> Bytes {
         }
     }
     plain.clone()
+}
+
+/// Recover from tail loss on a reliable stream.
+///
+/// The receiver only NACKs a gap when a later frame reveals it, so if the last frames of a
+/// burst are lost nothing ever asks for them.  Once `stream_id` goes quiet for a probe
+/// timeout, re-send its newest frame (TCP's tail loss probe): a duplicate is discarded,
+/// a missing tail is delivered, and a hole before it gets NACKed as usual.
+///
+/// Call after recording a reliable send.  At most one task runs per (peer, stream).
+pub(crate) fn arm_tail_probe(inner: &Arc<EngineInner>, peer: &Arc<PeerState>, stream_id: u16) {
+    if !peer.tail_probe_armed.lock().insert(stream_id) {
+        return;
+    }
+    let inner = inner.clone();
+    let peer = peer.clone();
+    tokio::spawn(async move {
+        let mut probed_seq = 0;
+        let mut probes = 0;
+        loop {
+            let pto = probe_timeout(&peer);
+            let newest = peer.newest_sent(stream_id);
+            match &newest {
+                Some((_, _, sent_at)) if sent_at.elapsed() < pto => {
+                    tokio::time::sleep(pto.saturating_sub(sent_at.elapsed())).await;
+                }
+                Some((seq, frame, _)) if *seq != probed_seq || probes < TAIL_PROBES => {
+                    if *seq != probed_seq {
+                        probed_seq = *seq;
+                        probes = 0;
+                    }
+                    send_tail_probe(&inner, &peer, frame, stream_id, *seq).await;
+                    probes += 1;
+                    tokio::time::sleep(pto * 2u32.pow(probes)).await;
+                }
+                _ => {
+                    // Disarm under the lock: a send recorded after this check re-arms.
+                    let mut armed = peer.tail_probe_armed.lock();
+                    if peer.newest_sent(stream_id).map(|n| n.0) == newest.as_ref().map(|n| n.0) {
+                        armed.remove(&stream_id);
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn probe_timeout(peer: &PeerState) -> Duration {
+    peer.cc
+        .lock()
+        .srtt()
+        .map_or(TAIL_PROBE_DEFAULT, |srtt| (srtt * 2).clamp(TAIL_PROBE_MIN, TAIL_PROBE_MAX))
+}
+
+async fn send_tail_probe(
+    inner: &Arc<EngineInner>,
+    peer: &PeerState,
+    plain_frame: &Bytes,
+    stream_id: u16,
+    seq: u64,
+) {
+    let wire = encrypt_or_plain(peer, plain_frame);
+    let (wire, dest) = match inner.config.relay_addr {
+        Some(relay) => (
+            Frame::Relay {
+                dest: peer.addr(),
+                inner: wire,
+            }
+            .encode(),
+            relay,
+        ),
+        None => (wire, peer.addr()),
+    };
+    peer.cc.lock().consume(wire.len());
+    tracing::debug!(target: "zudp::engine", peer = %peer.addr(), seq, stream_id, "tail loss probe");
+    if let Err(e) = inner.get_socket().send_to(&wire, dest).await {
+        tracing::warn!(target: "zudp::engine", peer = %peer.addr(), "tail loss probe failed: {e}");
+    }
 }
 
 async fn send_nack_if_needed(
