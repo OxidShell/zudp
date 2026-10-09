@@ -561,3 +561,27 @@ async fn relay_table_cap() {
     let result = timeout(Duration::from_millis(500), server2.recv()).await;
     assert!(result.is_err(), "relay table should be full — second route dropped");
 }
+
+/// Bulk request/response with default config: each ~60 KB message must be
+/// delivered promptly, without waiting on an application-level retry.
+#[tokio::test]
+async fn bulk_request_response_does_not_stall() {
+    let mut server: zudp::ZudpSocket<Vec<u8>> = lo().port(0).listen().await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let mut client = lo().port(0).connect::<Vec<u8>>(server_addr).await.unwrap();
+
+    tokio::spawn(async move {
+        while let Ok(pkt) = server.recv().await {
+            server.send(vec![0xAC], pkt.from).await.unwrap();
+        }
+    });
+
+    for round in 0..60u8 {
+        client.send(vec![round; 60_000]).await.unwrap();
+        let ack = timeout(Duration::from_secs(2), client.recv())
+            .await
+            .unwrap_or_else(|_| panic!("round {round}: no ack within 2 s"))
+            .unwrap();
+        assert_eq!(ack.msg, vec![0xAC]);
+    }
+}

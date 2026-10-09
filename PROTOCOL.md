@@ -272,10 +272,20 @@ The sender keeps a `BTreeMap<seq, (plain_frame, sent_at)>` per (peer, stream). E
 The receiver keeps a `BTreeMap<seq, Inbound>` per (peer, stream) and an `expected_seq` counter (starts at 1) per stream:
 
 - Frame at `seq == expected_seq`: deliver immediately, then drain consecutive buffered entries.
-- Frame at `seq > expected_seq`: NACK all gaps `[expected_seq, seq)` on this stream, buffer this frame.
+- Frame at `seq > expected_seq`: NACK every seq in `[expected_seq, seq)` not already buffered, buffer this frame.
 - Frame at `seq < expected_seq`: duplicate — silently discard.
 
 Nacks are sent immediately on gap detection; there is no delayed-NACK timer.
+
+### Tail loss probe
+
+A gap is only detected when a later frame arrives, so losing the last frames of a burst (or
+the retransmits of an earlier gap) would otherwise stall the stream until the application
+sends again. After each reliable send the sender arms one probe task per (peer, stream):
+once the stream has been idle for a probe timeout (`2 × srtt`, clamped to 10 ms–1 s; 100 ms
+before the first RTT sample), it re-sends the newest buffered frame of that stream, up to 3
+times with doubling backoff. The receiver needs nothing new: a duplicate is discarded, a
+missing tail frame is delivered, and a hole before it is NACKed.
 
 ### Limits
 

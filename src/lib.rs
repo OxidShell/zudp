@@ -640,6 +640,7 @@ impl Inner {
             peer.cc.lock().consume(wire.len());
             self.engine.get_socket().send_to(&wire, actual_dest).await?;
             peer.record_sent(stream_id, seq, plain_frame, self.config.sent_buffer_frames);
+            engine::arm_tail_probe(&self.engine, &peer, stream_id);
         } else if wrap_relay {
             let frame = Frame::Datagram(payload).encode();
             let wire = Frame::Relay {
@@ -710,6 +711,7 @@ impl Inner {
             self.engine.get_socket().send_to(&wire, actual_dest).await?;
             peer.record_sent(stream_id, seq, plain_frame, self.config.sent_buffer_frames);
         }
+        engine::arm_tail_probe(&self.engine, &peer, stream_id);
         Ok(())
     }
 }
