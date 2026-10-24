@@ -52,7 +52,7 @@ pub use discovery::{
 };
 pub use error::Error;
 #[cfg(feature = "security")]
-pub use security::Keypair;
+pub use security::{Keypair, ReplayWindow};
 
 /// Raw byte passthrough codec. Encodes by copying the `Bytes` to a `Vec`;
 /// decodes by copying the slice into a new `Bytes`. Use this when you want
