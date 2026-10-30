@@ -237,11 +237,6 @@ mod tests {
 
     #[test]
     fn wrong_key_rejected() {
-        // Encrypting with one channel, decrypting with a different key → AEAD fail.
-        let kp_a = Keypair::generate();
-        let kp_b = Keypair::generate();
-        let kp_c = Keypair::generate();
-
         fn handshake(
             kp_i: &Keypair,
             kp_r: &Keypair,
@@ -261,6 +256,11 @@ mod tests {
                 resp.into_stateless_transport_mode().unwrap(),
             )
         }
+
+        // Encrypting with one channel, decrypting with a different key → AEAD fail.
+        let kp_a = Keypair::generate();
+        let kp_b = Keypair::generate();
+        let kp_c = Keypair::generate();
 
         let (ti, _) = handshake(&kp_a, &kp_b);
         let (_, tr_wrong) = handshake(&kp_a, &kp_c); // different session key

@@ -46,7 +46,7 @@ impl RateLimiter {
     }
 
     /// Drop buckets idle for more than 60 s.  Call once per background tick;
-    /// the actual HashMap scan runs only every [`PRUNE_INTERVAL_TICKS`] ticks.
+    /// the actual `HashMap` scan runs only every [`PRUNE_INTERVAL_TICKS`] ticks.
     pub(crate) fn tick_prune(&mut self) {
         self.ticks += 1;
         if !self.ticks.is_multiple_of(PRUNE_INTERVAL_TICKS) {

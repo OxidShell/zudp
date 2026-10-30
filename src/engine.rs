@@ -117,6 +117,7 @@ impl EngineInner {
     }
 
     /// `true` when a Noise keypair is configured.
+    #[cfg_attr(not(feature = "security"), allow(clippy::unused_self))]
     pub fn secured(&self) -> bool {
         #[cfg(feature = "security")]
         {
@@ -262,6 +263,8 @@ async fn run(
     // is intentional: correct for the ~170-year lifetime of a u32 at 240 ticks/5 min.
     let mut relay_gen: u32 = 0;
     // TTL expressed as a tick delta: 5 minutes / tick_interval.
+    // A small positive tick count, so the float-to-int cast cannot truncate or wrap.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let relay_ttl_ticks = {
         let tick_secs = inner.config.keepalive_interval.as_secs_f64() / 4.0;
         (300.0_f64 / tick_secs).ceil() as u32
@@ -637,7 +640,10 @@ async fn dispatch_frame(
                     let pacing_rate = {
                         let mut cc = peer.cc.lock();
                         cc.on_rtt_sample(rtt_us);
-                        cc.pacing_rate() as u64
+                        // Bounded to [10_000, 100_000_000] by the controller.
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let rate = cc.pacing_rate() as u64;
+                        rate
                     };
                     tracing::debug!(
                         target: "zudp::engine",

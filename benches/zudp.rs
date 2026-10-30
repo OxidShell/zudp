@@ -7,12 +7,12 @@ fn bench_encode_decode(c: &mut Criterion) {
     g.throughput(Throughput::Bytes(512));
 
     g.bench_function("encode_512B", |b| {
-        b.iter(|| criterion::black_box(payload.encode_to_bytes().unwrap()))
+        b.iter(|| criterion::black_box(payload.encode_to_bytes().unwrap()));
     });
 
     let encoded = payload.encode_to_bytes().unwrap();
     g.bench_function("decode_512B", |b| {
-        b.iter(|| Vec::<u8>::decode_from_bytes(criterion::black_box(&encoded)).unwrap())
+        b.iter(|| Vec::<u8>::decode_from_bytes(criterion::black_box(&encoded)).unwrap());
     });
 
     g.finish();
@@ -37,7 +37,7 @@ fn bench_loopback(c: &mut Criterion) {
             .await
             .unwrap();
         addr_tx.send(server.local_addr().unwrap()).unwrap();
-        while let Ok(_) = server.recv().await {
+        while server.recv().await.is_ok() {
             if msg_tx.send(()).is_err() {
                 break;
             }
@@ -57,7 +57,7 @@ fn bench_loopback(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(client.send(small.clone())).unwrap();
             msg_rx.recv().unwrap();
-        })
+        });
     });
 
     let medium = vec![0u8; 1400];
@@ -66,7 +66,7 @@ fn bench_loopback(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(client.send(medium.clone())).unwrap();
             msg_rx.recv().unwrap();
-        })
+        });
     });
 
     let large = vec![0u8; 8192];
@@ -75,7 +75,7 @@ fn bench_loopback(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(client.send(large.clone())).unwrap();
             msg_rx.recv().unwrap();
-        })
+        });
     });
 
     g.finish();
@@ -104,7 +104,7 @@ fn bench_encrypted_loopback(c: &mut Criterion) {
                 .await
                 .unwrap();
             addr_tx.send(server.local_addr().unwrap()).unwrap();
-            while let Ok(_) = server.recv().await {
+            while server.recv().await.is_ok() {
                 if msg_tx.send(()).is_err() {
                     break;
                 }
@@ -130,7 +130,7 @@ fn bench_encrypted_loopback(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(client.send(small.clone())).unwrap();
                 msg_rx.recv().unwrap();
-            })
+            });
         });
 
         let medium = vec![0u8; 1400];
@@ -139,7 +139,7 @@ fn bench_encrypted_loopback(c: &mut Criterion) {
             b.iter(|| {
                 rt.block_on(client.send(medium.clone())).unwrap();
                 msg_rx.recv().unwrap();
-            })
+            });
         });
 
         g.finish();

@@ -1,4 +1,4 @@
-//! Demonstrates the PeerStats and EngineStats observability APIs.
+//! Demonstrates the `PeerStats` and `EngineStats` observability APIs.
 //!
 //! Run with:
 //!   `cargo run --example observability`

@@ -6,7 +6,7 @@ const MAX_PACING_RATE: f64 = 100_000_000.0; // 100 MB/s
 /// Initial burst allowance: typical game state syncs fit inside this without any pacing delay.
 const MAX_BURST_BYTES: f64 = 65_535.0;
 const MIN_RTT_WINDOW: Duration = Duration::from_secs(10);
-/// If SRTT > min_rtt × this factor, queue bloat is assumed and rate backs off.
+/// If SRTT > `min_rtt` × this factor, queue bloat is assumed and rate backs off.
 const RTT_INFLATION_THRESHOLD: f64 = 1.25;
 /// Cap on inter-send sleep so congestion never stalls latency-sensitive retransmits.
 const MAX_PACE_SLEEP: Duration = Duration::from_millis(10);
@@ -62,6 +62,8 @@ impl CongestionCtrl {
         self.update_pacing_rate();
     }
 
+    // RTTs in µs and datagram sizes are far below 2^52, so f64 holds them exactly.
+    #[allow(clippy::cast_precision_loss)]
     fn update_pacing_rate(&mut self) {
         let Some(srtt) = self.srtt_us else { return };
         if self.min_rtt_us == 0 || self.min_rtt_us == u64::MAX {
@@ -82,6 +84,7 @@ impl CongestionCtrl {
     /// Returns a capped sleep hint when the bucket is overdrawn.  Callers that can
     /// tolerate a small delay (retransmit batches) should honour it; latency-sensitive
     /// new sends may ignore it.
+    #[allow(clippy::cast_precision_loss)]
     pub fn consume(&mut self, bytes: usize) -> Option<Duration> {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
@@ -110,6 +113,7 @@ impl CongestionCtrl {
 
     /// `srtt / min_rtt`: close to 1.0 = path clear; above 1.25 = queue building.
     /// `None` until at least one sample has been taken.
+    #[allow(clippy::cast_precision_loss)]
     pub fn congestion_factor(&self) -> Option<f64> {
         let srtt = self.srtt_us?;
         if self.min_rtt_us == 0 || self.min_rtt_us == u64::MAX {

@@ -253,7 +253,8 @@ impl PeerState {
     }
 
     pub fn set_effective_mtu(&self, mtu: usize) {
-        self.effective_mtu.store(mtu as u32, Ordering::Relaxed);
+        self.effective_mtu
+            .store(u32::try_from(mtu).unwrap_or(u32::MAX), Ordering::Relaxed);
     }
 
     /// The remote peer's X25519 static public key, extracted from the Noise handshake.
@@ -323,6 +324,7 @@ impl PeerState {
 
     /// `true` once a Noise session is installed for this peer.
     #[must_use]
+    #[cfg_attr(not(feature = "security"), allow(clippy::unused_self))]
     pub fn has_channel(&self) -> bool {
         #[cfg(feature = "security")]
         {

@@ -4,9 +4,9 @@
 //!   `cargo run --example key_pinning --features security`
 //!
 //! Shows two scenarios:
-//!   1. Correct pin  — connect() succeeds, data flows.
-//!   2. Wrong pin    — connect() times out (the handshake is silently aborted
-//!                     server-side; no error frame is sent to prevent peer enumeration).
+//!   1. Correct pin  — `connect()` succeeds, data flows.
+//!   2. Wrong pin    — `connect()` fails with `Error::KeyMismatch` as soon as the
+//!      server's msg2 reveals its static key.
 
 use std::{net::SocketAddr, time::Duration};
 
@@ -57,8 +57,8 @@ async fn main() -> anyhow::Result<()> {
         );
         socket.send(Msg::Hi, pkt.from).await.expect("server send");
 
-        // Scenario 2 never reaches here — the engine silently aborts the handshake
-        // when the client's static key is checked against the server's pin.
+        // Scenario 2 never reaches here — the client aborts the handshake
+        // when the server's static key does not match its pin.
         // (This server has no pin; it's the *client* that pins the server key.)
     });
 
@@ -102,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
     let peer2: SocketAddr = "127.0.0.1:7771".parse()?;
 
     // ── Scenario 2: wrong pin ────────────────────────────────────────────────
-    println!("\n--- Scenario 2: wrong pin (should time out) ---");
+    println!("\n--- Scenario 2: wrong pin (should be rejected) ---");
     {
         let wrong_key = Keypair::generate();
         let wrong_public = *wrong_key.public_key();
@@ -113,16 +113,17 @@ async fn main() -> anyhow::Result<()> {
             Zudp::default()
                 .port(0)
                 .security(Keypair::generate())
-                // Wrong key — the server silently aborts the handshake; connect() hangs.
+                // Wrong key — the client rejects msg2 and connect() returns KeyMismatch.
                 .pin_remote_key(wrong_public)
                 .connect::<Msg>(peer2),
         )
         .await;
 
         match result {
-            Err(_elapsed) => println!("client  connect() timed out as expected ✓"),
+            Ok(Err(zudp::Error::KeyMismatch)) => println!("client  rejected the wrong key ✓"),
             Ok(Ok(_)) => println!("BUG: should not have connected with wrong key"),
             Ok(Err(e)) => println!("client  error: {e}"),
+            Err(_elapsed) => println!("BUG: connect() hung"),
         }
     }
 
