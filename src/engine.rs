@@ -18,7 +18,7 @@ use crate::{
     frag::FragAssembler,
     frame::Frame,
     peer::{Inbound, PeerState, RecvState},
-    socket::RawSocket,
+    socket::{self, RawSocket},
 };
 
 /// Runtime-mutable relay access control, updateable without socket rebind.
@@ -47,6 +47,11 @@ const TAIL_PROBE_DEFAULT: Duration = Duration::from_millis(100);
 /// At 1 400 B/frame and 8 192 slots this is ~11 MB peak backpressure before the engine
 /// starts dropping frames.  The engine uses `try_send` so the recv loop is never stalled.
 const INBOUND_CAP: usize = 8_192;
+
+/// Consecutive hard receive errors before an ephemeral-port socket is replaced.
+const REBIND_AFTER_ERRORS: u32 = 10;
+/// Back-off unit between retries after a hard receive error.
+const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 
 /// Smallest per-stream receive window, whatever `sent_buffer_frames` is set to.
 const MIN_RECV_WINDOW: usize = 1_024;
@@ -164,6 +169,7 @@ async fn run(
 
     // Local recv socket; replaced in-place when the socket is rebound.
     let mut recv_sock = inner.get_socket();
+    let mut recv_errors: u32 = 0;
 
     let mut ticker = time::interval(keepalive_interval / 4);
 
@@ -183,6 +189,7 @@ async fn run(
             result = recv_sock.recv_from() => {
                 match result {
                     Ok((data, from)) => {
+                        recv_errors = 0;
                         if inner.config.max_pps_per_ip > 0.0
                             && !rate_limiter.allow(from.ip())
                         {
@@ -196,8 +203,18 @@ async fn run(
                             &mut retransmit_tasks,
                         ).await;
                     }
+                    Err(e) if socket::is_transient_recv_error(&e) => {
+                        tracing::debug!(target: "zudp::engine", "transient recv error ignored: {e}");
+                    }
                     Err(e) => {
-                        tracing::warn!(target: "zudp::engine", "recv error: {e} — attempting socket rebind");
+                        recv_errors += 1;
+                        tracing::warn!(target: "zudp::engine", errors = recv_errors, "recv error: {e}");
+                        if recv_errors < REBIND_AFTER_ERRORS || inner.config.port != 0 {
+                            // A requested port is never given up: keep retrying the socket.
+                            time::sleep(RECV_ERROR_BACKOFF * recv_errors.min(50)).await;
+                            continue;
+                        }
+                        recv_errors = 0;
                         match rebind_socket(&inner).await {
                             Ok(new_sock) => {
                                 recv_sock = new_sock;
@@ -235,18 +252,12 @@ async fn run(
     tracing::info!(target: "zudp::engine", "engine task exited");
 }
 
-/// Try to bind a new socket on the same local address (same port if available, else port 0).
+/// Replace a failing ephemeral-port socket with a fresh one on a new ephemeral port.
 ///
 /// On success, replaces `inner.socket` so future `send_to` calls use the new interface.
 async fn rebind_socket(inner: &Arc<EngineInner>) -> Result<RawSocket, crate::Error> {
     let old_local = inner.get_socket().local_addr()?;
-    let new_sock = match RawSocket::bind(old_local).await {
-        Ok(s) => s,
-        Err(_) => {
-            let any = SocketAddr::new(old_local.ip(), 0);
-            RawSocket::bind(any).await?
-        }
-    };
+    let new_sock = RawSocket::bind(SocketAddr::new(old_local.ip(), 0)).await?;
     let new_addr = new_sock.local_addr()?;
     *inner.socket.write() = new_sock.clone();
     tracing::info!(target: "zudp::engine", old = %old_local, new = %new_addr, "socket rebound");
@@ -657,12 +668,13 @@ fn find_or_migrate_peer(
 ///
 /// Spawned on first contact and on every migration so the server always knows the usable path
 /// MTU — not just the client side (which probes inside `connect()`).
-fn spawn_mtu_probe(inner: &Arc<EngineInner>, peer_addr: SocketAddr) {
-    let inner = inner.clone();
+pub(crate) fn spawn_mtu_probe(inner: &Arc<EngineInner>, peer_addr: SocketAddr) {
+    let weak = Arc::downgrade(inner);
     let initial_mtu = inner.config.mtu;
     let max_mtu = inner.config.max_mtu;
     let _mtu_probe = tokio::spawn(async move {
-        let discovered = crate::mtu::probe(&inner, peer_addr, initial_mtu, max_mtu).await;
+        let discovered = crate::mtu::probe(&weak, peer_addr, initial_mtu, max_mtu).await;
+        let Some(inner) = weak.upgrade() else { return };
         if let Some(p) = inner.peers.get(&peer_addr) {
             p.set_effective_mtu(discovered);
         }
@@ -723,7 +735,8 @@ pub(crate) fn arm_tail_probe(inner: &Arc<EngineInner>, peer: &Arc<PeerState>, st
     if !peer.tail_probe_armed.lock().insert(stream_id) {
         return;
     }
-    let inner = inner.clone();
+    // Weak: a probe task must not keep the socket bound after the engine stops.
+    let weak = Arc::downgrade(inner);
     let peer = peer.clone();
     tokio::spawn(async move {
         let mut probed_seq = 0;
@@ -740,7 +753,9 @@ pub(crate) fn arm_tail_probe(inner: &Arc<EngineInner>, peer: &Arc<PeerState>, st
                         probed_seq = *seq;
                         probes = 0;
                     }
+                    let Some(inner) = weak.upgrade() else { return };
                     send_tail_probe(&inner, &peer, frame, stream_id, *seq).await;
+                    drop(inner);
                     probes += 1;
                     tokio::time::sleep(pto * 2u32.pow(probes)).await;
                 }

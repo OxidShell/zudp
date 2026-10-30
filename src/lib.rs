@@ -459,25 +459,7 @@ impl Zudp {
             socket.inner.initiate_handshake(peer).await?;
         }
         // Probe path MTU in background; sends use config.mtu until discovery completes.
-        // Total cap: 5 s.  Individual probes are already capped at 200 ms each;
-        // the outer timeout guards against extreme binary-search depths or stalled peers.
-        {
-            let inner = socket.inner.engine.clone();
-            let initial_mtu = socket.inner.config.mtu;
-            let max_mtu = socket.inner.config.max_mtu;
-            tokio::spawn(async move {
-                let discovered = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    mtu::probe(&inner, peer, initial_mtu, max_mtu),
-                )
-                .await
-                .unwrap_or(initial_mtu);
-                if let Some(p) = inner.peers.get(&peer) {
-                    p.set_effective_mtu(discovered);
-                }
-                tracing::info!(target: "zudp::mtu", peer = %peer, mtu = discovered, "path MTU discovered");
-            });
-        }
+        engine::spawn_mtu_probe(&socket.inner.engine, peer);
         Ok(ZudpConn {
             socket,
             peer: peer_addr,

@@ -1,7 +1,7 @@
 use std::{
     net::SocketAddr,
     sync::{
-        Arc,
+        Weak,
         atomic::{AtomicU16, Ordering},
     },
     time::Duration,
@@ -51,7 +51,7 @@ static PROBE_ID: AtomicU16 = AtomicU16::new(1);
 /// Returns the largest packet size (bytes) that was successfully acknowledged.
 /// Worst case: ~10 probes × 200 ms ≈ 2 s at the default ceiling; typical: 1–7 probes.
 pub async fn probe(
-    inner: &Arc<EngineInner>,
+    inner: &Weak<EngineInner>,
     peer_addr: SocketAddr,
     initial_mtu: usize,
     max_mtu: usize,
@@ -82,14 +82,20 @@ pub async fn probe(
     best
 }
 
-async fn probe_once(inner: &Arc<EngineInner>, peer_addr: SocketAddr, size: usize) -> bool {
+async fn probe_once(inner: &Weak<EngineInner>, peer_addr: SocketAddr, size: usize) -> bool {
     if size < 3 {
         return false;
     }
+    // Only hold the engine while sending, so a probe never keeps a closed socket bound.
+    let Some(inner) = inner.upgrade() else {
+        return false;
+    };
     let probe_id = PROBE_ID.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = oneshot::channel::<()>();
 
-    let peer = inner.get_or_create_peer(peer_addr);
+    let Some(peer) = inner.peers.get(&peer_addr).map(|r| r.value().clone()) else {
+        return false;
+    };
     {
         let mut acks = peer.probe_acks.lock();
         if acks.len() >= MAX_CONCURRENT_PROBES {
@@ -105,6 +111,7 @@ async fn probe_once(inner: &Arc<EngineInner>, peer_addr: SocketAddr, size: usize
         return false;
     }
 
+    drop(inner);
     let ok = tokio::time::timeout(PROBE_TIMEOUT, rx).await.is_ok();
     if !ok {
         peer.probe_acks.lock().remove(&probe_id);
