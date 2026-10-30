@@ -50,6 +50,9 @@ const INBOUND_CAP: usize = 8_192;
 
 /// Consecutive hard receive errors before an ephemeral-port socket is replaced.
 const REBIND_AFTER_ERRORS: u32 = 10;
+/// Handshake frames accepted per second per source IP, separate from the data budget.
+const HANDSHAKE_PPS_PER_IP: f64 = 20.0;
+
 /// Back-off unit between retries after a hard receive error.
 const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 
@@ -165,6 +168,11 @@ async fn run(
     // Bounded pool for NACK retransmit tasks.  Each task may sleep for CC pacing, so
     // they are spawned off the recv loop to avoid stalling it — but the pool is capped
     // to prevent unbounded task accumulation under heavy loss or adversarial NACKs.
+    // Handshakes get their own budget so a data flood from an IP cannot starve that IP's
+    // reconnect, while a handshake flood still cannot exhaust the engine.
+    let mut handshake_limiter =
+        crate::rate::RateLimiter::new(HANDSHAKE_PPS_PER_IP, HANDSHAKE_PPS_PER_IP);
+
     let mut retransmit_tasks: JoinSet<()> = JoinSet::new();
 
     // Local recv socket; replaced in-place when the socket is rebound.
@@ -190,9 +198,12 @@ async fn run(
                 match result {
                     Ok((data, from)) => {
                         recv_errors = 0;
-                        if inner.config.max_pps_per_ip > 0.0
-                            && !rate_limiter.allow(from.ip())
-                        {
+                        let limiter = if is_handshake(&data) {
+                            &mut handshake_limiter
+                        } else {
+                            &mut rate_limiter
+                        };
+                        if inner.config.max_pps_per_ip > 0.0 && !limiter.allow(from.ip()) {
                             tracing::trace!(target: "zudp::engine", %from, "rate limited");
                             inner.dropped_rate_limited.fetch_add(1, Ordering::Relaxed);
                             continue;
@@ -1116,6 +1127,19 @@ fn deliver_ready(
                 .fetch_add(bytes.len() as u64, Ordering::Relaxed);
             permit.send((bytes, from, stream_id));
         }
+    }
+}
+
+/// `true` when the datagram is a Noise handshake frame (type byte is last on the wire).
+fn is_handshake(data: &[u8]) -> bool {
+    #[cfg(feature = "security")]
+    {
+        data.last() == Some(&crate::frame::TYPE_HANDSHAKE)
+    }
+    #[cfg(not(feature = "security"))]
+    {
+        let _ = data;
+        false
     }
 }
 

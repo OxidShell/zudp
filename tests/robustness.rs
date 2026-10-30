@@ -75,3 +75,34 @@ async fn unanswered_mtu_probes_keep_the_configured_mtu() {
         "a silent peer must not pin the MTU to the minimum"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn data_flood_from_an_ip_does_not_starve_its_handshake() {
+    let server: zudp::ZudpSocket<Vec<u8>> = lo()
+        .port(0)
+        .security(zudp::Keypair::generate())
+        .listen()
+        .await
+        .unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let flood = tokio::spawn(async move {
+        let raw = UdpSocket::bind((common::LO, 0)).await.unwrap();
+        loop {
+            for _ in 0..200 {
+                let _ = raw.send_to(&[0x00], server_addr).await;
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let connect = lo()
+        .port(0)
+        .security(zudp::Keypair::generate())
+        .connect::<Vec<u8>>(server_addr);
+    let result = timeout(Duration::from_secs(3), connect).await;
+    flood.abort();
+    assert!(
+        matches!(result, Ok(Ok(_))),
+        "handshake starved by the data flood"
+    );
+}
