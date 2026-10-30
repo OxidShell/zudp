@@ -30,6 +30,8 @@ pub const MAX_NACK_SEQS: usize = 128;
 /// MtuProbe  : [zeros: padding bytes][probe_id: u16 BE][0x0B]                     (3 + padding bytes)
 /// MtuAck    : [probe_id: u16 BE][0x0C]                                            (3 bytes)
 /// Handshake : [noise msg][step: u8][version: u8][0x09]                            (3 bytes)
+/// Secure    : [ciphertext][nonce: u64 BE][index: u64 BE][0x0A]                   (17 bytes)
+/// SessionUnknown : [index: u64 BE][0x0D]                                          (9 bytes)
 /// ```
 ///
 /// The frame type byte is always last, making parsing O(1) from the tail.
@@ -48,6 +50,8 @@ pub(crate) const TYPE_HANDSHAKE: u8 = 0x09;
 const TYPE_SECURE: u8 = 0x0A;
 pub(crate) const TYPE_MTU_PROBE: u8 = 0x0B;
 const TYPE_MTU_ACK: u8 = 0x0C;
+#[cfg(feature = "security")]
+const TYPE_SESSION_UNKNOWN: u8 = 0x0D;
 
 const ADDR_V4: u8 = 0x00;
 const ADDR_V6: u8 = 0x01;
@@ -100,7 +104,17 @@ pub enum Frame {
     },
     /// Noise-encrypted data frame; `nonce` is the per-send AEAD counter.
     #[cfg(feature = "security")]
-    Secure { nonce: u64, ciphertext: Bytes },
+    Secure {
+        /// Session index the receiver chose during the handshake; finds the session even
+        /// when the sender's address changed.
+        index: u64,
+        nonce: u64,
+        ciphertext: Bytes,
+    },
+    /// "I have no session with this index": the sender lost our session (it restarted).
+    /// Unauthenticated, so it only ever prompts a re-handshake.
+    #[cfg(feature = "security")]
+    SessionUnknown { index: u64 },
     /// PLPMTUD path-MTU probe.  `padding` zero bytes are prepended so the total
     /// datagram is `padding + 3` bytes — the size being probed.
     MtuProbe { probe_id: u16, padding: usize },
@@ -222,11 +236,23 @@ impl Frame {
                 buf.freeze()
             }
             #[cfg(feature = "security")]
-            Frame::Secure { nonce, ciphertext } => {
-                let mut buf = BytesMut::with_capacity(ciphertext.len() + 9);
+            Frame::Secure {
+                index,
+                nonce,
+                ciphertext,
+            } => {
+                let mut buf = BytesMut::with_capacity(ciphertext.len() + 17);
                 buf.extend_from_slice(&ciphertext);
                 buf.put_u64(nonce);
+                buf.put_u64(index);
                 buf.put_u8(TYPE_SECURE);
+                buf.freeze()
+            }
+            #[cfg(feature = "security")]
+            Frame::SessionUnknown { index } => {
+                let mut buf = BytesMut::with_capacity(9);
+                buf.put_u64(index);
+                buf.put_u8(TYPE_SESSION_UNKNOWN);
                 buf.freeze()
             }
             Frame::MtuProbe { probe_id, padding } => {
@@ -429,14 +455,28 @@ impl Frame {
 
             #[cfg(feature = "security")]
             TYPE_SECURE => {
+                let index = pop_u64(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "secure",
+                    field: "index",
+                })?;
                 let nonce = pop_u64(&mut data).ok_or(Error::FrameTruncated {
                     frame: "secure",
                     field: "nonce",
                 })?;
                 Ok(Frame::Secure {
+                    index,
                     nonce,
                     ciphertext: data.freeze(),
                 })
+            }
+
+            #[cfg(feature = "security")]
+            TYPE_SESSION_UNKNOWN => {
+                let index = pop_u64(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "session_unknown",
+                    field: "index",
+                })?;
+                Ok(Frame::SessionUnknown { index })
             }
 
             TYPE_MTU_PROBE => {
@@ -717,17 +757,29 @@ mod tests {
     fn secure_roundtrip() {
         let ciphertext = Bytes::from_static(b"encrypted data with aead tag xxxx");
         let Frame::Secure {
+            index,
             nonce,
             ciphertext: out,
         } = roundtrip(Frame::Secure {
+            index: 0x0102_0304_0506_0708,
             nonce: 0xdead_beef_0000_0001,
             ciphertext: ciphertext.clone(),
         })
         else {
             panic!("wrong variant");
         };
+        assert_eq!(index, 0x0102_0304_0506_0708);
         assert_eq!(nonce, 0xdead_beef_0000_0001);
         assert_eq!(out, ciphertext);
+    }
+
+    #[cfg(feature = "security")]
+    #[test]
+    fn session_unknown_roundtrip() {
+        let Frame::SessionUnknown { index } = roundtrip(Frame::SessionUnknown { index: 99 }) else {
+            panic!("wrong variant");
+        };
+        assert_eq!(index, 99);
     }
 
     #[test]

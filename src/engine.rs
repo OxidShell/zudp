@@ -100,6 +100,12 @@ pub(crate) struct EngineInner {
     /// Handshakes in progress, keyed by remote address.
     #[cfg(feature = "security")]
     pub pending: Mutex<crate::handshake::PendingMap>,
+    /// Our session index → peer, so Secure frames find their session from any address.
+    #[cfg(feature = "security")]
+    pub by_index: DashMap<u64, Arc<PeerState>>,
+    /// Budget for `SessionUnknown` replies per source IP.
+    #[cfg(feature = "security")]
+    pub hint_limiter: Mutex<crate::rate::RateLimiter>,
     /// Runtime-mutable relay access policy (allowlist + table cap).
     pub relay_policy: RwLock<RelayPolicy>,
 }
@@ -189,6 +195,10 @@ impl EngineInner {
     }
 
     pub fn unindex(&self, old: &Arc<PeerState>) {
+        #[cfg(feature = "security")]
+        if let Some(index) = old.local_index() {
+            self.by_index.remove_if(&index, |_, p| Arc::ptr_eq(p, old));
+        }
         if let Some(id) = old.their_session_id() {
             self.sessions.remove_if(&id, |_, p| Arc::ptr_eq(p, old));
         }
@@ -447,40 +457,21 @@ async fn handle_incoming(
             } => {
                 handle_handshake(step, version, &payload, from, inner).await;
             }
-            Frame::Secure { nonce, ciphertext } => {
-                let Some(peer) = known_peer else {
-                    tracing::warn!(target: "zudp::engine", peer = %from, "secure frame from unknown peer");
+            Frame::Secure {
+                index,
+                nonce,
+                ciphertext,
+            } => {
+                let Some((peer, inner_frame)) =
+                    open_secure(inner, from, index, nonce, &ciphertext, recv_states).await
+                else {
                     return;
                 };
-                let plain = {
-                    let channel_guard = peer.channel.read();
-                    let Some(channel) = channel_guard.as_ref() else {
-                        tracing::warn!(target: "zudp::engine", peer = %from, "secure frame but no channel yet");
-                        return;
-                    };
-                    match channel.decrypt(nonce, &ciphertext) {
-                        Ok(p) => {
-                            peer.mark_seen();
-                            peer.mark_confirmed();
-                            p
-                        }
-                        Err(e) => {
-                            tracing::warn!(target: "zudp::engine", peer = %from, "decrypt failed: {e}");
-                            return;
-                        }
-                    }
-                    // channel_guard dropped here, before the dispatch_frame await below
-                };
-                let inner_frame = match Frame::decode(BytesMut::from(plain.as_slice())) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::warn!(target: "zudp::engine", peer = %from, "inner frame decode failed: {e}");
-                        return;
-                    }
-                };
+                // Dispatch under the session's (possibly just migrated) address so a late
+                // datagram from the old address does not split its state.
                 dispatch_frame(
                     inner_frame,
-                    from,
+                    peer.addr(),
                     inner,
                     inbound_tx,
                     recv_states,
@@ -490,6 +481,7 @@ async fn handle_incoming(
                 )
                 .await;
             }
+            Frame::SessionUnknown { index } => on_session_unknown(inner, from, index),
             frame => {
                 if inner.secured() && !plaintext_allowed(&frame) {
                     tracing::trace!(target: "zudp::engine", peer = %from, "plaintext frame on a secured socket dropped");
@@ -747,7 +739,7 @@ async fn dispatch_frame(
 
         // Handshake and Secure are handled before dispatch_frame is called.
         #[cfg(feature = "security")]
-        Frame::Handshake { .. } | Frame::Secure { .. } => {}
+        Frame::Handshake { .. } | Frame::Secure { .. } | Frame::SessionUnknown { .. } => {}
     }
 }
 
@@ -845,11 +837,8 @@ fn migrate_peer(
         .remove_if(&old_addr, |_, p| Arc::ptr_eq(p, peer));
     if let Some(placeholder) = inner.peers.insert(to, peer.clone())
         && !Arc::ptr_eq(&placeholder, peer)
-        && let Some(id) = placeholder.their_session_id()
     {
-        inner
-            .sessions
-            .remove_if(&id, |_, p| Arc::ptr_eq(p, &placeholder));
+        inner.unindex(&placeholder);
     }
     recv_states.retain(|(addr, _), _| *addr != to);
     let moved: Vec<u16> = recv_states
@@ -912,6 +901,7 @@ pub(crate) fn seal(inner: &EngineInner, peer: &PeerState, plain: &Bytes) -> Opti
             return match channel.encrypt(plain) {
                 Ok((nonce, ct)) => Some(
                     Frame::Secure {
+                        index: channel.remote_index(),
                         nonce,
                         ciphertext: Bytes::from(ct),
                     }
@@ -1122,6 +1112,8 @@ fn run_background(
 
     #[cfg(feature = "security")]
     crate::handshake::expire(inner);
+    #[cfg(feature = "security")]
+    inner.hint_limiter.lock().tick_prune();
 }
 
 fn now_micros() -> u64 {
@@ -1141,9 +1133,11 @@ async fn handle_handshake(
 ) {
     let (reply, done) = crate::handshake::on_message(inner, from, step, version, payload);
     if let Some((established, waiter)) = done {
-        install_session(inner, from, established);
+        let peer = install_session(inner, from, established);
         if let Some(waiter) = waiter {
-            let _ = waiter.send(crate::handshake::Outcome::Ready);
+            let _ = waiter.send(crate::handshake::Outcome::Ready {
+                generation: peer.generation,
+            });
         }
     }
     if let Some(reply) = reply
@@ -1163,7 +1157,14 @@ fn install_session(
     let had_session = inner.peers.get(&addr).is_some_and(|p| p.has_channel());
     let key = established.remote_static;
     let peer = inner.replace_peer(addr);
-    peer.set_channel(established.channel, key, established.finish_wire);
+    let local_index = established.channel.local_index();
+    peer.set_channel(
+        established.channel,
+        key,
+        established.finish_wire,
+        established.initiator,
+    );
+    inner.by_index.insert(local_index, peer.clone());
     peer.announce();
     inner.emit(if had_session {
         PeerEvent::Reset { addr, key }
@@ -1326,6 +1327,7 @@ fn plaintext_allowed(frame: &Frame) -> bool {
         frame,
         Frame::Handshake { .. }
             | Frame::Secure { .. }
+            | Frame::SessionUnknown { .. }
             | Frame::Probe { .. }
             | Frame::Beacon { .. }
             | Frame::MtuProbe { .. }
@@ -1346,4 +1348,86 @@ fn announce_plain_peer(inner: &EngineInner, from: SocketAddr) {
             key: None,
         });
     }
+}
+
+/// Authenticate a Secure frame and find its session by index.
+///
+/// A frame that decrypts and carries a newer nonce than any before moves the session to
+/// `from` (roaming).  A frame for an index we do not know earns the sender a rate-limited
+/// `SessionUnknown` so it can re-handshake instead of talking into the void.
+#[cfg(feature = "security")]
+async fn open_secure(
+    inner: &Arc<EngineInner>,
+    from: SocketAddr,
+    index: u64,
+    nonce: u64,
+    ciphertext: &Bytes,
+    recv_states: &mut RecvStates,
+) -> Option<(Arc<PeerState>, Frame)> {
+    let Some(peer) = inner.by_index.get(&index).map(|r| r.value().clone()) else {
+        if !crate::handshake::is_pending_index(inner, index) {
+            send_session_unknown(inner, from, index).await;
+        }
+        return None;
+    };
+    let plain = {
+        let guard = peer.channel.read();
+        let channel = guard.as_ref()?;
+        match channel.decrypt(nonce, ciphertext) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(target: "zudp::engine", peer = %from, "decrypt failed: {e}");
+                return None;
+            }
+        }
+    };
+    let newest = peer.advance_nonce(nonce);
+    if from != peer.addr() && newest {
+        migrate_peer(inner, &peer, from, recv_states);
+    }
+    peer.mark_seen();
+    peer.mark_confirmed();
+    match Frame::decode(BytesMut::from(plain.as_slice())) {
+        Ok(Frame::Handshake { .. } | Frame::Secure { .. } | Frame::SessionUnknown { .. }) => None,
+        Ok(frame) => Some((peer, frame)),
+        Err(e) => {
+            tracing::warn!(target: "zudp::engine", peer = %from, "inner frame decode failed: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(feature = "security")]
+async fn send_session_unknown(inner: &Arc<EngineInner>, to: SocketAddr, index: u64) {
+    if !inner.hint_limiter.lock().allow(to.ip()) {
+        return;
+    }
+    tracing::debug!(target: "zudp::engine", peer = %to, index, "secure frame for an unknown session");
+    let wire = Frame::SessionUnknown { index }.encode();
+    if let Err(e) = inner.get_socket().send_to(&wire, to).await {
+        tracing::debug!(target: "zudp::engine", peer = %to, "session-unknown send failed: {e}");
+    }
+}
+
+/// The remote lost the session we initiated (it restarted): handshake again in the
+/// background.  The hint is unauthenticated, so it only ever starts a handshake — the old
+/// session stays until a new one replaces it.
+#[cfg(feature = "security")]
+fn on_session_unknown(inner: &Arc<EngineInner>, from: SocketAddr, index: u64) {
+    let Some(peer) = inner.peers.get(&from).map(|r| r.value().clone()) else {
+        return;
+    };
+    if !peer.is_initiator()
+        || peer.remote_index() != Some(index)
+        || !peer.begin_rehandshake(inner.config.handshake_timeout)
+    {
+        return;
+    }
+    tracing::info!(target: "zudp::engine", peer = %from, "remote lost our session — re-handshaking");
+    let weak = Arc::downgrade(inner);
+    tokio::spawn(async move {
+        if let Err(e) = crate::handshake::initiate(&weak, from).await {
+            tracing::warn!(target: "zudp::engine", peer = %from, "re-handshake failed: {e}");
+        }
+    });
 }

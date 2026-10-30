@@ -65,6 +65,16 @@ pub struct PeerState {
     /// Our msg3, resent until the responder confirms it has the session too.
     #[cfg(feature = "security")]
     finish_wire: Mutex<Option<Bytes>>,
+    /// We initiated this session, so we are the side that re-handshakes when it is lost.
+    #[cfg(feature = "security")]
+    initiator: AtomicBool,
+    /// When a re-handshake for this session was last started.
+    #[cfg(feature = "security")]
+    rehandshake_started: Mutex<Option<Instant>>,
+    /// Highest nonce authenticated so far; only a newer frame may move the session to a
+    /// new address, so a replayed old datagram cannot redirect it.
+    #[cfg(feature = "security")]
+    highest_nonce: AtomicU64,
     /// Total bytes received from this peer (payload bytes, not wire bytes).
     pub rx_bytes: AtomicU64,
     /// Total bytes sent to this peer (payload bytes, not wire bytes).
@@ -109,6 +119,12 @@ impl PeerState {
             confirmed_notify: tokio::sync::Notify::new(),
             #[cfg(feature = "security")]
             finish_wire: Mutex::new(None),
+            #[cfg(feature = "security")]
+            initiator: AtomicBool::new(false),
+            #[cfg(feature = "security")]
+            rehandshake_started: Mutex::new(None),
+            #[cfg(feature = "security")]
+            highest_nonce: AtomicU64::new(0),
             rx_bytes: AtomicU64::new(0),
             tx_bytes: AtomicU64::new(0),
             retransmit_count: AtomicU64::new(0),
@@ -256,11 +272,53 @@ impl PeerState {
         channel: SecureChannel,
         remote_static: Option<[u8; 32]>,
         finish_wire: Option<Bytes>,
+        initiator: bool,
     ) {
+        self.initiator.store(initiator, Ordering::Release);
         *self.channel.write() = Some(channel);
         *self.remote_static_key.write() = remote_static;
         *self.finish_wire.lock() = finish_wire;
         self.confirmed.store(false, Ordering::Release);
+    }
+
+    /// Our session index for this peer, if a session is installed.
+    #[cfg(feature = "security")]
+    #[must_use]
+    pub fn local_index(&self) -> Option<u64> {
+        self.channel.read().as_ref().map(SecureChannel::local_index)
+    }
+
+    /// The remote's session index, if a session is installed.
+    #[cfg(feature = "security")]
+    #[must_use]
+    pub fn remote_index(&self) -> Option<u64> {
+        self.channel
+            .read()
+            .as_ref()
+            .map(SecureChannel::remote_index)
+    }
+
+    #[cfg(feature = "security")]
+    #[must_use]
+    pub fn is_initiator(&self) -> bool {
+        self.initiator.load(Ordering::Acquire)
+    }
+
+    /// Claim the right to start a re-handshake; `false` if one started within `cooldown`.
+    #[cfg(feature = "security")]
+    pub fn begin_rehandshake(&self, cooldown: Duration) -> bool {
+        let mut started = self.rehandshake_started.lock();
+        if started.is_some_and(|t| t.elapsed() < cooldown) {
+            return false;
+        }
+        *started = Some(Instant::now());
+        true
+    }
+
+    /// Record an authenticated nonce; `true` when it is the newest seen so far.
+    #[cfg(feature = "security")]
+    pub fn advance_nonce(&self, nonce: u64) -> bool {
+        self.highest_nonce.fetch_max(nonce, Ordering::AcqRel) < nonce
     }
 
     /// `true` once a Noise session is installed for this peer.

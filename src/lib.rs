@@ -569,6 +569,10 @@ impl Inner {
             delivery_stalled: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "security")]
             pending: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(feature = "security")]
+            by_index: DashMap::new(),
+            #[cfg(feature = "security")]
+            hint_limiter: parking_lot::Mutex::new(rate::RateLimiter::new(5.0, 5.0)),
             relay_policy: RwLock::new(engine::RelayPolicy {
                 allowlist: config.relay_allowlist.clone(),
                 max_entries: config.max_relay_entries,

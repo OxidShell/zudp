@@ -59,7 +59,10 @@ enum Role {
 /// How a handshake that someone is waiting on ended.
 #[derive(Debug)]
 pub(crate) enum Outcome {
-    Ready,
+    /// Installed as the peer state with this generation.
+    Ready {
+        generation: u64,
+    },
     KeyMismatch,
 }
 
@@ -87,7 +90,6 @@ pub(crate) type PendingMap = HashMap<SocketAddr, Pending>;
 pub(crate) struct Established {
     pub channel: SecureChannel,
     pub remote_static: Option<[u8; 32]>,
-    pub local_index: u64,
     pub initiator: bool,
     /// msg3 wire bytes; the initiator resends them until the responder answers.
     pub finish_wire: Option<Bytes>,
@@ -126,9 +128,8 @@ fn into_established(
     let transport = pending.hs.into_stateless_transport_mode()?;
     Ok((
         Established {
-            channel: SecureChannel::new(transport, pending.remote_index),
+            channel: SecureChannel::new(transport, pending.local_index, pending.remote_index),
             remote_static,
-            local_index: pending.local_index,
             initiator: pending.role == Role::Initiator,
             finish_wire,
         },
@@ -421,7 +422,9 @@ pub(crate) async fn initiate(engine: &Weak<EngineInner>, peer: SocketAddr) -> Re
     })
     .await;
     match outcome {
-        Some(Outcome::Ready) => {}
+        Some(Outcome::Ready { generation }) => {
+            return confirm(engine, peer, deadline, generation).await;
+        }
         Some(Outcome::KeyMismatch) => return Err(Error::KeyMismatch),
         None => {
             if let Some(inner) = engine.upgrade() {
@@ -430,8 +433,6 @@ pub(crate) async fn initiate(engine: &Weak<EngineInner>, peer: SocketAddr) -> Re
             return Err(Error::HandshakeTimeout { peer });
         }
     }
-
-    confirm(engine, peer, deadline).await
 }
 
 /// Resend whatever `next_wire` yields with back-off until `rx` resolves or `deadline`.
@@ -474,6 +475,7 @@ async fn confirm(
     engine: &Weak<EngineInner>,
     peer: SocketAddr,
     deadline: Instant,
+    generation: u64,
 ) -> Result<(), Error> {
     let mut delay = RETRY_MIN;
     loop {
@@ -483,6 +485,7 @@ async fn confirm(
                 .peers
                 .get(&peer)
                 .map(|r| r.value().clone())
+                .filter(|p| p.generation == generation)
                 .ok_or(Error::HandshakeTimeout { peer })?;
             (session, inner)
         };

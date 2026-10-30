@@ -97,17 +97,29 @@ impl ReplayWindow {
 pub struct SecureChannel {
     transport: Mutex<snow::StatelessTransportState>,
     send_nonce: AtomicU64,
+    /// Session index we chose; the remote stamps it on Secure frames it sends us.
+    local_index: u64,
     /// Session index the remote chose; stamped on every Secure frame we send it.
     remote_index: u64,
 }
 
 impl SecureChannel {
-    pub fn new(transport: snow::StatelessTransportState, remote_index: u64) -> Self {
+    pub fn new(
+        transport: snow::StatelessTransportState,
+        local_index: u64,
+        remote_index: u64,
+    ) -> Self {
         Self {
             transport: Mutex::new(transport),
             send_nonce: AtomicU64::new(0),
+            local_index,
             remote_index,
         }
+    }
+
+    #[must_use]
+    pub fn local_index(&self) -> u64 {
+        self.local_index
     }
 
     #[must_use]
@@ -214,8 +226,8 @@ mod tests {
         let transport_i = init.into_stateless_transport_mode().unwrap();
         let transport_r = resp.into_stateless_transport_mode().unwrap();
 
-        let ch_i = SecureChannel::new(transport_i, 1);
-        let ch_r = SecureChannel::new(transport_r, 2);
+        let ch_i = SecureChannel::new(transport_i, 1, 2);
+        let ch_r = SecureChannel::new(transport_r, 2, 1);
 
         let plaintext = b"hello zudp security";
         let (nonce, ciphertext) = ch_i.encrypt(plaintext).unwrap();
@@ -253,8 +265,8 @@ mod tests {
         let (ti, _) = handshake(&kp_a, &kp_b);
         let (_, tr_wrong) = handshake(&kp_a, &kp_c); // different session key
 
-        let ch_send = SecureChannel::new(ti, 1);
-        let ch_recv_wrong = SecureChannel::new(tr_wrong, 2);
+        let ch_send = SecureChannel::new(ti, 1, 2);
+        let ch_recv_wrong = SecureChannel::new(tr_wrong, 2, 1);
 
         let (nonce, ciphertext) = ch_send.encrypt(b"secret").unwrap();
         // Wrong session key → AEAD tag mismatch → error.
