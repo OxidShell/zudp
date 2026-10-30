@@ -59,3 +59,19 @@ async fn reliable_data_survives_a_full_inbound_channel() {
         .collect();
     assert_eq!(seqs, (0..COUNT).collect::<Vec<_>>());
 }
+
+#[tokio::test]
+async fn unanswered_mtu_probes_keep_the_configured_mtu() {
+    let silent = UdpSocket::bind((common::LO, 0)).await.unwrap();
+    let conn = lo()
+        .port(0)
+        .connect::<Vec<u8>>(silent.local_addr().unwrap())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        conn.effective_mtu(),
+        None,
+        "a silent peer must not pin the MTU to the minimum"
+    );
+}

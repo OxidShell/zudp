@@ -48,22 +48,24 @@ static PROBE_ID: AtomicU16 = AtomicU16::new(1);
 /// [`DEFAULT_MTU_CEILING`]). Each step waits up to [`PROBE_TIMEOUT`] for a
 /// [`Frame::MtuAck`].
 ///
-/// Returns the largest packet size (bytes) that was successfully acknowledged.
+/// Returns the largest packet size (bytes) that was successfully acknowledged, or `None`
+/// when no probe was acknowledged at all: an unreachable peer says nothing about the path,
+/// so the caller keeps its configured MTU instead of falling back to the minimum.
 /// Worst case: ~10 probes × 200 ms ≈ 2 s at the default ceiling; typical: 1–7 probes.
 pub async fn probe(
     inner: &Weak<EngineInner>,
     peer_addr: SocketAddr,
     initial_mtu: usize,
     max_mtu: usize,
-) -> usize {
+) -> Option<usize> {
     let max_mtu = max_mtu.clamp(MTU_MIN, MTU_ABSOLUTE_MAX);
     let initial_mtu = initial_mtu.clamp(MTU_MIN, max_mtu);
     let mut lo = MTU_MIN;
     let mut hi = max_mtu;
-    let mut best = MTU_MIN;
+    let mut best = None;
 
     if probe_once(inner, peer_addr, initial_mtu).await {
-        best = initial_mtu;
+        best = Some(initial_mtu);
         lo = initial_mtu + 1;
     } else {
         hi = initial_mtu.saturating_sub(1);
@@ -72,7 +74,7 @@ pub async fn probe(
     while lo <= hi {
         let mid = lo + (hi - lo) / 2;
         if probe_once(inner, peer_addr, mid).await {
-            best = mid;
+            best = Some(mid);
             lo = mid + 1;
         } else {
             hi = mid.saturating_sub(1);

@@ -675,6 +675,10 @@ pub(crate) fn spawn_mtu_probe(inner: &Arc<EngineInner>, peer_addr: SocketAddr) {
     let _mtu_probe = tokio::spawn(async move {
         let discovered = crate::mtu::probe(&weak, peer_addr, initial_mtu, max_mtu).await;
         let Some(inner) = weak.upgrade() else { return };
+        let Some(discovered) = discovered else {
+            tracing::debug!(target: "zudp::mtu", peer = %peer_addr, "no MTU probe answered — keeping configured MTU");
+            return;
+        };
         if let Some(p) = inner.peers.get(&peer_addr) {
             p.set_effective_mtu(discovered);
         }
