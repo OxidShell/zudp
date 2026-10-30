@@ -229,7 +229,7 @@ async fn key_pinning_wrong_key_rejected() {
         .unwrap();
     let server_addr = server.local_addr().unwrap();
 
-    // connect() blocks until channel_ready fires; with a wrong pinned key it never fires.
+    // msg2 carries the server's static key, so the client aborts as soon as it arrives.
     let result = timeout(
         Duration::from_secs(2),
         Zudp::default()
@@ -242,8 +242,8 @@ async fn key_pinning_wrong_key_rejected() {
     .await;
 
     assert!(
-        result.is_err(),
-        "connect() should time out with a wrong pinned key"
+        matches!(result, Ok(Err(zudp::Error::KeyMismatch))),
+        "connect() should fail with KeyMismatch"
     );
 }
 

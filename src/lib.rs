@@ -34,6 +34,8 @@ mod engine;
 mod error;
 mod frag;
 mod frame;
+#[cfg(feature = "security")]
+mod handshake;
 mod mtu;
 mod peer;
 mod rate;
@@ -51,6 +53,7 @@ pub use discovery::{
     AdvertiseHandle, AppId, DISCOVERY_PORT, DiscoveredPeer, Discovery, DiscoveryConfig, ScanStream,
 };
 pub use error::Error;
+pub use frame::WIRE_VERSION;
 #[cfg(feature = "security")]
 pub use security::{Keypair, ReplayWindow};
 
@@ -238,6 +241,8 @@ pub struct Config {
     /// of 1 024 covers ~1.4 MB per stream; raise this for high-bitrate streams (e.g. set
     /// to 8 192 for 30 fps H.264 video at 5 Mbps, which generates ~450 frags/s).
     pub(crate) sent_buffer_frames: usize,
+    /// How long a Noise handshake may take before it is abandoned.
+    pub(crate) handshake_timeout: Duration,
 }
 
 impl Default for Config {
@@ -260,6 +265,7 @@ impl Default for Config {
             relay_allowlist: vec![],
             max_relay_entries: 256,
             sent_buffer_frames: 1_024,
+            handshake_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -430,6 +436,15 @@ impl Zudp {
         self
     }
 
+    /// How long [`connect`](Self::connect) (and a re-handshake after the remote lost our
+    /// session) keeps retransmitting before giving up with [`Error::HandshakeTimeout`].
+    /// Default: 5 s.  Half-open responder states are dropped after the same time.
+    #[must_use]
+    pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.config.handshake_timeout = timeout;
+        self
+    }
+
     /// Bind and start listening for packets from any peer.
     ///
     /// # Errors
@@ -444,11 +459,15 @@ impl Zudp {
     /// `recv()` only delivers messages originating from `peer`.
     ///
     /// When the `security` feature is enabled and a keypair was configured via
-    /// [`.security()`](Self::security), the full three-message Noise XX handshake
-    /// completes before this function returns — the channel is encrypted and ready.
+    /// [`.security()`](Self::security), the Noise XX handshake completes before this function
+    /// returns, and so does one authenticated round trip: both ends hold the session.
+    /// Lost handshake datagrams are retransmitted with back-off.
     ///
     /// # Errors
-    /// Returns `Err` if the OS refuses to bind the requested address/port.
+    /// - [`Error::Io`] if the OS refuses to bind the requested address/port.
+    /// - [`Error::HandshakeTimeout`] if the handshake does not finish within
+    ///   [`handshake_timeout`](Self::handshake_timeout).
+    /// - [`Error::KeyMismatch`] if a key was pinned and the remote presented another one.
     pub async fn connect<M>(self, peer: SocketAddr) -> Result<ZudpConn<M>, Error> {
         let socket = ZudpSocket::new(self.config).await?;
         // Pre-create the peer entry so ZudpConn can share the live-address Arc.
@@ -456,7 +475,7 @@ impl Zudp {
         let peer_addr = peer_state.addr_arc();
         #[cfg(feature = "security")]
         if socket.inner.config.security.is_some() {
-            socket.inner.initiate_handshake(peer).await?;
+            handshake::initiate(&Arc::downgrade(&socket.inner.engine), peer).await?;
         }
         // Probe path MTU in background; sends use config.mtu until discovery completes.
         engine::spawn_mtu_probe(&socket.inner.engine, peer);
@@ -495,6 +514,8 @@ impl Inner {
             dropped_relay_blocked: AtomicU64::new(0),
             dropped_relay_cap: AtomicU64::new(0),
             delivery_stalled: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "security")]
+            pending: parking_lot::Mutex::new(std::collections::HashMap::new()),
             relay_policy: RwLock::new(engine::RelayPolicy {
                 allowlist: config.relay_allowlist.clone(),
                 max_entries: config.max_relay_entries,
@@ -509,50 +530,6 @@ impl Inner {
             _shutdown: shutdown_tx,
         });
         Ok((inner, rx))
-    }
-
-    /// Initiate a Noise XX handshake toward `peer` and block until the channel is established.
-    ///
-    /// Sends msg1, then yields to the executor while the engine drives msg2 and msg3.
-    /// Returns only after the `SecureChannel` is live, so callers cannot accidentally
-    /// send plaintext frames.  Typical wait: one network round-trip.
-    #[cfg(feature = "security")]
-    async fn initiate_handshake(&self, peer_addr: SocketAddr) -> Result<(), Error> {
-        use security::build_initiator;
-
-        let kp = self
-            .config
-            .security
-            .as_ref()
-            .expect("called only when security is Some");
-        let mut hs = build_initiator(kp)?;
-
-        let mut buf = vec![0u8; 1024];
-        let n = hs.write_message(&[], &mut buf)?;
-        buf.truncate(n);
-
-        let wire = Frame::Handshake {
-            payload: Bytes::from(buf),
-        }
-        .encode();
-
-        let peer = self.get_or_create_peer(peer_addr);
-
-        // Register the notification future BEFORE sending msg1.  `notify_one` stores a permit
-        // even if it fires before we first poll the future, so this ordering prevents any race
-        // between the server responding very quickly and our subsequent `.await`.
-        let notified = peer.channel_ready.notified();
-
-        self.engine.get_socket().send_to(&wire, peer_addr).await?;
-        *peer.handshake.lock() = Some(hs);
-
-        // Fast path: channel already established (extremely unlikely in practice but correct).
-        // Slow path: yield until the engine calls `notify_one` after msg3.
-        if peer.channel.read().is_none() {
-            notified.await;
-        }
-
-        Ok(())
     }
 
     fn alloc_msg_id(&self) -> u32 {
@@ -824,7 +801,7 @@ impl<M> ZudpSocket<M> {
             .engine
             .peers
             .get(&peer)
-            .and_then(|p| p.remote_static_key().copied())
+            .and_then(|p| p.remote_static_key())
     }
 
     /// Update the relay access policy at runtime without rebinding the socket.

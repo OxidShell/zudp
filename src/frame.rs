@@ -4,6 +4,11 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::Error;
 
+/// Version of the session wire protocol, carried in every handshake message.
+///
+/// 2: handshake frames carry step + version; Secure frames carry the receiver's session index.
+pub const WIRE_VERSION: u8 = 2;
+
 /// Maximum number of sequence numbers encoded in a single Nack frame.
 pub const MAX_NACK_SEQS: usize = 128;
 
@@ -24,6 +29,7 @@ pub const MAX_NACK_SEQS: usize = 128;
 ///                         [app_id: u64 BE][0x08]                                  (13 + meta bytes)
 /// MtuProbe  : [zeros: padding bytes][probe_id: u16 BE][0x0B]                     (3 + padding bytes)
 /// MtuAck    : [probe_id: u16 BE][0x0C]                                            (3 bytes)
+/// Handshake : [noise msg][step: u8][version: u8][0x09]                            (3 bytes)
 /// ```
 ///
 /// The frame type byte is always last, making parsing O(1) from the tail.
@@ -85,7 +91,13 @@ pub enum Frame {
     },
     /// One Noise XX handshake message (msg1, msg2, or msg3).
     #[cfg(feature = "security")]
-    Handshake { payload: Bytes },
+    Handshake {
+        /// Noise XX message number: 1 (initiator), 2 (responder), 3 (initiator).
+        step: u8,
+        /// [`WIRE_VERSION`] of the sender; peers on another version are ignored.
+        version: u8,
+        payload: Bytes,
+    },
     /// Noise-encrypted data frame; `nonce` is the per-send AEAD counter.
     #[cfg(feature = "security")]
     Secure { nonce: u64, ciphertext: Bytes },
@@ -197,9 +209,15 @@ impl Frame {
                 buf.freeze()
             }
             #[cfg(feature = "security")]
-            Frame::Handshake { payload } => {
-                let mut buf = BytesMut::with_capacity(payload.len() + 1);
+            Frame::Handshake {
+                step,
+                version,
+                payload,
+            } => {
+                let mut buf = BytesMut::with_capacity(payload.len() + 3);
                 buf.extend_from_slice(&payload);
+                buf.put_u8(step);
+                buf.put_u8(version);
                 buf.put_u8(TYPE_HANDSHAKE);
                 buf.freeze()
             }
@@ -393,9 +411,21 @@ impl Frame {
             }
 
             #[cfg(feature = "security")]
-            TYPE_HANDSHAKE => Ok(Frame::Handshake {
-                payload: data.freeze(),
-            }),
+            TYPE_HANDSHAKE => {
+                let version = pop_u8(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "handshake",
+                    field: "version",
+                })?;
+                let step = pop_u8(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "handshake",
+                    field: "step",
+                })?;
+                Ok(Frame::Handshake {
+                    step,
+                    version,
+                    payload: data.freeze(),
+                })
+            }
 
             #[cfg(feature = "security")]
             TYPE_SECURE => {
@@ -667,12 +697,19 @@ mod tests {
     #[test]
     fn handshake_roundtrip() {
         let payload = Bytes::from_static(b"noise handshake msg");
-        let Frame::Handshake { payload: out } = roundtrip(Frame::Handshake {
+        let Frame::Handshake {
+            step,
+            version,
+            payload: out,
+        } = roundtrip(Frame::Handshake {
+            step: 2,
+            version: WIRE_VERSION,
             payload: payload.clone(),
-        }) else {
+        })
+        else {
             panic!("wrong variant");
         };
-        assert_eq!(out, payload);
+        assert_eq!((step, version, out), (2, WIRE_VERSION, payload));
     }
 
     #[cfg(feature = "security")]

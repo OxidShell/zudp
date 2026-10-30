@@ -76,6 +76,7 @@ async fn unanswered_mtu_probes_keep_the_configured_mtu() {
     );
 }
 
+#[cfg(feature = "security")]
 #[tokio::test(flavor = "multi_thread")]
 async fn data_flood_from_an_ip_does_not_starve_its_handshake() {
     let server: zudp::ZudpSocket<Vec<u8>> = lo()

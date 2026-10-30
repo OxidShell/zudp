@@ -64,6 +64,12 @@ pub enum Error {
     #[cfg(feature = "security")]
     KeyMismatch,
 
+    /// The Noise handshake with `peer` did not complete in time.
+    #[cfg(feature = "security")]
+    HandshakeTimeout {
+        peer: SocketAddr,
+    },
+
     /// Packet dropped — source IP exceeded configured rate limit.
     Throttled,
 }
@@ -115,6 +121,10 @@ impl fmt::Display for Error {
             Self::Security(e) => write!(f, "security: {e}"),
             #[cfg(feature = "security")]
             Self::KeyMismatch => f.write_str("security: remote key does not match pinned key"),
+            #[cfg(feature = "security")]
+            Self::HandshakeTimeout { peer } => {
+                write!(f, "security: handshake with {peer} timed out")
+            }
             Self::Throttled => f.write_str("packet dropped: rate limit exceeded"),
         }
     }

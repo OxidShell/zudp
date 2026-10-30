@@ -37,6 +37,7 @@ dashmap = "6"
 windows-sys = { version = "0.60", features = ["Win32_Networking_WinSock", "Win32_System_IO"] }
 
 [dev-dependencies]
+snow = "0.9"
 anyhow = "1"
 tracing-subscriber = "0.3"
 criterion = "0.5"

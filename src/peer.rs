@@ -1,5 +1,3 @@
-#[cfg(feature = "security")]
-use std::sync::OnceLock;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     hash::{Hash, Hasher},
@@ -10,6 +8,9 @@ use std::{
     },
     time::{Duration, Instant, SystemTime},
 };
+
+#[cfg(feature = "security")]
+use std::sync::atomic::AtomicBool;
 
 use tokio::sync::oneshot;
 
@@ -47,21 +48,22 @@ pub struct PeerState {
     effective_mtu: AtomicU32,
     /// Pending MTU probe acks: maps `probe_id → oneshot sender` woken by the engine on MtuAck.
     pub probe_acks: Mutex<HashMap<u16, oneshot::Sender<()>>>,
-    /// In-progress Noise XX handshake state; `None` once the channel is established.
-    #[cfg(feature = "security")]
-    pub handshake: Mutex<Option<snow::HandshakeState>>,
     /// Established Noise transport channel; replaced on every completed handshake so
     /// reconnecting peers get fresh keys instead of silently reusing stale ones.
     #[cfg(feature = "security")]
     pub channel: RwLock<Option<SecureChannel>>,
-    /// The remote peer's X25519 static public key, extracted from the Noise handshake.
-    /// Set once when the handshake finishes; `None` until then.
+    /// The remote peer's X25519 static public key from the handshake that set `channel`.
     #[cfg(feature = "security")]
-    pub remote_static_key: OnceLock<[u8; 32]>,
-    /// Notified (via `notify_one`) when `channel` transitions from `None` to `Some`.
-    /// `connect()` awaits this so it never returns before encryption is active.
+    remote_static_key: RwLock<Option<[u8; 32]>>,
+    /// Set once an authenticated frame arrived on the current channel.
     #[cfg(feature = "security")]
-    pub channel_ready: tokio::sync::Notify,
+    confirmed: AtomicBool,
+    /// Woken (`notify_waiters`) when `confirmed` becomes true.
+    #[cfg(feature = "security")]
+    pub confirmed_notify: tokio::sync::Notify,
+    /// Our msg3, resent until the responder confirms it has the session too.
+    #[cfg(feature = "security")]
+    finish_wire: Mutex<Option<Bytes>>,
     /// Total bytes received from this peer (payload bytes, not wire bytes).
     pub rx_bytes: AtomicU64,
     /// Total bytes sent to this peer (payload bytes, not wire bytes).
@@ -78,7 +80,7 @@ impl PeerState {
         let now = Instant::now();
         Self {
             addr: Arc::new(RwLock::new(addr)),
-            my_session_id: gen_session_id(),
+            my_session_id: random_u64(),
             their_session_id: Mutex::new(None),
             next_seqs: Mutex::new(HashMap::new()),
             sent: Mutex::new(HashMap::new()),
@@ -88,13 +90,15 @@ impl PeerState {
             effective_mtu: AtomicU32::new(0),
             probe_acks: Mutex::new(HashMap::new()),
             #[cfg(feature = "security")]
-            handshake: Mutex::new(None),
-            #[cfg(feature = "security")]
             channel: RwLock::new(None),
             #[cfg(feature = "security")]
-            remote_static_key: OnceLock::new(),
+            remote_static_key: RwLock::new(None),
             #[cfg(feature = "security")]
-            channel_ready: tokio::sync::Notify::new(),
+            confirmed: AtomicBool::new(false),
+            #[cfg(feature = "security")]
+            confirmed_notify: tokio::sync::Notify::new(),
+            #[cfg(feature = "security")]
+            finish_wire: Mutex::new(None),
             rx_bytes: AtomicU64::new(0),
             tx_bytes: AtomicU64::new(0),
             retransmit_count: AtomicU64::new(0),
@@ -221,26 +225,79 @@ impl PeerState {
     /// Returns `None` until the handshake completes.
     #[cfg(feature = "security")]
     #[must_use]
-    pub fn remote_static_key(&self) -> Option<&[u8; 32]> {
-        self.remote_static_key.get()
+    pub fn remote_static_key(&self) -> Option<[u8; 32]> {
+        *self.remote_static_key.read()
+    }
+
+    /// Install a freshly negotiated channel.
+    #[cfg(feature = "security")]
+    pub fn set_channel(
+        &self,
+        channel: SecureChannel,
+        remote_static: Option<[u8; 32]>,
+        finish_wire: Option<Bytes>,
+    ) {
+        *self.channel.write() = Some(channel);
+        *self.remote_static_key.write() = remote_static;
+        *self.finish_wire.lock() = finish_wire;
+        self.confirmed.store(false, Ordering::Release);
+    }
+
+    /// `true` once a Noise session is installed for this peer.
+    #[must_use]
+    pub fn has_channel(&self) -> bool {
+        #[cfg(feature = "security")]
+        {
+            self.channel.read().is_some()
+        }
+        #[cfg(not(feature = "security"))]
+        {
+            false
+        }
+    }
+
+    /// Record that the remote proved it holds the current session.
+    #[cfg(feature = "security")]
+    pub fn mark_confirmed(&self) {
+        if !self.confirmed.swap(true, Ordering::AcqRel) {
+            self.confirmed_notify.notify_waiters();
+        }
+    }
+
+    #[cfg(feature = "security")]
+    #[must_use]
+    pub fn is_confirmed(&self) -> bool {
+        self.confirmed.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "security")]
+    #[must_use]
+    pub fn finish_wire(&self) -> Option<Bytes> {
+        self.finish_wire.lock().clone()
+    }
+
+    #[cfg(feature = "security")]
+    pub fn clear_finish_wire(&self) {
+        self.finish_wire.lock().take();
     }
 }
 
-/// Generate a non-cryptographic but sufficiently unique session ID without adding dependencies.
-fn gen_session_id() -> u64 {
-    use std::collections::hash_map::DefaultHasher;
+/// A random, non-cryptographic `u64` (session ids and session indices).
+///
+/// `RandomState` is seeded per process from the OS, so values differ across restarts; the
+/// counter keeps them distinct within one.
+#[must_use]
+pub fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, RandomState};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
-    let mut h = DefaultHasher::new();
+    let mut h = RandomState::new().build_hasher();
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .hash(&mut h);
     SEQ.fetch_add(1, Ordering::Relaxed).hash(&mut h);
-    // Stack address adds a bit of process-specific entropy.
-    let addr: u64 = (&h as *const _ as usize) as u64;
-    addr.hash(&mut h);
     h.finish()
 }
 

@@ -82,6 +82,9 @@ pub(crate) struct EngineInner {
     /// Set when a reliable stream could not deliver because the inbound channel was full;
     /// the engine then waits for capacity and drains every stream.
     pub delivery_stalled: AtomicBool,
+    /// Handshakes in progress, keyed by remote address.
+    #[cfg(feature = "security")]
+    pub pending: Mutex<crate::handshake::PendingMap>,
     /// Runtime-mutable relay access policy (allowlist + table cap).
     pub relay_policy: RwLock<RelayPolicy>,
 }
@@ -203,7 +206,10 @@ async fn run(
                         } else {
                             &mut rate_limiter
                         };
-                        if inner.config.max_pps_per_ip > 0.0 && !limiter.allow(from.ip()) {
+                        // Addresses that completed a handshake are not throttled; the budget is
+                        // for traffic nobody has authenticated yet.
+                        let trusted = inner.peers.get(&from).is_some_and(|p| p.has_channel());
+                        if inner.config.max_pps_per_ip > 0.0 && !trusted && !limiter.allow(from.ip()) {
                             tracing::trace!(target: "zudp::engine", %from, "rate limited");
                             inner.dropped_rate_limited.fetch_add(1, Ordering::Relaxed);
                             continue;
@@ -331,8 +337,12 @@ async fn handle_incoming(
     #[cfg(feature = "security")]
     {
         match frame {
-            Frame::Handshake { payload } => {
-                handle_handshake(payload, from, inner).await;
+            Frame::Handshake {
+                step,
+                version,
+                payload,
+            } => {
+                handle_handshake(step, version, &payload, from, inner).await;
             }
             Frame::Secure { nonce, ciphertext } => {
                 let Some(peer) = known_peer else {
@@ -346,7 +356,10 @@ async fn handle_incoming(
                         return;
                     };
                     match channel.decrypt(nonce, &ciphertext) {
-                        Ok(p) => p,
+                        Ok(p) => {
+                            peer.mark_confirmed();
+                            p
+                        }
                         Err(e) => {
                             tracing::warn!(target: "zudp::engine", peer = %from, "decrypt failed: {e}");
                             return;
@@ -903,6 +916,9 @@ fn run_background(
         .retain(|_, (_, last_seen_gen)| current_gen.wrapping_sub(*last_seen_gen) < relay_ttl_ticks);
 
     rate_limiter.tick_prune();
+
+    #[cfg(feature = "security")]
+    crate::handshake::expire(inner);
 }
 
 fn now_micros() -> u64 {
@@ -911,158 +927,93 @@ fn now_micros() -> u64 {
         .map_or(0u64, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
-/// Drive a Noise XX handshake step on behalf of the engine.
-///
-/// - If no handshake exists for `from` yet, creates a responder state (server role).
-/// - If a handshake already exists (initiator stored it before sending msg1), reads the
-///   incoming message and, if it's the initiator's turn, writes the next message.
-/// - When both sides finish all three messages, transitions to `StatelessTransportState`.
-/// - If `inner.config.remote_key` is set, the remote's static key is verified after the
-///   handshake finishes.  A mismatch silently aborts — no channel is established and
-///   `connect()` will time out on the other side.
+/// Feed one handshake message to the driver, answer it, and install a finished session.
 #[cfg(feature = "security")]
-async fn handle_handshake(payload: Bytes, from: SocketAddr, inner: &Arc<EngineInner>) {
-    use crate::security::{SecureChannel, build_responder};
-
-    let Some(kp) = inner.keypair.as_ref() else {
-        tracing::debug!(target: "zudp::engine", peer = %from, "handshake ignored — security not configured");
-        return;
-    };
-
-    let peer = inner.get_or_create_peer(from);
-
-    // Initialise as responder if this peer's handshake hasn't started yet.
+async fn handle_handshake(
+    step: u8,
+    version: u8,
+    payload: &Bytes,
+    from: SocketAddr,
+    inner: &Arc<EngineInner>,
+) {
+    let (reply, done) = crate::handshake::on_message(inner, from, step, version, payload);
+    if let Some((established, waiter)) = done {
+        install_session(inner, from, established);
+        if let Some(waiter) = waiter {
+            let _ = waiter.send(crate::handshake::Outcome::Ready);
+        }
+    }
+    if let Some(reply) = reply
+        && let Err(e) = inner.get_socket().send_to(&reply, from).await
     {
-        let mut guard = peer.handshake.lock();
-        if guard.is_none() {
-            match build_responder(kp) {
-                Ok(hs) => *guard = Some(hs),
-                Err(e) => {
-                    tracing::error!(target: "zudp::engine", peer = %from, "build_responder: {e}");
-                    return;
-                }
-            }
-        }
-    }
-
-    // Process the incoming message; determine if we need to reply and/or finish.
-    // Returns (optional reply, optional finished handshake, key_mismatch).
-    let outcome = 'step: {
-        let mut guard = peer.handshake.lock();
-        let hs = guard.as_mut().expect("initialised above");
-
-        let mut rbuf = vec![0u8; 1024];
-        if let Err(e) = hs.read_message(&payload, &mut rbuf) {
-            tracing::warn!(target: "zudp::engine", peer = %from, "handshake read: {e}");
-            return;
-        }
-
-        // After reading, check if the handshake is done (responder finishes on msg3).
-        let finished_after_read = hs.is_handshake_finished();
-
-        if finished_after_read {
-            // Key pinning check — must happen before consuming state.
-            if !check_pinned_key(hs, inner, from) {
-                let _ = guard.take();
-                break 'step (None::<Bytes>, None, true);
-            }
-            let hs_owned = guard.take().unwrap();
-            break 'step (None, Some(hs_owned), false);
-        }
-
-        // Still our turn to write (msg2 for responder, msg3 for initiator).
-        let mut wbuf = vec![0u8; 1024];
-        let n = match hs.write_message(&[], &mut wbuf) {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(target: "zudp::engine", peer = %from, "handshake write: {e}");
-                return;
-            }
-        };
-        wbuf.truncate(n);
-        let reply = Bytes::from(wbuf);
-
-        // After writing, check again (initiator finishes on msg3 write).
-        let finished_after_write = hs.is_handshake_finished();
-        if finished_after_write {
-            // Key pinning check — must happen before consuming state.
-            if !check_pinned_key(hs, inner, from) {
-                let _ = guard.take();
-                // Don't send msg3 either — abort silently.
-                break 'step (None, None, true);
-            }
-        }
-
-        let hs_owned = if finished_after_write {
-            guard.take()
-        } else {
-            None
-        };
-        (Some(reply), hs_owned, false)
-    }; // handshake lock released
-
-    let (reply, finished_hs, key_mismatch) = outcome;
-
-    if key_mismatch {
-        tracing::warn!(target: "zudp::security", peer = %from, "handshake aborted — key mismatch");
-        return;
-    }
-
-    if let Some(reply_bytes) = reply {
-        let wire = Frame::Handshake {
-            payload: reply_bytes,
-        }
-        .encode();
-        if let Err(e) = inner.get_socket().send_to(&wire, from).await {
-            tracing::warn!(target: "zudp::engine", peer = %from, "handshake send: {e}");
-        }
-    }
-
-    if let Some(hs) = finished_hs {
-        // Extract and persist the remote static key before consuming the handshake state.
-        if let Some(remote) = hs.get_remote_static() {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(remote);
-            // `set` is a no-op if already initialised; safe to ignore the result.
-            let _ = peer.remote_static_key.set(key);
-        }
-        match hs.into_stateless_transport_mode() {
-            Ok(transport) => {
-                *peer.channel.write() = Some(SecureChannel::new(transport));
-                // Unblock connect() which may be waiting for encryption to be active.
-                peer.channel_ready.notify_one();
-                tracing::info!(target: "zudp::engine", peer = %from, "Noise XX handshake complete");
-            }
-            Err(e) => {
-                tracing::error!(target: "zudp::engine", peer = %from, "into_transport_mode: {e}");
-            }
-        }
+        tracing::warn!(target: "zudp::engine", peer = %from, "handshake send: {e}");
     }
 }
 
-/// Check the remote's static key against the pinned key in config.
-///
-/// Returns `true` if the key is acceptable (no pinning, or pinned key matches).
-/// Returns `false` and logs a warning if the key is pinned and doesn't match.
-/// Must be called while the `HandshakeState` is still active (before consuming it).
+/// Make `established` the live session for `addr`.
 #[cfg(feature = "security")]
-fn check_pinned_key(hs: &snow::HandshakeState, inner: &Arc<EngineInner>, from: SocketAddr) -> bool {
-    let Some(expected) = &inner.config.remote_key else {
-        return true;
-    };
-    match hs.get_remote_static() {
-        Some(remote) if remote == expected.as_slice() => true,
-        Some(_) => {
-            tracing::warn!(target: "zudp::security", peer = %from, "key mismatch — remote key does not match pinned key");
-            false
-        }
-        None => {
-            tracing::warn!(target: "zudp::security", peer = %from, "key pinning: remote static not available");
-            false
-        }
+fn install_session(
+    inner: &Arc<EngineInner>,
+    addr: SocketAddr,
+    established: crate::handshake::Established,
+) -> Arc<PeerState> {
+    let peer = inner.get_or_create_peer(addr);
+    peer.set_channel(
+        established.channel,
+        established.remote_static,
+        established.finish_wire,
+    );
+    tracing::info!(target: "zudp::engine", peer = %addr, initiator = established.initiator, "Noise XX handshake complete");
+    peer
+}
+
+/// An encrypted (when possible) keepalive Ping for `peer`.
+#[cfg(feature = "security")]
+pub(crate) fn ping_for(inner: &EngineInner, peer: &PeerState) -> Bytes {
+    let _ = inner;
+    secure_frame(
+        peer,
+        Frame::Ping {
+            echo: now_micros(),
+            session_id: peer.my_session_id,
+        },
+    )
+}
+
+/// `true` when the datagram is a Noise handshake frame (type byte is last on the wire).
+fn is_handshake(data: &[u8]) -> bool {
+    #[cfg(feature = "security")]
+    {
+        data.last() == Some(&crate::frame::TYPE_HANDSHAKE)
+    }
+    #[cfg(not(feature = "security"))]
+    {
+        let _ = data;
+        false
     }
 }
 
+/// Retry delivery on every stream after the application freed inbound capacity.
+fn drain_all_streams(
+    inner: &Arc<EngineInner>,
+    recv_states: &mut RecvStates,
+    inbound_tx: &mpsc::Sender<(Bytes, SocketAddr, u16)>,
+) {
+    for (&(addr, stream_id), (recv, frag)) in recv_states.iter_mut() {
+        let Some(peer) = inner.peers.get(&addr).map(|r| r.value().clone()) else {
+            continue;
+        };
+        deliver_ready(
+            recv,
+            frag,
+            &peer,
+            addr,
+            stream_id,
+            inbound_tx,
+            &inner.delivery_stalled,
+        );
+    }
+}
 /// Buffer one reliable frame, NACK what is missing before it, and deliver whatever is now
 /// in order.
 #[allow(clippy::too_many_arguments)]
@@ -1127,40 +1078,5 @@ fn deliver_ready(
                 .fetch_add(bytes.len() as u64, Ordering::Relaxed);
             permit.send((bytes, from, stream_id));
         }
-    }
-}
-
-/// `true` when the datagram is a Noise handshake frame (type byte is last on the wire).
-fn is_handshake(data: &[u8]) -> bool {
-    #[cfg(feature = "security")]
-    {
-        data.last() == Some(&crate::frame::TYPE_HANDSHAKE)
-    }
-    #[cfg(not(feature = "security"))]
-    {
-        let _ = data;
-        false
-    }
-}
-
-/// Retry delivery on every stream after the application freed inbound capacity.
-fn drain_all_streams(
-    inner: &Arc<EngineInner>,
-    recv_states: &mut RecvStates,
-    inbound_tx: &mpsc::Sender<(Bytes, SocketAddr, u16)>,
-) {
-    for (&(addr, stream_id), (recv, frag)) in recv_states.iter_mut() {
-        let Some(peer) = inner.peers.get(&addr).map(|r| r.value().clone()) else {
-            continue;
-        };
-        deliver_ready(
-            recv,
-            frag,
-            &peer,
-            addr,
-            stream_id,
-            inbound_tx,
-            &inner.delivery_stalled,
-        );
     }
 }
