@@ -17,6 +17,7 @@ use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 
 use crate::cc::CongestionCtrl;
+use crate::frame::MAX_NACK_SEQS;
 #[cfg(feature = "security")]
 use crate::security::SecureChannel;
 
@@ -258,68 +259,82 @@ pub enum Inbound {
 }
 
 /// Per-(peer, stream) receive state, owned exclusively by the engine task.
+///
+/// Frames are buffered by sequence number and handed out in order through
+/// [`pop_ready`](Self::pop_ready), so a frame is only consumed once the caller has
+/// room to deliver it.
 pub struct RecvState {
-    pub expected_seq: u64,
+    expected_seq: u64,
     buf: BTreeMap<u64, Inbound>,
+    /// Frames at or beyond `expected_seq + window` are dropped: they cannot be NACKed back
+    /// into place anyway, and accepting them would let one forged sequence number make the
+    /// receiver track an unbounded gap.
+    window: u64,
     /// When a sequence gap was first detected.  Used by [`prune_gap`](Self::prune_gap)
-    /// to discard the backlog when the missing fragment can no longer be retransmitted
-    /// (i.e. the sender evicted it from its sent buffer and never NACKed it back).
+    /// to skip a hole the sender can no longer retransmit.
     gap_since: Option<Instant>,
 }
 
 impl RecvState {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(window: usize) -> Self {
         Self {
             expected_seq: 1,
             buf: BTreeMap::new(),
+            window: u64::try_from(window).unwrap_or(u64::MAX).max(1),
             gap_since: None,
         }
     }
 
-    /// Process an incoming reliable payload at `seq`.
+    /// Buffer a reliable payload received at `seq`.
     ///
-    /// Returns:
-    /// - `ready`: in-order payloads available for delivery (possibly multiple, after gap fills).
-    /// - `nack_seqs`: sequence numbers still missing before `seq` (already-buffered ones
-    ///   are not asked for again).
-    pub fn ingest(&mut self, seq: u64, payload: Inbound) -> (Vec<Inbound>, Vec<u64>) {
-        if seq < self.expected_seq {
-            return (vec![], vec![]);
+    /// Returns the sequence numbers still missing before `seq` (at most
+    /// [`MAX_NACK_SEQS`]); already-buffered ones are not asked for again.  With
+    /// `allow_reorder == false` only the next in-order frame is accepted.
+    pub fn ingest(&mut self, seq: u64, payload: Inbound, allow_reorder: bool) -> Vec<u64> {
+        if seq < self.expected_seq
+            || seq - self.expected_seq >= self.window
+            || (seq != self.expected_seq && !allow_reorder)
+            || self.buf.contains_key(&seq)
+        {
+            return vec![];
         }
-
-        if seq > self.expected_seq {
-            if self.gap_since.is_none() {
-                self.gap_since = Some(Instant::now());
-            }
-            let nack_seqs: Vec<u64> = (self.expected_seq..seq)
-                .filter(|missing| !self.buf.contains_key(missing))
-                .collect();
-            self.buf.insert(seq, payload);
-            return (vec![], nack_seqs);
-        }
-
-        // In-order: deliver immediately and drain any consecutive buffered entries.
-        self.gap_since = None;
-        let mut ready = vec![payload];
-        self.expected_seq += 1;
-        while let Some(next) = self.buf.remove(&self.expected_seq) {
-            ready.push(next);
-            self.expected_seq += 1;
-        }
-        // If buf still has buffered entries there is a new gap ahead; start timing it now.
-        if !self.buf.is_empty() {
-            self.gap_since = Some(Instant::now());
-        }
-        (ready, vec![])
+        let nack_seqs = (self.expected_seq..seq)
+            .filter(|missing| !self.buf.contains_key(missing))
+            .take(MAX_NACK_SEQS)
+            .collect();
+        self.buf.insert(seq, payload);
+        self.refresh_gap();
+        nack_seqs
     }
 
-    /// Advance past a gap that has been unresolved for longer than `max_age`.
+    /// `true` when the next in-order payload is buffered.
+    #[must_use]
+    pub fn has_ready(&self) -> bool {
+        self.buf.contains_key(&self.expected_seq)
+    }
+
+    /// Take the next in-order payload, if it has arrived.
+    pub fn pop_ready(&mut self) -> Option<Inbound> {
+        let next = self.buf.remove(&self.expected_seq)?;
+        self.expected_seq += 1;
+        self.refresh_gap();
+        Some(next)
+    }
+
+    fn refresh_gap(&mut self) {
+        if self.buf.is_empty() || self.has_ready() {
+            self.gap_since = None;
+        } else if self.gap_since.is_none() {
+            self.gap_since = Some(Instant::now());
+        }
+    }
+
+    /// Skip a gap that has been unresolved for longer than `max_age`.
     ///
     /// Called periodically by the engine background task.  Returns `true` when a skip
-    /// occurred so the caller can emit a warning.  Discards the entire backlog — the
-    /// stream resyncs on the next in-order delivery (H.264 picks up from the next
-    /// I-frame; other streams tolerate a small discontinuity).
+    /// occurred so the caller can emit a warning.  Only the missing sequence numbers are
+    /// skipped; everything buffered after the hole is still delivered.
     pub fn prune_gap(&mut self, max_age: Duration) -> bool {
         let Some(since) = self.gap_since else {
             return false;
@@ -327,10 +342,8 @@ impl RecvState {
         if since.elapsed() < max_age {
             return false;
         }
-        // Gap timed out — discard buffered backlog and advance expected_seq past everything.
-        if let Some((&last_seq, _)) = self.buf.last_key_value() {
-            self.expected_seq = last_seq + 1;
-            self.buf.clear();
+        if let Some((&first, _)) = self.buf.first_key_value() {
+            self.expected_seq = first;
         }
         self.gap_since = None;
         true
@@ -341,14 +354,72 @@ impl RecvState {
 mod tests {
     use super::*;
 
+    fn data() -> Inbound {
+        Inbound::Data(Bytes::from_static(b"x"))
+    }
+
+    fn drain(recv: &mut RecvState) -> usize {
+        std::iter::from_fn(|| recv.pop_ready()).count()
+    }
+
     #[test]
     fn nack_skips_seqs_already_buffered() {
-        let mut recv = RecvState::new();
-        let data = || Inbound::Data(Bytes::from_static(b"x"));
-        assert_eq!(recv.ingest(3, data()).1, vec![1, 2]);
-        assert_eq!(recv.ingest(5, data()).1, vec![1, 2, 4], "3 is buffered");
-        let (ready, nacks) = recv.ingest(1, data());
-        assert!(nacks.is_empty());
-        assert_eq!(ready.len(), 1, "2 still missing, so only 1 is delivered");
+        let mut recv = RecvState::new(1024);
+        assert_eq!(recv.ingest(3, data(), true), vec![1, 2]);
+        assert_eq!(recv.ingest(5, data(), true), vec![1, 2, 4], "3 is buffered");
+        assert!(recv.ingest(1, data(), true).is_empty());
+        assert_eq!(
+            drain(&mut recv),
+            1,
+            "2 still missing, so only 1 is delivered"
+        );
+    }
+
+    #[test]
+    fn huge_sequence_number_is_dropped_without_allocating() {
+        let mut recv = RecvState::new(1024);
+        assert!(recv.ingest(u64::MAX - 1, data(), true).is_empty());
+        assert!(recv.ingest(1 << 40, data(), true).is_empty());
+        assert!(recv.buf.is_empty());
+        assert!(recv.ingest(1, data(), true).is_empty());
+        assert_eq!(drain(&mut recv), 1);
+    }
+
+    #[test]
+    fn nack_list_is_capped() {
+        let mut recv = RecvState::new(4096);
+        assert_eq!(recv.ingest(4000, data(), true).len(), MAX_NACK_SEQS);
+    }
+
+    #[test]
+    fn undelivered_frames_stay_buffered() {
+        let mut recv = RecvState::new(1024);
+        recv.ingest(1, data(), true);
+        recv.ingest(2, data(), true);
+        assert!(recv.has_ready());
+        assert!(
+            recv.ingest(1, data(), true).is_empty(),
+            "duplicate of a buffered frame"
+        );
+        assert_eq!(drain(&mut recv), 2);
+        assert!(!recv.has_ready());
+    }
+
+    #[test]
+    fn in_order_only_rejects_out_of_order() {
+        let mut recv = RecvState::new(1024);
+        assert!(recv.ingest(2, data(), false).is_empty());
+        assert!(!recv.has_ready());
+        recv.ingest(1, data(), false);
+        assert_eq!(drain(&mut recv), 1);
+    }
+
+    #[test]
+    fn gap_timeout_keeps_frames_after_the_hole() {
+        let mut recv = RecvState::new(1024);
+        recv.ingest(3, data(), true);
+        recv.ingest(4, data(), true);
+        assert!(recv.prune_gap(Duration::ZERO));
+        assert_eq!(drain(&mut recv), 2);
     }
 }

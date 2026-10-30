@@ -512,6 +512,7 @@ impl Inner {
             dropped_peer_cap: AtomicU64::new(0),
             dropped_relay_blocked: AtomicU64::new(0),
             dropped_relay_cap: AtomicU64::new(0),
+            delivery_stalled: std::sync::atomic::AtomicBool::new(false),
             relay_policy: RwLock::new(engine::RelayPolicy {
                 allowlist: config.relay_allowlist.clone(),
                 max_entries: config.max_relay_entries,

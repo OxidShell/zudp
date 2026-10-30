@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -48,6 +48,11 @@ const TAIL_PROBE_DEFAULT: Duration = Duration::from_millis(100);
 /// starts dropping frames.  The engine uses `try_send` so the recv loop is never stalled.
 const INBOUND_CAP: usize = 8_192;
 
+/// Smallest per-stream receive window, whatever `sent_buffer_frames` is set to.
+const MIN_RECV_WINDOW: usize = 1_024;
+
+pub(crate) type RecvStates = HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>;
+
 /// State shared between the engine task and the [`crate::ZudpSocket`] / [`crate::ZudpConn`] handles.
 pub(crate) struct EngineInner {
     /// Current socket; replaced atomically on rebind.  Use [`get_socket`] to obtain a cheap clone.
@@ -66,6 +71,9 @@ pub(crate) struct EngineInner {
     pub dropped_peer_cap: AtomicU64,
     pub dropped_relay_blocked: AtomicU64,
     pub dropped_relay_cap: AtomicU64,
+    /// Set when a reliable stream could not deliver because the inbound channel was full;
+    /// the engine then waits for capacity and drains every stream.
+    pub delivery_stalled: AtomicBool,
     /// Runtime-mutable relay access policy (allowlist + table cap).
     pub relay_policy: RwLock<RelayPolicy>,
 }
@@ -126,7 +134,7 @@ async fn run(
     mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     // Keyed by (peer_addr, stream_id) so each stream has independent reorder + reassembly.
-    let mut recv_states: HashMap<(SocketAddr, u16), (RecvState, FragAssembler)> = HashMap::new();
+    let mut recv_states: RecvStates = HashMap::new();
     // Stateful relay table: maps server_addr → (client_addr, last_seen_gen).
     // `last_seen_gen` is the relay_gen value at the last Frame::Relay from that client.
     // Entries pruned when (relay_gen - last_seen_gen) >= relay_ttl_ticks.
@@ -207,6 +215,12 @@ async fn run(
                 }
             }
 
+            permit = inbound_tx.reserve(), if inner.delivery_stalled.load(Ordering::Relaxed) => {
+                drop(permit);
+                inner.delivery_stalled.store(false, Ordering::Relaxed);
+                drain_all_streams(&inner, &mut recv_states, &inbound_tx);
+            }
+
             _ = ticker.tick() => {
                 run_background(
                     &inner, &mut recv_states, &mut relay_table, &mut relay_gen,
@@ -263,7 +277,7 @@ async fn handle_incoming(
     from: SocketAddr,
     inner: &Arc<EngineInner>,
     inbound_tx: &mpsc::Sender<(Bytes, SocketAddr, u16)>,
-    recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
+    recv_states: &mut RecvStates,
     relay_table: &mut HashMap<SocketAddr, (SocketAddr, u32)>,
     relay_gen: u32,
     retransmit_tasks: &mut JoinSet<()>,
@@ -375,7 +389,7 @@ async fn dispatch_frame(
     from: SocketAddr,
     inner: &Arc<EngineInner>,
     inbound_tx: &mpsc::Sender<(Bytes, SocketAddr, u16)>,
-    recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
+    recv_states: &mut RecvStates,
     relay_table: &mut HashMap<SocketAddr, (SocketAddr, u32)>,
     relay_gen: u32,
     retransmit_tasks: &mut JoinSet<()>,
@@ -395,22 +409,18 @@ async fn dispatch_frame(
             stream_id,
             payload,
         } => {
-            let (recv, _frag) = recv_states
-                .entry((from, stream_id))
-                .or_insert_with(|| (RecvState::new(), FragAssembler::new()));
-
-            let (ready, nack_seqs) = recv.ingest(seq, Inbound::Data(payload));
-            send_nack_if_needed(nack_seqs, stream_id, from, inner).await;
             let peer = inner.get_or_create_peer(from);
-            for item in ready {
-                if let Inbound::Data(bytes) = item {
-                    peer.rx_bytes
-                        .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                    if inbound_tx.try_send((bytes, from, stream_id)).is_err() {
-                        tracing::warn!(target: "zudp::engine", %from, stream_id, "inbound channel full — dropping stream frame");
-                    }
-                }
-            }
+            ingest_reliable(
+                inner,
+                &peer,
+                from,
+                stream_id,
+                seq,
+                Inbound::Data(payload),
+                recv_states,
+                inbound_tx,
+            )
+            .await;
         }
 
         Frame::Nack { stream_id, seqs } => {
@@ -501,37 +511,24 @@ async fn dispatch_frame(
             stream_id,
             payload,
         } => {
-            let (recv, frag_assembler) = recv_states
-                .entry((from, stream_id))
-                .or_insert_with(|| (RecvState::new(), FragAssembler::new()));
-
+            let peer = inner.get_or_create_peer(from);
             let inbound = Inbound::Fragment {
                 msg_id,
                 frag_idx,
                 frag_total,
                 data: payload,
             };
-            let (ready, nack_seqs) = recv.ingest(seq, inbound);
-            send_nack_if_needed(nack_seqs, stream_id, from, inner).await;
-
-            let peer = inner.get_or_create_peer(from);
-            for item in ready {
-                if let Inbound::Fragment {
-                    msg_id,
-                    frag_idx,
-                    frag_total,
-                    data,
-                } = item
-                    && let Some(complete) =
-                        frag_assembler.insert(msg_id, frag_idx, frag_total, data)
-                {
-                    peer.rx_bytes
-                        .fetch_add(complete.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                    if inbound_tx.try_send((complete, from, stream_id)).is_err() {
-                        tracing::warn!(target: "zudp::engine", %from, stream_id, "inbound channel full — dropping reassembled fragment");
-                    }
-                }
-            }
+            ingest_reliable(
+                inner,
+                &peer,
+                from,
+                stream_id,
+                seq,
+                inbound,
+                recv_states,
+                inbound_tx,
+            )
+            .await;
         }
 
         Frame::Relay {
@@ -607,7 +604,7 @@ fn find_or_migrate_peer(
     from: SocketAddr,
     session_id: u64,
     inner: &Arc<EngineInner>,
-    recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
+    recv_states: &mut RecvStates,
 ) -> Arc<PeerState> {
     // Fast path: familiar address.
     if let Some(peer) = inner.peers.get(&from).map(|r| r.value().clone()) {
@@ -819,7 +816,7 @@ async fn send_nack_if_needed(
 #[allow(clippy::too_many_arguments)]
 fn run_background(
     inner: &Arc<EngineInner>,
-    recv_states: &mut HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>,
+    recv_states: &mut RecvStates,
     relay_table: &mut HashMap<SocketAddr, (SocketAddr, u32)>,
     relay_gen: &mut u32,
     relay_ttl_ticks: u32,
@@ -1033,5 +1030,94 @@ fn check_pinned_key(hs: &snow::HandshakeState, inner: &Arc<EngineInner>, from: S
             tracing::warn!(target: "zudp::security", peer = %from, "key pinning: remote static not available");
             false
         }
+    }
+}
+
+/// Buffer one reliable frame, NACK what is missing before it, and deliver whatever is now
+/// in order.
+#[allow(clippy::too_many_arguments)]
+async fn ingest_reliable(
+    inner: &Arc<EngineInner>,
+    peer: &PeerState,
+    from: SocketAddr,
+    stream_id: u16,
+    seq: u64,
+    inbound: Inbound,
+    recv_states: &mut RecvStates,
+    inbound_tx: &mpsc::Sender<(Bytes, SocketAddr, u16)>,
+) {
+    let window = inner.config.sent_buffer_frames.max(MIN_RECV_WINDOW);
+    let (recv, frag) = recv_states
+        .entry((from, stream_id))
+        .or_insert_with(|| (RecvState::new(window), FragAssembler::new()));
+    let nack_seqs = recv.ingest(seq, inbound, true);
+    deliver_ready(
+        recv,
+        frag,
+        peer,
+        from,
+        stream_id,
+        inbound_tx,
+        &inner.delivery_stalled,
+    );
+    send_nack_if_needed(nack_seqs, stream_id, from, inner).await;
+}
+
+/// Hand in-order payloads to the application while the inbound channel has room.
+///
+/// A payload is only taken out of the receive buffer once a channel slot is reserved for
+/// it, so a slow application stalls the stream instead of silently losing reliable data.
+fn deliver_ready(
+    recv: &mut RecvState,
+    frag: &mut FragAssembler,
+    peer: &PeerState,
+    from: SocketAddr,
+    stream_id: u16,
+    inbound_tx: &mpsc::Sender<(Bytes, SocketAddr, u16)>,
+    stalled: &AtomicBool,
+) {
+    while recv.has_ready() {
+        let Ok(permit) = inbound_tx.try_reserve() else {
+            tracing::trace!(target: "zudp::engine", %from, stream_id, "inbound channel full — holding stream");
+            stalled.store(true, Ordering::Relaxed);
+            return;
+        };
+        let complete = match recv.pop_ready() {
+            Some(Inbound::Data(bytes)) => Some(bytes),
+            Some(Inbound::Fragment {
+                msg_id,
+                frag_idx,
+                frag_total,
+                data,
+            }) => frag.insert(msg_id, frag_idx, frag_total, data),
+            None => None,
+        };
+        if let Some(bytes) = complete {
+            peer.rx_bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            permit.send((bytes, from, stream_id));
+        }
+    }
+}
+
+/// Retry delivery on every stream after the application freed inbound capacity.
+fn drain_all_streams(
+    inner: &Arc<EngineInner>,
+    recv_states: &mut RecvStates,
+    inbound_tx: &mpsc::Sender<(Bytes, SocketAddr, u16)>,
+) {
+    for (&(addr, stream_id), (recv, frag)) in recv_states.iter_mut() {
+        let Some(peer) = inner.peers.get(&addr).map(|r| r.value().clone()) else {
+            continue;
+        };
+        deliver_ready(
+            recv,
+            frag,
+            &peer,
+            addr,
+            stream_id,
+            inbound_tx,
+            &inner.delivery_stalled,
+        );
     }
 }
