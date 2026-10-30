@@ -507,6 +507,17 @@ impl Zudp {
     ///   [`handshake_timeout`](Self::handshake_timeout).
     /// - [`Error::KeyMismatch`] if a key was pinned and the remote presented another one.
     pub async fn connect<M>(self, peer: SocketAddr) -> Result<ZudpConn<M>, Error> {
+        // Replies to 0.0.0.0 / :: come back from a concrete loopback address, which would
+        // never match the peer entry; talk to loopback explicitly instead.
+        let peer = match peer.ip() {
+            IpAddr::V4(ip) if ip.is_unspecified() => {
+                SocketAddr::new(Ipv4Addr::LOCALHOST.into(), peer.port())
+            }
+            IpAddr::V6(ip) if ip.is_unspecified() => {
+                SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), peer.port())
+            }
+            _ => peer,
+        };
         let socket = ZudpSocket::new(self.config).await?;
         // Pre-create the peer entry so ZudpConn can share the live-address Arc.
         let peer_state = socket.inner.get_or_create_peer(peer);

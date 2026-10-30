@@ -137,3 +137,25 @@ async fn aborted_handshake_does_not_wedge_the_address() {
         1
     );
 }
+
+#[tokio::test]
+async fn connecting_to_the_unspecified_address_reaches_loopback() {
+    let server: zudp::ZudpSocket<Vec<u8>> = zudp::Zudp::default()
+        .port(0)
+        .security(Keypair::generate())
+        .listen()
+        .await
+        .unwrap();
+    let target = server.local_addr().unwrap();
+    assert!(target.ip().is_unspecified());
+    let conn = timeout(
+        Duration::from_secs(3),
+        zudp::Zudp::default()
+            .port(0)
+            .security(Keypair::generate())
+            .connect::<Vec<u8>>(target),
+    )
+    .await
+    .expect("connect hung");
+    assert!(conn.is_ok());
+}
