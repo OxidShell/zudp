@@ -336,26 +336,25 @@ impl<M: Decode> ScanStream<M> {
         }
         let data_addr = SocketAddr::new(from.ip(), data_port);
         let now = Instant::now();
-        let changed = match self.seen.get_mut(&data_addr) {
-            Some(seen) => {
-                seen.last = now;
-                let changed = seen.instance != instance || seen.meta != meta;
-                seen.instance = instance;
-                seen.meta = meta.clone();
-                if changed { Some(false) } else { None }
+        let found = if let Some(seen) = self.seen.get_mut(&data_addr) {
+            seen.last = now;
+            if seen.instance == instance && seen.meta == meta {
+                return None;
             }
-            None => {
-                self.seen.insert(
-                    data_addr,
-                    Seen {
-                        last: now,
-                        instance,
-                        meta: meta.clone(),
-                    },
-                );
-                Some(true)
-            }
-        }?;
+            seen.instance = instance;
+            seen.meta = meta.clone();
+            false
+        } else {
+            self.seen.insert(
+                data_addr,
+                Seen {
+                    last: now,
+                    instance,
+                    meta: meta.clone(),
+                },
+            );
+            true
+        };
         let meta = match M::decode_from_bytes(&meta) {
             Ok(meta) => meta,
             Err(e) => {
@@ -369,7 +368,7 @@ impl<M: Decode> ScanStream<M> {
             instance,
             meta,
         };
-        Some(if changed {
+        Some(if found {
             DiscoveryEvent::Found(peer)
         } else {
             DiscoveryEvent::Updated(peer)

@@ -86,6 +86,12 @@ pub(crate) struct Pending {
 
 pub(crate) type PendingMap = HashMap<SocketAddr, Pending>;
 
+/// A finished handshake and whoever is waiting for it.
+pub(crate) type Done = (Established, Option<oneshot::Sender<Outcome>>);
+
+/// What one handshake message produced: a reply to send, and a finished session.
+pub(crate) type StepResult = (Option<Bytes>, Option<Done>);
+
 /// Material for a freshly established session, handed to the engine to install.
 pub(crate) struct Established {
     pub channel: SecureChannel,
@@ -120,10 +126,7 @@ fn pinned_key_ok(inner: &EngineInner, hs: &snow::HandshakeState) -> bool {
     }
 }
 
-fn into_established(
-    pending: Pending,
-    finish_wire: Option<Bytes>,
-) -> Result<(Established, Option<oneshot::Sender<Outcome>>), snow::Error> {
+fn into_established(pending: Pending, finish_wire: Option<Bytes>) -> Result<Done, snow::Error> {
     let remote_static = remote_static(&pending.hs);
     let transport = pending.hs.into_stateless_transport_mode()?;
     Ok((
@@ -147,10 +150,7 @@ pub(crate) fn on_message(
     step: u8,
     version: u8,
     payload: &Bytes,
-) -> (
-    Option<Bytes>,
-    Option<(Established, Option<oneshot::Sender<Outcome>>)>,
-) {
+) -> StepResult {
     let Some(kp) = inner.keypair.as_ref() else {
         tracing::debug!(target: "zudp::handshake", peer = %from, "ignored — security not configured");
         return (None, None);
@@ -174,10 +174,7 @@ fn respond(
     pending: &mut PendingMap,
     from: SocketAddr,
     payload: &Bytes,
-) -> (
-    Option<Bytes>,
-    Option<(Established, Option<oneshot::Sender<Outcome>>)>,
-) {
+) -> StepResult {
     let mut waiter = None;
     if let Some(existing) = pending.get_mut(&from) {
         match existing.role {
@@ -249,10 +246,7 @@ fn finish_as_initiator(
     pending: &mut PendingMap,
     from: SocketAddr,
     payload: &Bytes,
-) -> (
-    Option<Bytes>,
-    Option<(Established, Option<oneshot::Sender<Outcome>>)>,
-) {
+) -> StepResult {
     let Some(state) = pending.get_mut(&from).filter(|p| p.role == Role::Initiator) else {
         return (None, None);
     };
@@ -324,10 +318,7 @@ fn finish_as_responder(
     pending: &mut PendingMap,
     from: SocketAddr,
     payload: &Bytes,
-) -> (
-    Option<Bytes>,
-    Option<(Established, Option<oneshot::Sender<Outcome>>)>,
-) {
+) -> StepResult {
     let Some(state) = pending.get_mut(&from).filter(|p| p.role == Role::Responder) else {
         return (None, None);
     };
@@ -422,15 +413,13 @@ pub(crate) async fn initiate(engine: &Weak<EngineInner>, peer: SocketAddr) -> Re
     })
     .await;
     match outcome {
-        Some(Outcome::Ready { generation }) => {
-            return confirm(engine, peer, deadline, generation).await;
-        }
-        Some(Outcome::KeyMismatch) => return Err(Error::KeyMismatch),
+        Some(Outcome::Ready { generation }) => confirm(engine, peer, deadline, generation).await,
+        Some(Outcome::KeyMismatch) => Err(Error::KeyMismatch),
         None => {
             if let Some(inner) = engine.upgrade() {
                 inner.pending.lock().remove(&peer);
             }
-            return Err(Error::HandshakeTimeout { peer });
+            Err(Error::HandshakeTimeout { peer })
         }
     }
 }

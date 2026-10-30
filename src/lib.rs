@@ -98,6 +98,7 @@ impl ZudpSender {
     /// Forget `peer` now: drop its session, buffers and receive state and emit
     /// [`PeerEvent::Disconnected`] with [`DisconnectReason::Removed`].  Returns `false` when
     /// the peer was unknown.
+    #[must_use = "false means the peer was not known"]
     pub fn remove_peer(&self, peer: SocketAddr) -> bool {
         self.inner.engine.remove_peer(peer)
     }
@@ -798,7 +799,7 @@ impl<M> ZudpSocket<M> {
         self.inner.engine.peers.get(&peer)?.cc.lock().srtt()
     }
 
-    /// Congestion factor for `peer` (SRTT / min_RTT).
+    /// Congestion factor for `peer` (SRTT / `min_RTT`).
     ///
     /// Values near 1.0 mean the path is clear; above 1.25 indicates buffer bloat.
     /// `None` until at least one RTT sample has been taken.
@@ -866,6 +867,7 @@ impl<M> ZudpSocket<M> {
     /// Forget `peer` now: drop its session, buffers and receive state and emit
     /// [`PeerEvent::Disconnected`] with [`DisconnectReason::Removed`].  Returns `false` when
     /// the peer was unknown.
+    #[must_use = "false means the peer was not known"]
     pub fn remove_peer(&self, peer: SocketAddr) -> bool {
         self.inner.engine.remove_peer(peer)
     }
@@ -1032,7 +1034,7 @@ impl<M> ZudpConn<M> {
         self.socket.peer_srtt(self.peer())
     }
 
-    /// Congestion factor (SRTT / min_RTT).
+    /// Congestion factor (SRTT / `min_RTT`).
     ///
     /// Values near 1.0 mean the path is clear; above 1.25 indicates buffer bloat.
     /// `None` until at least one RTT sample has been taken.

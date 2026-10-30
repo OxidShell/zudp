@@ -47,7 +47,7 @@ pub struct PeerState {
     pub cc: Mutex<CongestionCtrl>,
     /// Path MTU discovered by PLPMTUD; 0 = discovery not yet complete, use config default.
     effective_mtu: AtomicU32,
-    /// Pending MTU probe acks: maps `probe_id → oneshot sender` woken by the engine on MtuAck.
+    /// Pending MTU probe acks: maps `probe_id → oneshot sender` woken by the engine on `MtuAck`.
     pub probe_acks: Mutex<HashMap<u16, oneshot::Sender<()>>>,
     /// Established Noise transport channel; replaced on every completed handshake so
     /// reconnecting peers get fresh keys instead of silently reusing stale ones.
@@ -401,7 +401,7 @@ pub enum Inbound {
 pub struct RecvState {
     expected_seq: u64,
     buf: BTreeMap<u64, Inbound>,
-    /// Frames at or beyond `expected_seq + window` are dropped: they cannot be NACKed back
+    /// Frames at or beyond `expected_seq + window` are dropped: they cannot be requested back
     /// into place anyway, and accepting them would let one forged sequence number make the
     /// receiver track an unbounded gap.
     window: u64,

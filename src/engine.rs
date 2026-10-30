@@ -500,7 +500,7 @@ async fn handle_incoming(
                     relay_gen,
                     retransmit_tasks,
                 )
-                .await
+                .await;
             }
         }
         announce_plain_peer(inner, from);
@@ -819,7 +819,7 @@ fn observe_session(
 /// Move `peer` to `to`: re-key the peer table and its receive state, and re-probe the MTU.
 ///
 /// Whatever state sat at `to` (a placeholder made by frames that arrived before we knew who
-/// was sending) is discarded; anything it buffered is NACKed back in on the moved state.
+/// was sending) is discarded; anything it buffered is requested again on the moved state.
 fn migrate_peer(
     inner: &Arc<EngineInner>,
     peer: &Arc<PeerState>,
@@ -923,7 +923,7 @@ pub(crate) fn seal(inner: &EngineInner, peer: &PeerState, plain: &Bytes) -> Opti
 /// The receiver only NACKs a gap when a later frame reveals it, so if the last frames of a
 /// burst are lost nothing ever asks for them.  Once `stream_id` goes quiet for a probe
 /// timeout, re-send its newest frame (TCP's tail loss probe): a duplicate is discarded,
-/// a missing tail is delivered, and a hole before it gets NACKed as usual.
+/// a missing tail is delivered, and a hole before it gets requested again as usual.
 ///
 /// Call after recording a reliable send.  At most one task runs per (peer, stream).
 pub(crate) fn arm_tail_probe(inner: &Arc<EngineInner>, peer: &Arc<PeerState>, stream_id: u16) {
@@ -1309,12 +1309,11 @@ fn deliver_ready(
 /// with it restart and migration detection, is known within one round trip.
 async fn data_peer(inner: &Arc<EngineInner>, from: SocketAddr) -> Arc<PeerState> {
     let (peer, created) = inner.peer_for_incoming(from);
-    if created {
-        if let Some(ping) = ping_for(inner, &peer)
-            && let Err(e) = inner.get_socket().send_to(&ping, from).await
-        {
-            tracing::debug!(target: "zudp::engine", peer = %from, "first-contact ping failed: {e}");
-        }
+    if created
+        && let Some(ping) = ping_for(inner, &peer)
+        && let Err(e) = inner.get_socket().send_to(&ping, from).await
+    {
+        tracing::debug!(target: "zudp::engine", peer = %from, "first-contact ping failed: {e}");
     }
     peer
 }
