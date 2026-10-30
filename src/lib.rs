@@ -32,6 +32,7 @@ mod codec;
 mod discovery;
 mod engine;
 mod error;
+mod event;
 mod frag;
 mod frame;
 #[cfg(feature = "security")]
@@ -53,6 +54,7 @@ pub use discovery::{
     AdvertiseHandle, AppId, DISCOVERY_PORT, DiscoveredPeer, Discovery, DiscoveryConfig, ScanStream,
 };
 pub use error::Error;
+pub use event::{DisconnectReason, PeerEvent, PeerEvents};
 pub use frame::WIRE_VERSION;
 #[cfg(feature = "security")]
 pub use security::{Keypair, ReplayWindow};
@@ -86,6 +88,19 @@ pub struct ZudpSender {
 }
 
 impl ZudpSender {
+    /// Subscribe to peer lifecycle events; see [`PeerEvent`].
+    #[must_use]
+    pub fn events(&self) -> PeerEvents {
+        self.inner.events()
+    }
+
+    /// Forget `peer` now: drop its session, buffers and receive state and emit
+    /// [`PeerEvent::Disconnected`] with [`DisconnectReason::Removed`].  Returns `false` when
+    /// the peer was unknown.
+    pub fn remove_peer(&self, peer: SocketAddr) -> bool {
+        self.inner.engine.remove_peer(peer)
+    }
+
     /// Send `msg` to `peer` on `stream_id`.
     ///
     /// # Errors
@@ -245,6 +260,14 @@ pub struct Config {
     pub(crate) sent_buffer_frames: usize,
     /// How long a Noise handshake may take before it is abandoned.
     pub(crate) handshake_timeout: Duration,
+    /// Silence after which a peer is dropped; `None` = 3 × keepalive interval.
+    pub(crate) peer_timeout: Option<Duration>,
+}
+
+impl Config {
+    pub(crate) fn effective_peer_timeout(&self) -> Duration {
+        self.peer_timeout.unwrap_or(self.keepalive_interval * 3)
+    }
 }
 
 impl Default for Config {
@@ -268,6 +291,7 @@ impl Default for Config {
             max_relay_entries: 256,
             sent_buffer_frames: 1_024,
             handshake_timeout: Duration::from_secs(5),
+            peer_timeout: None,
         }
     }
 }
@@ -438,6 +462,16 @@ impl Zudp {
         self
     }
 
+    /// Drop a peer after this long without receiving anything from it, emitting
+    /// [`PeerEvent::Disconnected`] and making [`ZudpConn::recv`] fail with
+    /// [`Error::PeerTimeout`].  Keepalive Pings keep live peers well inside it.
+    /// Default: 3 × [`keepalive_interval`](Self::keepalive_interval) (15 s).
+    #[must_use]
+    pub fn peer_timeout(mut self, timeout: Duration) -> Self {
+        self.config.peer_timeout = Some(timeout);
+        self
+    }
+
     /// How long [`connect`](Self::connect) (and a re-handshake after the remote lost our
     /// session) keeps retransmitting before giving up with [`Error::HandshakeTimeout`].
     /// Default: 5 s.  Half-open responder states are dropped after the same time.
@@ -493,9 +527,11 @@ impl Zudp {
         }
         // Probe path MTU in background; sends use config.mtu until discovery completes.
         engine::spawn_mtu_probe(&socket.inner.engine, peer);
+        let events = socket.events();
         Ok(ZudpConn {
             socket,
             peer: peer_addr,
+            events,
         })
     }
 }
@@ -520,6 +556,7 @@ impl Inner {
             peers: DashMap::new(),
             sessions: DashMap::new(),
             instance_id: peer::random_u64(),
+            events: tokio::sync::broadcast::channel(event::EVENT_CAPACITY).0,
             config: config.clone(),
             #[cfg(feature = "security")]
             keypair: config.security.clone(),
@@ -546,6 +583,12 @@ impl Inner {
             _shutdown: shutdown_tx,
         });
         Ok((inner, rx))
+    }
+
+    fn events(&self) -> PeerEvents {
+        PeerEvents {
+            rx: self.engine.events.subscribe(),
+        }
     }
 
     fn alloc_msg_id(&self) -> u32 {
@@ -656,6 +699,7 @@ impl Inner {
                 )
                 .await?;
         }
+        peer.mark_sent();
         Ok(())
     }
 
@@ -808,6 +852,19 @@ impl<M> ZudpSocket<M> {
         }
     }
 
+    /// Subscribe to peer lifecycle events; see [`PeerEvent`].
+    #[must_use]
+    pub fn events(&self) -> PeerEvents {
+        self.inner.events()
+    }
+
+    /// Forget `peer` now: drop its session, buffers and receive state and emit
+    /// [`PeerEvent::Disconnected`] with [`DisconnectReason::Removed`].  Returns `false` when
+    /// the peer was unknown.
+    pub fn remove_peer(&self, peer: SocketAddr) -> bool {
+        self.inner.engine.remove_peer(peer)
+    }
+
     /// The remote peer's X25519 static public key as negotiated by the Noise
     /// handshake.  Returns `None` if the peer is unknown or the handshake has
     /// not yet completed.
@@ -915,9 +972,16 @@ pub struct ZudpConn<M> {
     socket: ZudpSocket<M>,
     /// Shared with `PeerState.addr`; updated in-place when the remote migrates.
     peer: Arc<RwLock<SocketAddr>>,
+    events: PeerEvents,
 }
 
 impl<M> ZudpConn<M> {
+    /// Subscribe to peer lifecycle events; see [`PeerEvent`].
+    #[must_use]
+    pub fn events(&self) -> PeerEvents {
+        self.socket.events()
+    }
+
     /// Current remote peer address.
     ///
     /// Updated automatically when the peer migrates to a new network interface.
@@ -1026,13 +1090,26 @@ impl<M> ZudpConn<M> {
     /// Messages from unrelated peers are silently discarded.
     ///
     /// # Errors
-    /// Returns `Err(Error::ChannelClosed)` if the engine task has stopped.
+    /// - [`Error::PeerTimeout`] once nothing was heard from the peer for the peer timeout
+    ///   (messages that arrived before are still returned first).
+    /// - [`Error::EngineStopped`] if the engine task has stopped.
     pub async fn recv(&mut self) -> Result<Packet<M>, Error>
     where
         M: Decode,
     {
         loop {
-            let pkt = self.socket.recv().await?;
+            let pkt = tokio::select! {
+                biased;
+                pkt = self.socket.recv() => pkt?,
+                event = self.events.recv() => {
+                    if let Ok(PeerEvent::Disconnected { addr, reason: DisconnectReason::TimedOut }) = event
+                        && addr == *self.peer.read()
+                    {
+                        return Err(Error::PeerTimeout { peer: addr });
+                    }
+                    continue;
+                }
+            };
             let current = *self.peer.read();
             if pkt.from == current {
                 return Ok(pkt);

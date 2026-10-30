@@ -73,6 +73,8 @@ pub struct PeerState {
     pub retransmit_count: AtomicU64,
     /// Streams with a tail-loss probe task running (see `engine::arm_tail_probe`).
     pub tail_probe_armed: Mutex<HashSet<u16>>,
+    /// Whether `PeerEvent::Connected` (or `Reset`) was emitted for this state.
+    announced: std::sync::atomic::AtomicBool,
 }
 
 impl PeerState {
@@ -111,6 +113,7 @@ impl PeerState {
             tx_bytes: AtomicU64::new(0),
             retransmit_count: AtomicU64::new(0),
             tail_probe_armed: Mutex::new(HashSet::new()),
+            announced: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -208,8 +211,21 @@ impl PeerState {
         *self.last_seen.lock() = Instant::now();
     }
 
-    pub fn secs_since_sent(&self) -> u64 {
-        self.last_sent.lock().elapsed().as_secs()
+    pub fn mark_sent(&self) {
+        *self.last_sent.lock() = Instant::now();
+    }
+
+    pub fn since_sent(&self) -> Duration {
+        self.last_sent.lock().elapsed()
+    }
+
+    pub fn since_seen(&self) -> Duration {
+        self.last_seen.lock().elapsed()
+    }
+
+    /// `true` the first time it is called: the caller emits `PeerEvent::Connected`.
+    pub fn announce(&self) -> bool {
+        !self.announced.swap(true, Ordering::AcqRel)
     }
 
     /// Effective path MTU discovered by PLPMTUD; falls back to `default` until discovery completes.

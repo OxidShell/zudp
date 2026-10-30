@@ -15,6 +15,7 @@ use tokio::{sync::mpsc, task::JoinSet, time};
 
 use crate::{
     Config,
+    event::{DisconnectReason, PeerEvent},
     frag::FragAssembler,
     frame::Frame,
     peer::{Inbound, PeerState, RecvState},
@@ -78,6 +79,8 @@ pub(crate) struct EngineInner {
     pub sessions: DashMap<u64, Arc<PeerState>>,
     /// Random id of this engine, sent in every Ping and Pong.
     pub instance_id: u64,
+    /// Lifecycle notifications; see [`PeerEvent`].
+    pub events: tokio::sync::broadcast::Sender<PeerEvent>,
     pub config: Arc<Config>,
     /// Noise keypair for the `security` feature; `None` when security is disabled.
     #[cfg(feature = "security")]
@@ -142,6 +145,10 @@ impl EngineInner {
                     "peer table full — evicting least-recently-seen peer"
                 );
                 self.forget_peer(evict);
+                self.emit(PeerEvent::Disconnected {
+                    addr: evict,
+                    reason: DisconnectReason::Evicted,
+                });
             }
             self.dropped_peer_cap.fetch_add(1, Ordering::Relaxed);
         }
@@ -181,10 +188,29 @@ impl EngineInner {
         Some(old)
     }
 
-    fn unindex(&self, old: &Arc<PeerState>) {
+    pub fn unindex(&self, old: &Arc<PeerState>) {
         if let Some(id) = old.their_session_id() {
             self.sessions.remove_if(&id, |_, p| Arc::ptr_eq(p, old));
         }
+    }
+
+    /// Publish a lifecycle event; nobody listening is fine.
+    pub fn emit(&self, event: PeerEvent) {
+        let _ = self.events.send(event);
+    }
+
+    /// Drop `addr` on request.  Returns `false` when there was no such peer.
+    pub fn remove_peer(&self, addr: SocketAddr) -> bool {
+        #[cfg(feature = "security")]
+        self.pending.lock().remove(&addr);
+        if self.forget_peer(addr).is_none() {
+            return false;
+        }
+        self.emit(PeerEvent::Disconnected {
+            addr,
+            reason: DisconnectReason::Removed,
+        });
+        true
     }
 
     /// `true` while `peer` is still the live state for its address.
@@ -404,7 +430,10 @@ async fn handle_incoming(
     };
 
     let known_peer = inner.peers.get(&from).map(|r| r.value().clone());
-    if let Some(peer) = &known_peer {
+    // On a secured socket only authenticated frames count as signs of life.
+    if let Some(peer) = &known_peer
+        && !inner.secured()
+    {
         peer.mark_seen();
     }
 
@@ -431,6 +460,7 @@ async fn handle_incoming(
                     };
                     match channel.decrypt(nonce, &ciphertext) {
                         Ok(p) => {
+                            peer.mark_seen();
                             peer.mark_confirmed();
                             p
                         }
@@ -481,6 +511,7 @@ async fn handle_incoming(
                 .await
             }
         }
+        announce_plain_peer(inner, from);
     }
 
     #[cfg(not(feature = "security"))]
@@ -495,6 +526,8 @@ async fn handle_incoming(
         retransmit_tasks,
     )
     .await;
+
+    announce_plain_peer(inner, from);
 }
 
 // All parameters are genuinely distinct state that the frame dispatch needs to mutate or read;
@@ -597,6 +630,7 @@ async fn dispatch_frame(
             ) else {
                 return;
             };
+            peer.mark_sent();
             if let Err(e) = inner.get_socket().send_to(&pong, from).await {
                 tracing::warn!(target: "zudp::engine", peer = %from, "pong failed: {e}");
             }
@@ -764,6 +798,11 @@ fn observe_session(
                 );
                 let fresh = inner.replace_peer(from);
                 fresh.set_their_session_id(session_id);
+                fresh.announce();
+                inner.emit(PeerEvent::Reset {
+                    addr: from,
+                    key: None,
+                });
                 inner.sessions.insert(session_id, fresh.clone());
                 return Some(fresh);
             }
@@ -825,6 +864,7 @@ fn migrate_peer(
     }
     peer.set_effective_mtu(0);
     spawn_mtu_probe(inner, to);
+    inner.emit(PeerEvent::Migrated { from: old_addr, to });
 }
 
 /// Fire-and-forget PLPMTUD probe toward `peer_addr`.
@@ -1010,11 +1050,29 @@ fn run_background(
     keepalive_interval: Duration,
     sent_prune_age: Duration,
 ) {
-    let keepalive_threshold = keepalive_interval.as_secs();
+    let peer_timeout = inner.config.effective_peer_timeout();
     let peers: Vec<Arc<PeerState>> = inner.peers.iter().map(|r| r.value().clone()).collect();
 
     for peer in peers {
-        if peer.secs_since_sent() >= keepalive_threshold {
+        if peer.since_seen() >= peer_timeout {
+            let addr = peer.addr();
+            if inner
+                .peers
+                .remove_if(&addr, |_, p| Arc::ptr_eq(p, &peer))
+                .is_some()
+            {
+                inner.unindex(&peer);
+                tracing::info!(target: "zudp::engine", peer = %addr, "peer timed out");
+                inner.emit(PeerEvent::Disconnected {
+                    addr,
+                    reason: DisconnectReason::TimedOut,
+                });
+            }
+            continue;
+        }
+        // Ping when we have been quiet, and also when they have: a peer that only receives
+        // must still hear from us, and we must still hear from it, within the timeout.
+        if peer.since_sent() >= keepalive_interval || peer.since_seen() >= keepalive_interval {
             // Spawn each keepalive independently so sequential `send_to` calls
             // don't stall the recv loop when many peers need pinging at once.
             let sock = inner.get_socket();
@@ -1024,6 +1082,7 @@ fn run_background(
                 peer.prune_sent(sent_prune_age);
                 continue;
             };
+            peer.mark_sent();
             tokio::spawn(async move {
                 if let Err(e) = sock.send_to(&ping, addr).await {
                     tracing::warn!(target: "zudp::engine", peer = %addr, "keepalive failed: {e}");
@@ -1101,12 +1160,16 @@ fn install_session(
     addr: SocketAddr,
     established: crate::handshake::Established,
 ) -> Arc<PeerState> {
+    let had_session = inner.peers.get(&addr).is_some_and(|p| p.has_channel());
+    let key = established.remote_static;
     let peer = inner.replace_peer(addr);
-    peer.set_channel(
-        established.channel,
-        established.remote_static,
-        established.finish_wire,
-    );
+    peer.set_channel(established.channel, key, established.finish_wire);
+    peer.announce();
+    inner.emit(if had_session {
+        PeerEvent::Reset { addr, key }
+    } else {
+        PeerEvent::Connected { addr, key }
+    });
     tracing::info!(target: "zudp::engine", peer = %addr, initiator = established.initiator, "Noise XX handshake complete");
     peer
 }
@@ -1268,4 +1331,19 @@ fn plaintext_allowed(frame: &Frame) -> bool {
             | Frame::MtuProbe { .. }
             | Frame::MtuAck { .. }
     )
+}
+
+/// Without security a session starts with the first frame heard from an address.
+fn announce_plain_peer(inner: &EngineInner, from: SocketAddr) {
+    if inner.secured() {
+        return;
+    }
+    if let Some(peer) = inner.peers.get(&from).map(|r| r.value().clone())
+        && peer.announce()
+    {
+        inner.emit(PeerEvent::Connected {
+            addr: from,
+            key: None,
+        });
+    }
 }
