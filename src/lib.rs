@@ -139,6 +139,8 @@ pub struct EngineStats {
     pub dropped_relay_blocked: u64,
     /// Relay frames dropped because the relay routing table was full.
     pub dropped_relay_cap: u64,
+    /// Plaintext data frames dropped because this socket requires encryption.
+    pub dropped_unauthenticated: u64,
 }
 
 /// A message received from a ZUDP socket, together with its origin and stream.
@@ -477,10 +479,11 @@ impl Zudp {
         if socket.inner.config.security.is_some() {
             handshake::initiate(&Arc::downgrade(&socket.inner.engine), peer).await?;
         }
-        if !socket.inner.engine.secured() {
+        if !socket.inner.engine.secured()
+            && let Some(ping) = engine::ping_for(&socket.inner.engine, &peer_state)
+        {
             // Announce our instance id first, so a server that still has state from a previous
             // process on this address resets it before our first data frame.
-            let ping = engine::ping_for(&socket.inner.engine, &peer_state);
             socket
                 .inner
                 .engine
@@ -525,6 +528,7 @@ impl Inner {
             dropped_peer_cap: AtomicU64::new(0),
             dropped_relay_blocked: AtomicU64::new(0),
             dropped_relay_cap: AtomicU64::new(0),
+            dropped_unauthenticated: AtomicU64::new(0),
             delivery_stalled: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "security")]
             pending: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -571,7 +575,17 @@ impl Inner {
 
         // Single peer lookup covers both MTU discovery and send-side state;
         // avoids a second lock acquisition in send_single/send_fragmented.
-        let peer = self.get_or_create_peer(dest);
+        let peer = if self.engine.secured() {
+            // Never create a session-less peer on a secured socket: it could only send plaintext.
+            self.engine
+                .peers
+                .get(&dest)
+                .map(|p| p.value().clone())
+                .filter(|p| p.has_channel())
+                .ok_or(Error::NoSession { peer: dest })?
+        } else {
+            self.get_or_create_peer(dest)
+        };
         let mtu = peer.effective_mtu_or(self.config.mtu);
 
         if payload.len() <= mtu {
@@ -601,7 +615,7 @@ impl Inner {
                 payload,
             }
             .encode();
-            let inner_wire = maybe_encrypt(&peer, &plain_frame)?;
+            let inner_wire = maybe_encrypt(&self.engine, &peer, &plain_frame)?;
             let wire = if wrap_relay {
                 Frame::Relay {
                     dest: peer.addr(),
@@ -616,17 +630,20 @@ impl Inner {
             self.engine.get_socket().send_to(&wire, actual_dest).await?;
             peer.record_sent(stream_id, seq, plain_frame, self.config.sent_buffer_frames);
             engine::arm_tail_probe(&self.engine, &peer, stream_id);
-        } else if wrap_relay {
-            let frame = Frame::Datagram(payload).encode();
-            let wire = Frame::Relay {
-                dest: peer.addr(),
-                inner: frame,
-            }
-            .encode();
+        } else if wrap_relay || self.engine.secured() {
+            let frame = maybe_encrypt(&self.engine, &peer, &Frame::Datagram(payload).encode())?;
+            let wire = if wrap_relay {
+                Frame::Relay {
+                    dest: peer.addr(),
+                    inner: frame,
+                }
+                .encode()
+            } else {
+                frame
+            };
             self.engine.get_socket().send_to(&wire, actual_dest).await?;
         } else {
             // Scatter-gather: send payload + 1-byte type tag without copying payload.
-            // (Unreliable datagrams are not encrypted — no peer channel tracking for these.)
             let type_tag = [frame::TYPE_DATAGRAM];
             self.engine
                 .get_socket()
@@ -670,7 +687,7 @@ impl Inner {
                 payload: chunk,
             }
             .encode();
-            let inner_wire = maybe_encrypt(&peer, &plain_frame)?;
+            let inner_wire = maybe_encrypt(&self.engine, &peer, &plain_frame)?;
             let wire = if wrap_relay {
                 Frame::Relay {
                     dest: peer.addr(),
@@ -694,21 +711,8 @@ impl Inner {
 /// Encrypt `plain` using the peer's Noise channel if one exists; otherwise return `plain` as-is.
 // Result is needed when the `security` feature is enabled (channel.encrypt can fail).
 #[allow(clippy::unnecessary_wraps)]
-fn maybe_encrypt(peer: &PeerState, plain: &Bytes) -> Result<Bytes, Error> {
-    #[cfg(feature = "security")]
-    {
-        let guard = peer.channel.read();
-        if let Some(channel) = guard.as_ref() {
-            let (nonce, ct) = channel.encrypt(plain)?;
-            return Ok(Frame::Secure {
-                nonce,
-                ciphertext: Bytes::from(ct),
-            }
-            .encode());
-        }
-    }
-    let _ = peer;
-    Ok(plain.clone())
+fn maybe_encrypt(engine: &EngineInner, peer: &PeerState, plain: &Bytes) -> Result<Bytes, Error> {
+    engine::seal(engine, peer, plain).ok_or(Error::NoSession { peer: peer.addr() })
 }
 
 /// A ZUDP socket that sends and receives messages from any remote peer.
@@ -790,6 +794,7 @@ impl<M> ZudpSocket<M> {
             dropped_peer_cap: e.dropped_peer_cap.load(Ordering::Relaxed),
             dropped_relay_blocked: e.dropped_relay_blocked.load(Ordering::Relaxed),
             dropped_relay_cap: e.dropped_relay_cap.load(Ordering::Relaxed),
+            dropped_unauthenticated: e.dropped_unauthenticated.load(Ordering::Relaxed),
         }
     }
 

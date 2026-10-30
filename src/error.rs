@@ -72,6 +72,12 @@ pub enum Error {
 
     /// Packet dropped — source IP exceeded configured rate limit.
     Throttled,
+
+    /// Security is configured but there is no established session with `peer` (never
+    /// connected, timed out, removed, or being re-established), so nothing was sent.
+    NoSession {
+        peer: SocketAddr,
+    },
 }
 
 impl fmt::Display for Error {
@@ -126,6 +132,7 @@ impl fmt::Display for Error {
                 write!(f, "security: handshake with {peer} timed out")
             }
             Self::Throttled => f.write_str("packet dropped: rate limit exceeded"),
+            Self::NoSession { peer } => write!(f, "no secure session with {peer}"),
         }
     }
 }

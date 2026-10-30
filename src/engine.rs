@@ -89,6 +89,8 @@ pub(crate) struct EngineInner {
     pub dropped_peer_cap: AtomicU64,
     pub dropped_relay_blocked: AtomicU64,
     pub dropped_relay_cap: AtomicU64,
+    /// Plaintext data frames dropped because a keypair is configured.
+    pub dropped_unauthenticated: AtomicU64,
     /// Set when a reliable stream could not deliver because the inbound channel was full;
     /// the engine then waits for capacity and drains every stream.
     pub delivery_stalled: AtomicBool,
@@ -355,13 +357,16 @@ async fn ping_all_peers(inner: &Arc<EngineInner>, sock: &RawSocket) {
     let now_ms = now_micros();
     let peers: Vec<Arc<PeerState>> = inner.peers.iter().map(|r| r.value().clone()).collect();
     for peer in peers {
-        let ping = secure_frame(
+        let Some(ping) = secure_frame(
+            inner,
             &peer,
             Frame::Ping {
                 echo: now_ms,
                 session_id: inner.instance_id,
             },
-        );
+        ) else {
+            continue;
+        };
         if let Err(e) = sock.send_to(&ping, peer.addr()).await {
             tracing::warn!(target: "zudp::engine", peer = %peer.addr(), "post-rebind ping failed: {e}");
         }
@@ -456,6 +461,13 @@ async fn handle_incoming(
                 .await;
             }
             frame => {
+                if inner.secured() && !plaintext_allowed(&frame) {
+                    tracing::trace!(target: "zudp::engine", peer = %from, "plaintext frame on a secured socket dropped");
+                    inner
+                        .dropped_unauthenticated
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
                 dispatch_frame(
                     frame,
                     from,
@@ -541,9 +553,12 @@ async fn dispatch_frame(
                     } else {
                         // Spawn so the engine recv loop isn't stalled by CC pacing sleeps.
                         let sock = inner.get_socket();
+                        let wires: Vec<(u64, Bytes)> = to_retransmit
+                            .into_iter()
+                            .filter_map(|(seq, plain)| Some((seq, seal(inner, &peer, &plain)?)))
+                            .collect();
                         retransmit_tasks.spawn(async move {
-                            for (seq, plain_frame) in to_retransmit {
-                                let wire = encrypt_or_plain(&peer, &plain_frame);
+                            for (seq, wire) in wires {
                                 // Extract delay before awaiting — MutexGuard is not Send.
                                 let delay = peer.cc.lock().consume(wire.len());
                                 if let Some(d) = delay {
@@ -572,13 +587,16 @@ async fn dispatch_frame(
             let Some(peer) = observe_session(from, session_id, inner, recv_states, true) else {
                 return;
             };
-            let pong = secure_frame(
+            let Some(pong) = secure_frame(
+                inner,
                 &peer,
                 Frame::Pong {
                     echo,
                     session_id: inner.instance_id,
                 },
-            );
+            ) else {
+                return;
+            };
             if let Err(e) = inner.get_socket().send_to(&pong, from).await {
                 tracing::warn!(target: "zudp::engine", peer = %from, "pong failed: {e}");
             }
@@ -672,12 +690,12 @@ async fn dispatch_frame(
 
         Frame::MtuProbe { probe_id, .. } => {
             // Reflect probe_id in a tiny MtuAck — always gets through regardless of path MTU.
-            let ack_frame = Frame::MtuAck { probe_id };
-            let ack = if let Some(peer) = inner.peers.get(&from).map(|r| r.value().clone()) {
-                secure_frame(&peer, ack_frame)
-            } else {
-                ack_frame.encode()
-            };
+            // Plaintext when there is no session: the ack reveals nothing and probes precede it.
+            let ack = inner
+                .peers
+                .get(&from)
+                .and_then(|peer| secure_frame(inner, &peer, Frame::MtuAck { probe_id }))
+                .unwrap_or_else(|| Frame::MtuAck { probe_id }.encode());
             if let Err(e) = inner.get_socket().send_to(&ack, from).await {
                 tracing::warn!(target: "zudp::engine", peer = %from, "mtu ack send failed: {e}");
             }
@@ -836,40 +854,38 @@ pub(crate) fn spawn_mtu_probe(inner: &Arc<EngineInner>, peer_addr: SocketAddr) {
     });
 }
 
-/// Encode `frame` and encrypt it for `peer` if an established Noise channel exists.
-///
-/// Falls back to plaintext when called before the handshake completes or when the
-/// `security` feature is disabled.  All post-handshake control frames (Ping, Pong,
-/// Nack, `MtuAck`) go through this so passive observers cannot read session metadata.
-fn secure_frame(peer: &PeerState, frame: Frame) -> Bytes {
-    let plain = frame.encode();
-    encrypt_or_plain(peer, &plain)
+/// Encode `frame` and seal it for `peer`; see [`seal`].
+fn secure_frame(inner: &EngineInner, peer: &PeerState, frame: Frame) -> Option<Bytes> {
+    seal(inner, peer, &frame.encode())
 }
 
-/// If the peer has an established Noise channel, re-encrypt the plain frame; otherwise send as-is.
+/// Wrap an encoded frame for the wire.
 ///
-/// Used for NACK-triggered retransmits: each retransmit gets a fresh nonce to avoid reuse.
-#[allow(unused_variables)]
-fn encrypt_or_plain(peer: &PeerState, plain: &Bytes) -> Bytes {
+/// With a Noise session it is encrypted under a fresh nonce (so retransmits never reuse
+/// one).  Without a keypair it goes out as-is.  With a keypair but no session yet it returns
+/// `None`: nothing but handshake traffic may leave a secured socket in plaintext.
+pub(crate) fn seal(inner: &EngineInner, peer: &PeerState, plain: &Bytes) -> Option<Bytes> {
     #[cfg(feature = "security")]
     {
         let guard = peer.channel.read();
         if let Some(channel) = guard.as_ref() {
-            match channel.encrypt(plain) {
-                Ok((nonce, ct)) => {
-                    return Frame::Secure {
+            return match channel.encrypt(plain) {
+                Ok((nonce, ct)) => Some(
+                    Frame::Secure {
                         nonce,
                         ciphertext: Bytes::from(ct),
                     }
-                    .encode();
-                }
+                    .encode(),
+                ),
                 Err(e) => {
-                    tracing::warn!(target: "zudp::engine", "retransmit encrypt failed: {e}");
+                    tracing::warn!(target: "zudp::engine", peer = %peer.addr(), "encrypt failed: {e}");
+                    None
                 }
-            }
+            };
         }
     }
-    plain.clone()
+    let _ = peer;
+    (!inner.secured()).then(|| plain.clone())
 }
 
 /// Recover from tail loss on a reliable stream.
@@ -938,7 +954,9 @@ async fn send_tail_probe(
     stream_id: u16,
     seq: u64,
 ) {
-    let wire = encrypt_or_plain(peer, plain_frame);
+    let Some(wire) = seal(inner, peer, plain_frame) else {
+        return;
+    };
     let (wire, dest) = match inner.config.relay_addr {
         Some(relay) => (
             Frame::Relay {
@@ -971,11 +989,11 @@ async fn send_nack_if_needed(
         stream_id,
         seqs: nack_seqs,
     };
-    let wire = if let Some(peer) = inner.peers.get(&to).map(|r| r.value().clone()) {
-        secure_frame(&peer, nack)
-    } else {
-        nack.encode()
+    let wire = match inner.peers.get(&to).map(|r| r.value().clone()) {
+        Some(peer) => secure_frame(inner, &peer, nack),
+        None => (!inner.secured()).then(|| nack.encode()),
     };
+    let Some(wire) = wire else { return };
     if let Err(e) = inner.get_socket().send_to(&wire, to).await {
         tracing::warn!(target: "zudp::engine", peer = %to, "nack send failed: {e}");
     }
@@ -1002,6 +1020,10 @@ fn run_background(
             let sock = inner.get_socket();
             let ping = ping_for(inner, &peer);
             let addr = peer.addr();
+            let Some(ping) = ping else {
+                peer.prune_sent(sent_prune_age);
+                continue;
+            };
             tokio::spawn(async move {
                 if let Err(e) = sock.send_to(&ping, addr).await {
                     tracing::warn!(target: "zudp::engine", peer = %addr, "keepalive failed: {e}");
@@ -1090,8 +1112,9 @@ fn install_session(
 }
 
 /// A keepalive Ping for `peer`, encrypted when a session exists.
-pub(crate) fn ping_for(inner: &EngineInner, peer: &PeerState) -> Bytes {
+pub(crate) fn ping_for(inner: &EngineInner, peer: &PeerState) -> Option<Bytes> {
     secure_frame(
+        inner,
         peer,
         Frame::Ping {
             echo: now_micros(),
@@ -1223,10 +1246,26 @@ fn deliver_ready(
 async fn data_peer(inner: &Arc<EngineInner>, from: SocketAddr) -> Arc<PeerState> {
     let (peer, created) = inner.peer_for_incoming(from);
     if created {
-        let ping = ping_for(inner, &peer);
-        if let Err(e) = inner.get_socket().send_to(&ping, from).await {
+        if let Some(ping) = ping_for(inner, &peer)
+            && let Err(e) = inner.get_socket().send_to(&ping, from).await
+        {
             tracing::debug!(target: "zudp::engine", peer = %from, "first-contact ping failed: {e}");
         }
     }
     peer
+}
+
+/// Frames a secured socket accepts outside a Noise session: handshakes, discovery and path
+/// MTU probing.  Everything else must arrive inside a `Secure` frame.
+#[cfg(feature = "security")]
+fn plaintext_allowed(frame: &Frame) -> bool {
+    matches!(
+        frame,
+        Frame::Handshake { .. }
+            | Frame::Secure { .. }
+            | Frame::Probe { .. }
+            | Frame::Beacon { .. }
+            | Frame::MtuProbe { .. }
+            | Frame::MtuAck { .. }
+    )
 }

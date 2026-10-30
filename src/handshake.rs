@@ -500,7 +500,9 @@ async fn confirm(
         if let Some(finish) = finish {
             let _ = sock.send_to(&finish, peer).await;
         }
-        let _ = sock.send_to(&ping, peer).await;
+        if let Some(ping) = ping {
+            let _ = sock.send_to(&ping, peer).await;
+        }
         let now = Instant::now();
         if now >= deadline {
             return Err(Error::HandshakeTimeout { peer });
