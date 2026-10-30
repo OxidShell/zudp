@@ -59,15 +59,25 @@ const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 /// Smallest per-stream receive window, whatever `sent_buffer_frames` is set to.
 const MIN_RECV_WINDOW: usize = 1_024;
 
-pub(crate) type RecvStates = HashMap<(SocketAddr, u16), (RecvState, FragAssembler)>;
+/// Receive side of one (peer, stream).
+pub(crate) struct StreamRx {
+    /// [`PeerState::generation`] this state belongs to; a mismatch means the peer was reset.
+    generation: u64,
+    recv: RecvState,
+    frag: FragAssembler,
+}
+
+pub(crate) type RecvStates = HashMap<(SocketAddr, u16), StreamRx>;
 
 /// State shared between the engine task and the [`crate::ZudpSocket`] / [`crate::ZudpConn`] handles.
 pub(crate) struct EngineInner {
     /// Current socket; replaced atomically on rebind.  Use [`get_socket`] to obtain a cheap clone.
     pub socket: RwLock<RawSocket>,
     pub peers: DashMap<SocketAddr, Arc<PeerState>>,
-    /// Reverse index: remote's `my_session_id` → peer, for detecting address migrations.
+    /// Reverse index: remote engine instance id → peer, for detecting address migrations.
     pub sessions: DashMap<u64, Arc<PeerState>>,
+    /// Random id of this engine, sent in every Ping and Pong.
+    pub instance_id: u64,
     pub config: Arc<Config>,
     /// Noise keypair for the `security` feature; `None` when security is disabled.
     #[cfg(feature = "security")]
@@ -95,9 +105,26 @@ impl EngineInner {
         self.socket.read().clone()
     }
 
+    /// `true` when a Noise keypair is configured.
+    pub fn secured(&self) -> bool {
+        #[cfg(feature = "security")]
+        {
+            self.keypair.is_some()
+        }
+        #[cfg(not(feature = "security"))]
+        {
+            false
+        }
+    }
+
     pub fn get_or_create_peer(self: &Arc<Self>, addr: SocketAddr) -> Arc<PeerState> {
+        self.peer_for_incoming(addr).0
+    }
+
+    /// Like [`get_or_create_peer`](Self::get_or_create_peer); also says whether it was created.
+    pub fn peer_for_incoming(self: &Arc<Self>, addr: SocketAddr) -> (Arc<PeerState>, bool) {
         if let Some(p) = self.peers.get(&addr) {
-            return p.value().clone();
+            return (p.value().clone(), false);
         }
         if self.peers.len() >= self.config.max_peers {
             let evict_addr = self
@@ -112,15 +139,57 @@ impl EngineInner {
                     new = %addr,
                     "peer table full — evicting least-recently-seen peer"
                 );
-                self.peers.remove(&evict);
+                self.forget_peer(evict);
             }
             self.dropped_peer_cap.fetch_add(1, Ordering::Relaxed);
         }
-        self.peers
+        let mut created = false;
+        let peer = self
+            .peers
             .entry(addr)
-            .or_insert_with(|| Arc::new(PeerState::new(addr)))
+            .or_insert_with(|| {
+                created = true;
+                Arc::new(PeerState::new(addr))
+            })
             .value()
-            .clone()
+            .clone();
+        (peer, created)
+    }
+
+    /// Start a new session state for `addr`, dropping everything the old one carried.
+    ///
+    /// Sequence counters, send buffers, receive state, fragments, congestion state, keys and
+    /// the session-id index all belong to one remote incarnation; reusing them across a
+    /// restart makes the new incarnation's frames look stale.
+    pub fn replace_peer(&self, addr: SocketAddr) -> Arc<PeerState> {
+        let fresh = Arc::new(match self.peers.get(&addr) {
+            Some(old) => PeerState::with_addr(old.addr_arc()),
+            None => PeerState::new(addr),
+        });
+        if let Some(old) = self.peers.insert(addr, fresh.clone()) {
+            self.unindex(&old);
+        }
+        fresh
+    }
+
+    /// Remove `addr` and every index entry pointing at it.  Returns the removed state.
+    pub fn forget_peer(&self, addr: SocketAddr) -> Option<Arc<PeerState>> {
+        let (_, old) = self.peers.remove(&addr)?;
+        self.unindex(&old);
+        Some(old)
+    }
+
+    fn unindex(&self, old: &Arc<PeerState>) {
+        if let Some(id) = old.their_session_id() {
+            self.sessions.remove_if(&id, |_, p| Arc::ptr_eq(p, old));
+        }
+    }
+
+    /// `true` while `peer` is still the live state for its address.
+    pub fn is_current(&self, peer: &Arc<PeerState>) -> bool {
+        self.peers
+            .get(&peer.addr())
+            .is_some_and(|p| Arc::ptr_eq(p.value(), peer))
     }
 }
 
@@ -290,7 +359,7 @@ async fn ping_all_peers(inner: &Arc<EngineInner>, sock: &RawSocket) {
             &peer,
             Frame::Ping {
                 echo: now_ms,
-                session_id: peer.my_session_id,
+                session_id: inner.instance_id,
             },
         );
         if let Err(e) = sock.send_to(&ping, peer.addr()).await {
@@ -431,7 +500,7 @@ async fn dispatch_frame(
 ) {
     match frame {
         Frame::Datagram(payload) => {
-            let peer = inner.get_or_create_peer(from);
+            let peer = data_peer(inner, from).await;
             peer.rx_bytes
                 .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
             if inbound_tx.try_send((payload, from, 0)).is_err() {
@@ -444,7 +513,7 @@ async fn dispatch_frame(
             stream_id,
             payload,
         } => {
-            let peer = inner.get_or_create_peer(from);
+            let peer = data_peer(inner, from).await;
             ingest_reliable(
                 inner,
                 &peer,
@@ -500,12 +569,14 @@ async fn dispatch_frame(
         }
 
         Frame::Ping { echo, session_id } => {
-            let peer = find_or_migrate_peer(from, session_id, inner, recv_states);
+            let Some(peer) = observe_session(from, session_id, inner, recv_states, true) else {
+                return;
+            };
             let pong = secure_frame(
                 &peer,
                 Frame::Pong {
                     echo,
-                    session_id: peer.my_session_id,
+                    session_id: inner.instance_id,
                 },
             );
             if let Err(e) = inner.get_socket().send_to(&pong, from).await {
@@ -514,10 +585,7 @@ async fn dispatch_frame(
         }
 
         Frame::Pong { echo, session_id } => {
-            if let Some(peer) = inner.peers.get(&from).map(|r| r.value().clone()) {
-                if peer.store_their_session_id(session_id) {
-                    inner.sessions.insert(session_id, peer.clone());
-                }
+            if let Some(peer) = observe_session(from, session_id, inner, recv_states, false) {
                 // echo carries a µs timestamp; RTT is the round-trip in microseconds.
                 let now_us = now_micros();
                 if echo <= now_us {
@@ -546,7 +614,7 @@ async fn dispatch_frame(
             stream_id,
             payload,
         } => {
-            let peer = inner.get_or_create_peer(from);
+            let peer = data_peer(inner, from).await;
             let inbound = Inbound::Fragment {
                 msg_id,
                 frag_idx,
@@ -631,61 +699,114 @@ async fn dispatch_frame(
     }
 }
 
-/// Locate the peer for an incoming Ping, handling first contact, familiar address, and migration.
+/// Match the engine instance id in a Ping or Pong from `from` to a peer.
 ///
-/// Migration: if `session_id` matches a known peer but `from` differs, the peer's address is
-/// updated, the `peers` map is re-keyed, and all `recv_states` entries are moved to the new key.
-fn find_or_migrate_peer(
+/// Handles first contact, a familiar address, a restarted remote on the same address (its
+/// state is reset), and a known remote seen from a new address (migration).  Returns
+/// `None` only when `create` is false and nothing matched.
+fn observe_session(
     from: SocketAddr,
     session_id: u64,
     inner: &Arc<EngineInner>,
     recv_states: &mut RecvStates,
-) -> Arc<PeerState> {
-    // Fast path: familiar address.
+    create: bool,
+) -> Option<Arc<PeerState>> {
     if let Some(peer) = inner.peers.get(&from).map(|r| r.value().clone()) {
-        if peer.store_their_session_id(session_id) {
-            inner.sessions.insert(session_id, peer.clone());
-        }
-        return peer;
-    }
-
-    // Migration: known session but new address.
-    if let Some(peer) = inner.sessions.get(&session_id).map(|r| r.value().clone()) {
-        let old_addr = peer.addr();
-        if old_addr != from {
-            tracing::info!(
-                target: "zudp::engine",
-                old = %old_addr,
-                new = %from,
-                "peer address migrated"
-            );
-            peer.migrate_to(from);
-            inner.peers.remove(&old_addr);
-            inner.peers.insert(from, peer.clone());
-            // Move all recv_states from old key to new key.
-            let stream_ids: Vec<u16> = recv_states
-                .keys()
-                .filter(|(a, _)| *a == old_addr)
-                .map(|(_, s)| *s)
-                .collect();
-            for sid in stream_ids {
-                if let Some(state) = recv_states.remove(&(old_addr, sid)) {
-                    recv_states.insert((from, sid), state);
+        match peer.their_session_id() {
+            Some(known) if known == session_id => return Some(peer),
+            None => {
+                // A state made by a data frame before the remote's id was known: if that id
+                // belongs to a peer at another address, it is that peer arriving from here.
+                if let Some(moved) = inner
+                    .sessions
+                    .get(&session_id)
+                    .map(|r| r.value().clone())
+                    .filter(|p| !Arc::ptr_eq(p, &peer) && p.addr() != from)
+                {
+                    migrate_peer(inner, &moved, from, recv_states);
+                    return Some(moved);
                 }
+                peer.set_their_session_id(session_id);
+                inner.sessions.insert(session_id, peer.clone());
+                return Some(peer);
             }
-            // Path has changed — reset discovered MTU and re-probe.
-            peer.set_effective_mtu(0);
-            spawn_mtu_probe(inner, from);
+            Some(_) if inner.secured() => {
+                // With Noise, sessions are bounded by handshakes, not by this id.
+                peer.set_their_session_id(session_id);
+                inner.sessions.insert(session_id, peer.clone());
+                return Some(peer);
+            }
+            Some(previous) => {
+                tracing::info!(
+                    target: "zudp::engine",
+                    peer = %from,
+                    previous,
+                    current = session_id,
+                    "remote restarted — resetting its session"
+                );
+                let fresh = inner.replace_peer(from);
+                fresh.set_their_session_id(session_id);
+                inner.sessions.insert(session_id, fresh.clone());
+                return Some(fresh);
+            }
         }
-        return peer;
     }
 
-    // First contact: create peer, register session, and discover path MTU.
+    if let Some(peer) = inner.sessions.get(&session_id).map(|r| r.value().clone()) {
+        migrate_peer(inner, &peer, from, recv_states);
+        return Some(peer);
+    }
+
+    if !create {
+        return None;
+    }
     let peer = inner.get_or_create_peer(from);
-    peer.store_their_session_id(session_id);
+    peer.set_their_session_id(session_id);
     inner.sessions.insert(session_id, peer.clone());
     spawn_mtu_probe(inner, from);
-    peer
+    Some(peer)
+}
+
+/// Move `peer` to `to`: re-key the peer table and its receive state, and re-probe the MTU.
+///
+/// Whatever state sat at `to` (a placeholder made by frames that arrived before we knew who
+/// was sending) is discarded; anything it buffered is NACKed back in on the moved state.
+fn migrate_peer(
+    inner: &Arc<EngineInner>,
+    peer: &Arc<PeerState>,
+    to: SocketAddr,
+    recv_states: &mut RecvStates,
+) {
+    let old_addr = peer.addr();
+    if old_addr == to {
+        return;
+    }
+    tracing::info!(target: "zudp::engine", old = %old_addr, new = %to, "peer address migrated");
+    peer.migrate_to(to);
+    inner
+        .peers
+        .remove_if(&old_addr, |_, p| Arc::ptr_eq(p, peer));
+    if let Some(placeholder) = inner.peers.insert(to, peer.clone())
+        && !Arc::ptr_eq(&placeholder, peer)
+        && let Some(id) = placeholder.their_session_id()
+    {
+        inner
+            .sessions
+            .remove_if(&id, |_, p| Arc::ptr_eq(p, &placeholder));
+    }
+    recv_states.retain(|(addr, _), _| *addr != to);
+    let moved: Vec<u16> = recv_states
+        .keys()
+        .filter(|(a, _)| *a == old_addr)
+        .map(|(_, s)| *s)
+        .collect();
+    for sid in moved {
+        if let Some(state) = recv_states.remove(&(old_addr, sid)) {
+            recv_states.insert((to, sid), state);
+        }
+    }
+    peer.set_effective_mtu(0);
+    spawn_mtu_probe(inner, to);
 }
 
 /// Fire-and-forget PLPMTUD probe toward `peer_addr`.
@@ -781,7 +902,11 @@ pub(crate) fn arm_tail_probe(inner: &Arc<EngineInner>, peer: &Arc<PeerState>, st
                         probed_seq = *seq;
                         probes = 0;
                     }
-                    let Some(inner) = weak.upgrade() else { return };
+                    let Some(inner) = weak.upgrade().filter(|i| i.is_current(&peer)) else {
+                        // Engine gone or the peer was reset: these frames belong to nobody now.
+                        peer.tail_probe_armed.lock().remove(&stream_id);
+                        return;
+                    };
                     send_tail_probe(&inner, &peer, frame, stream_id, *seq).await;
                     drop(inner);
                     probes += 1;
@@ -868,8 +993,6 @@ fn run_background(
     sent_prune_age: Duration,
 ) {
     let keepalive_threshold = keepalive_interval.as_secs();
-    let now_ms = now_micros();
-
     let peers: Vec<Arc<PeerState>> = inner.peers.iter().map(|r| r.value().clone()).collect();
 
     for peer in peers {
@@ -877,16 +1000,9 @@ fn run_background(
             // Spawn each keepalive independently so sequential `send_to` calls
             // don't stall the recv loop when many peers need pinging at once.
             let sock = inner.get_socket();
-            let peer_clone = peer.clone();
+            let ping = ping_for(inner, &peer);
+            let addr = peer.addr();
             tokio::spawn(async move {
-                let addr = peer_clone.addr();
-                let ping = secure_frame(
-                    &peer_clone,
-                    Frame::Ping {
-                        echo: now_ms,
-                        session_id: peer_clone.my_session_id,
-                    },
-                );
                 if let Err(e) = sock.send_to(&ping, addr).await {
                     tracing::warn!(target: "zudp::engine", peer = %addr, "keepalive failed: {e}");
                 }
@@ -896,9 +1012,15 @@ fn run_background(
         peer.prune_sent(sent_prune_age);
     }
 
-    for ((addr, stream_id), (recv, frag_assembler)) in recv_states.iter_mut() {
-        frag_assembler.prune(sent_prune_age);
-        if recv.prune_gap(sent_prune_age) {
+    recv_states.retain(|(addr, _), rx| {
+        inner
+            .peers
+            .get(addr)
+            .is_some_and(|p| p.generation == rx.generation)
+    });
+    for ((addr, stream_id), rx) in recv_states.iter_mut() {
+        rx.frag.prune(sent_prune_age);
+        if rx.recv.prune_gap(sent_prune_age) {
             tracing::warn!(
                 target: "zudp::engine",
                 peer = %addr,
@@ -957,7 +1079,7 @@ fn install_session(
     addr: SocketAddr,
     established: crate::handshake::Established,
 ) -> Arc<PeerState> {
-    let peer = inner.get_or_create_peer(addr);
+    let peer = inner.replace_peer(addr);
     peer.set_channel(
         established.channel,
         established.remote_static,
@@ -967,15 +1089,13 @@ fn install_session(
     peer
 }
 
-/// An encrypted (when possible) keepalive Ping for `peer`.
-#[cfg(feature = "security")]
+/// A keepalive Ping for `peer`, encrypted when a session exists.
 pub(crate) fn ping_for(inner: &EngineInner, peer: &PeerState) -> Bytes {
-    let _ = inner;
     secure_frame(
         peer,
         Frame::Ping {
             echo: now_micros(),
-            session_id: peer.my_session_id,
+            session_id: inner.instance_id,
         },
     )
 }
@@ -999,13 +1119,18 @@ fn drain_all_streams(
     recv_states: &mut RecvStates,
     inbound_tx: &mpsc::Sender<(Bytes, SocketAddr, u16)>,
 ) {
-    for (&(addr, stream_id), (recv, frag)) in recv_states.iter_mut() {
-        let Some(peer) = inner.peers.get(&addr).map(|r| r.value().clone()) else {
+    for (&(addr, stream_id), rx) in recv_states.iter_mut() {
+        let Some(peer) = inner
+            .peers
+            .get(&addr)
+            .map(|r| r.value().clone())
+            .filter(|p| p.generation == rx.generation)
+        else {
             continue;
         };
         deliver_ready(
-            recv,
-            frag,
+            &mut rx.recv,
+            &mut rx.frag,
             &peer,
             addr,
             stream_id,
@@ -1028,13 +1153,23 @@ async fn ingest_reliable(
     inbound_tx: &mpsc::Sender<(Bytes, SocketAddr, u16)>,
 ) {
     let window = inner.config.sent_buffer_frames.max(MIN_RECV_WINDOW);
-    let (recv, frag) = recv_states
-        .entry((from, stream_id))
-        .or_insert_with(|| (RecvState::new(window), FragAssembler::new()));
-    let nack_seqs = recv.ingest(seq, inbound, true);
+    let fresh = || StreamRx {
+        generation: peer.generation,
+        recv: RecvState::new(window),
+        frag: FragAssembler::new(),
+    };
+    let rx = recv_states.entry((from, stream_id)).or_insert_with(fresh);
+    if rx.generation != peer.generation {
+        *rx = fresh();
+    }
+    // Until a plain-mode peer's session is known, its frames may belong to a previous
+    // incarnation of the remote, so only accept the very next one: nothing stale gets
+    // buffered and nothing gets NACKed from a sender that is about to reset.
+    let allow_reorder = inner.secured() || peer.their_session_id().is_some();
+    let nack_seqs = rx.recv.ingest(seq, inbound, allow_reorder);
     deliver_ready(
-        recv,
-        frag,
+        &mut rx.recv,
+        &mut rx.frag,
         peer,
         from,
         stream_id,
@@ -1079,4 +1214,19 @@ fn deliver_ready(
             permit.send((bytes, from, stream_id));
         }
     }
+}
+
+/// The peer a data frame from `from` belongs to.
+///
+/// A peer first seen through a data frame is pinged at once so its engine instance id, and
+/// with it restart and migration detection, is known within one round trip.
+async fn data_peer(inner: &Arc<EngineInner>, from: SocketAddr) -> Arc<PeerState> {
+    let (peer, created) = inner.peer_for_incoming(from);
+    if created {
+        let ping = ping_for(inner, &peer);
+        if let Err(e) = inner.get_socket().send_to(&ping, from).await {
+            tracing::debug!(target: "zudp::engine", peer = %from, "first-contact ping failed: {e}");
+        }
+    }
+    peer
 }

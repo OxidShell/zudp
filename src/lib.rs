@@ -477,6 +477,17 @@ impl Zudp {
         if socket.inner.config.security.is_some() {
             handshake::initiate(&Arc::downgrade(&socket.inner.engine), peer).await?;
         }
+        if !socket.inner.engine.secured() {
+            // Announce our instance id first, so a server that still has state from a previous
+            // process on this address resets it before our first data frame.
+            let ping = engine::ping_for(&socket.inner.engine, &peer_state);
+            socket
+                .inner
+                .engine
+                .get_socket()
+                .send_to(&ping, peer)
+                .await?;
+        }
         // Probe path MTU in background; sends use config.mtu until discovery completes.
         engine::spawn_mtu_probe(&socket.inner.engine, peer);
         Ok(ZudpConn {
@@ -505,6 +516,7 @@ impl Inner {
             socket: RwLock::new(socket),
             peers: DashMap::new(),
             sessions: DashMap::new(),
+            instance_id: peer::random_u64(),
             config: config.clone(),
             #[cfg(feature = "security")]
             keypair: config.security.clone(),

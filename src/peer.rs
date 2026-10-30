@@ -32,9 +32,10 @@ pub struct SentPacket {
 pub struct PeerState {
     /// Current remote address; updated transparently on network migration.
     addr: Arc<RwLock<SocketAddr>>,
-    /// Session ID we include in every Ping to this peer so they can migrate us if our IP changes.
-    pub my_session_id: u64,
-    /// Session ID the remote includes in their Pings; lets us recognise them from a new address.
+    /// Unique per `PeerState`; receive state tagged with another generation is stale.
+    pub generation: u64,
+    /// Engine instance id the remote puts in its Pings and Pongs.  A different id from the
+    /// same address means the remote process restarted.
     their_session_id: Mutex<Option<u64>>,
     /// Per-stream sequence counters; each stream starts at 1 and advances independently.
     next_seqs: Mutex<HashMap<u16, u64>>,
@@ -77,10 +78,17 @@ pub struct PeerState {
 impl PeerState {
     #[must_use]
     pub fn new(addr: SocketAddr) -> Self {
+        Self::with_addr(Arc::new(RwLock::new(addr)))
+    }
+
+    /// A fresh session state that keeps tracking the same live address handle, so a
+    /// [`ZudpConn`](crate::ZudpConn) survives its peer being reset.
+    #[must_use]
+    pub fn with_addr(addr: Arc<RwLock<SocketAddr>>) -> Self {
         let now = Instant::now();
         Self {
-            addr: Arc::new(RwLock::new(addr)),
-            my_session_id: random_u64(),
+            addr,
+            generation: random_u64(),
             their_session_id: Mutex::new(None),
             next_seqs: Mutex::new(HashMap::new()),
             sent: Mutex::new(HashMap::new()),
@@ -121,17 +129,13 @@ impl PeerState {
         *self.addr.write() = new_addr;
     }
 
-    /// Record the session ID received from the remote's Pings.
-    ///
-    /// Returns `true` if this is the first time the ID is learned (caller should register in sessions map).
-    pub fn store_their_session_id(&self, id: u64) -> bool {
-        let mut guard = self.their_session_id.lock();
-        if guard.is_none() {
-            *guard = Some(id);
-            true
-        } else {
-            false
-        }
+    #[must_use]
+    pub fn their_session_id(&self) -> Option<u64> {
+        *self.their_session_id.lock()
+    }
+
+    pub fn set_their_session_id(&self, id: u64) {
+        *self.their_session_id.lock() = Some(id);
     }
 
     /// Allocate the next sequence number for `stream_id`.  Each stream starts at 1.
