@@ -39,7 +39,8 @@ where
                 rkyv::ser::allocator::ArenaHandle<'a>,
                 rkyv::rancor::Error,
             >,
-        > + Send + 'static,
+        > + Send
+        + 'static,
 {
     fn encode_to_bytes(&self) -> Result<Vec<u8>, crate::Error> {
         rkyv::to_bytes::<rkyv::rancor::Error>(self)
@@ -52,9 +53,8 @@ where
 impl<T> Decode for T
 where
     T: rkyv::Archive + Send + 'static,
-    T::Archived: for<'a> rkyv::bytecheck::CheckBytes<
-            rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
-        > + rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>,
+    T::Archived: for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>
+        + rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>,
 {
     fn decode_from_bytes(bytes: &[u8]) -> Result<Self, crate::Error> {
         rkyv::from_bytes::<T, rkyv::rancor::Error>(bytes)

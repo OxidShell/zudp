@@ -8,11 +8,14 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use zudp::rkyv::{Archive, Deserialize, Serialize};
 use zudp::Zudp;
+use zudp::rkyv::{Archive, Deserialize, Serialize};
 
 #[derive(Debug, Archive, Serialize, Deserialize)]
-#[cfg_attr(feature = "serde", derive(zudp::serde::Serialize, zudp::serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(zudp::serde::Serialize, zudp::serde::Deserialize)
+)]
 enum Msg {
     Data(Vec<u8>),
 }

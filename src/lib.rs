@@ -166,34 +166,34 @@ pub struct Packet<M> {
     pub stream: u16,
 }
 
-/// Re-exported so users can use `rkyv::Archive`, `rkyv::Serialize`, `rkyv::Deserialize` without a direct `rkyv` dependency.
-#[cfg(feature = "rkyv")]
-pub use ::rkyv;
 /// Re-exported so users can derive `Encode`/`Decode` without a direct `bitcode` dependency.
 #[cfg(feature = "bitcode")]
 pub use ::bitcode;
-/// Re-exported so users can derive `Serialize`/`Deserialize` without a direct `serde` dependency.
-#[cfg(feature = "serde")]
-pub use ::serde;
 /// Re-exported alongside `serde` for codec access without a direct `postcard` dependency.
 #[cfg(feature = "serde")]
 pub use ::postcard;
+/// Re-exported so users can use `rkyv::Archive`, `rkyv::Serialize`, `rkyv::Deserialize` without a direct `rkyv` dependency.
+#[cfg(feature = "rkyv")]
+pub use ::rkyv;
+/// Re-exported so users can derive `Serialize`/`Deserialize` without a direct `serde` dependency.
+#[cfg(feature = "serde")]
+pub use ::serde;
 
 use std::{
     marker::PhantomData,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use engine::EngineInner;
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
-use engine::EngineInner;
 
 use frag::fragment;
 use frame::Frame;
@@ -478,7 +478,10 @@ impl Zudp {
                 tracing::info!(target: "zudp::mtu", peer = %peer, mtu = discovered, "path MTU discovered");
             });
         }
-        Ok(ZudpConn { socket, peer: peer_addr })
+        Ok(ZudpConn {
+            socket,
+            peer: peer_addr,
+        })
     }
 }
 
@@ -776,7 +779,13 @@ impl<M> ZudpSocket<M> {
     /// `None` until at least one RTT sample has been taken.
     #[must_use]
     pub fn peer_congestion_factor(&self, peer: SocketAddr) -> Option<f64> {
-        self.inner.engine.peers.get(&peer)?.cc.lock().congestion_factor()
+        self.inner
+            .engine
+            .peers
+            .get(&peer)?
+            .cc
+            .lock()
+            .congestion_factor()
     }
 
     /// Full statistics snapshot for `peer`.  `None` if the peer is not in the table.
@@ -817,7 +826,9 @@ impl<M> ZudpSocket<M> {
     /// The returned [`ZudpSender`] can be cheaply cloned and sent across tasks.
     #[must_use]
     pub fn sender(&self) -> ZudpSender {
-        ZudpSender { inner: self.inner.clone() }
+        ZudpSender {
+            inner: self.inner.clone(),
+        }
     }
 
     /// The remote peer's X25519 static public key as negotiated by the Noise

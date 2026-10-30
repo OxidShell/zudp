@@ -414,7 +414,10 @@ impl Frame {
                     frame: "mtu_probe",
                     field: "probe_id",
                 })?;
-                Ok(Frame::MtuProbe { probe_id, padding: data.len() })
+                Ok(Frame::MtuProbe {
+                    probe_id,
+                    padding: data.len(),
+                })
             }
 
             TYPE_MTU_ACK => {
@@ -692,9 +695,10 @@ mod tests {
 
     #[test]
     fn mtu_probe_roundtrip() {
-        let Frame::MtuProbe { probe_id, padding } =
-            roundtrip(Frame::MtuProbe { probe_id: 0xABCD, padding: 1397 })
-        else {
+        let Frame::MtuProbe { probe_id, padding } = roundtrip(Frame::MtuProbe {
+            probe_id: 0xABCD,
+            padding: 1397,
+        }) else {
             panic!("wrong variant");
         };
         assert_eq!(probe_id, 0xABCD);
@@ -704,7 +708,11 @@ mod tests {
     #[test]
     fn mtu_probe_size_is_correct() {
         let padding = 1397;
-        let encoded = Frame::MtuProbe { probe_id: 1, padding }.encode();
+        let encoded = Frame::MtuProbe {
+            probe_id: 1,
+            padding,
+        }
+        .encode();
         assert_eq!(encoded.len(), padding + 3);
     }
 

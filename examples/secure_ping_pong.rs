@@ -12,7 +12,10 @@ use zudp::rkyv::{Archive, Deserialize, Serialize};
 use zudp::{Keypair, Zudp};
 
 #[derive(Debug, Archive, Serialize, Deserialize)]
-#[cfg_attr(feature = "serde", derive(zudp::serde::Serialize, zudp::serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(zudp::serde::Serialize, zudp::serde::Deserialize)
+)]
 enum Msg {
     Ping(u32),
     Pong(u32),
@@ -43,7 +46,10 @@ async fn main() -> anyhow::Result<()> {
             let Msg::Ping(seq) = pkt.msg else { continue };
             println!("server  ←  Ping({seq}) from {}  [encrypted ✓]", pkt.from);
 
-            server.send(Msg::Pong(seq), pkt.from).await.expect("server send");
+            server
+                .send(Msg::Pong(seq), pkt.from)
+                .await
+                .expect("server send");
             println!("server  →  Pong({seq}) to {}  [encrypted ✓]", pkt.from);
 
             let _ = i;

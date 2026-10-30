@@ -12,14 +12,17 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use zudp::rkyv::{Archive, Deserialize, Serialize};
 use zudp::Zudp;
+use zudp::rkyv::{Archive, Deserialize, Serialize};
 
 const STREAM_COMMANDS: u16 = 0;
 const STREAM_STATE: u16 = 1;
 
 #[derive(Debug, Archive, Serialize, Deserialize)]
-#[cfg_attr(feature = "serde", derive(zudp::serde::Serialize, zudp::serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(zudp::serde::Serialize, zudp::serde::Deserialize)
+)]
 enum Command {
     Jump,
     Fire { target_id: u32 },
@@ -27,14 +30,20 @@ enum Command {
 }
 
 #[derive(Debug, Archive, Serialize, Deserialize)]
-#[cfg_attr(feature = "serde", derive(zudp::serde::Serialize, zudp::serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(zudp::serde::Serialize, zudp::serde::Deserialize)
+)]
 enum StateSnapshot {
     World { tick: u32, data: Vec<u8> },
 }
 
 // The server uses a single enum to receive from both streams.
 #[derive(Debug, Archive, Serialize, Deserialize)]
-#[cfg_attr(feature = "serde", derive(zudp::serde::Serialize, zudp::serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(zudp::serde::Serialize, zudp::serde::Deserialize)
+)]
 enum ServerMsg {
     Command(Command),
     State(StateSnapshot),
@@ -55,7 +64,10 @@ async fn main() -> anyhow::Result<()> {
 
         for _ in 0..5 {
             let pkt = server.recv().await.expect("server recv");
-            println!("server  ←  stream {}  {:?}  from {}", pkt.stream, pkt.msg, pkt.from);
+            println!(
+                "server  ←  stream {}  {:?}  from {}",
+                pkt.stream, pkt.msg, pkt.from
+            );
         }
         println!("server done");
     });
@@ -65,18 +77,18 @@ async fn main() -> anyhow::Result<()> {
     let peer: SocketAddr = "127.0.0.1:7760".parse()?;
 
     // Client A — sends commands on stream 0 and snapshots on stream 1.
-    let conn = Zudp::default()
-        .port(0)
-        .connect::<ServerMsg>(peer)
-        .await?;
+    let conn = Zudp::default().port(0).connect::<ServerMsg>(peer).await?;
 
     println!("client connected {}", conn.local_addr()?);
 
     // Stream 0: urgent game commands.
     conn.send_stream(ServerMsg::Command(Command::Jump), STREAM_COMMANDS)
         .await?;
-    conn.send_stream(ServerMsg::Command(Command::Fire { target_id: 42 }), STREAM_COMMANDS)
-        .await?;
+    conn.send_stream(
+        ServerMsg::Command(Command::Fire { target_id: 42 }),
+        STREAM_COMMANDS,
+    )
+    .await?;
     conn.send_stream(ServerMsg::Command(Command::Respawn), STREAM_COMMANDS)
         .await?;
 
@@ -92,8 +104,11 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     // Stream 0 again: loss on stream 1's large snapshot cannot block this.
-    conn.send_stream(ServerMsg::Command(Command::Fire { target_id: 99 }), STREAM_COMMANDS)
-        .await?;
+    conn.send_stream(
+        ServerMsg::Command(Command::Fire { target_id: 99 }),
+        STREAM_COMMANDS,
+    )
+    .await?;
 
     println!("client sent 3 commands on stream 0, 1 snapshot on stream 1, 1 more command");
 

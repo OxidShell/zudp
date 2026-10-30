@@ -1,5 +1,5 @@
-use std::{net::IpAddr, net::Ipv4Addr, time::Duration};
 use std::collections::HashMap;
+use std::{net::IpAddr, net::Ipv4Addr, time::Duration};
 
 use tokio::time::timeout;
 use zudp::Zudp;
@@ -43,10 +43,7 @@ async fn echo_roundtrip() {
     let mut client = lo().port(0).connect::<Vec<u8>>(server_addr).await.unwrap();
 
     tokio::spawn(async move {
-        let pkt = timeout(RECV_TIMEOUT, server.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let pkt = timeout(RECV_TIMEOUT, server.recv()).await.unwrap().unwrap();
         let mut echoed = pkt.msg.clone();
         echoed.extend_from_slice(b"_ack");
         server.send(echoed, pkt.from).await.unwrap();
@@ -134,11 +131,7 @@ async fn multi_stream() {
     let mut server: zudp::ZudpSocket<Vec<u8>> = lo().port(0).listen().await.unwrap();
     let server_addr = server.local_addr().unwrap();
 
-    let client = lo()
-        .port(0)
-        .connect::<Vec<u8>>(server_addr)
-        .await
-        .unwrap();
+    let client = lo().port(0).connect::<Vec<u8>>(server_addr).await.unwrap();
 
     client.send_stream(b"s0".to_vec(), 0).await.unwrap();
     client.send_stream(b"s1".to_vec(), 1).await.unwrap();
@@ -159,13 +152,12 @@ async fn unreliable_datagram() {
     let mut server: zudp::ZudpSocket<Vec<u8>> = lo().port(0).listen().await.unwrap();
     let server_addr = server.local_addr().unwrap();
 
-    let client = lo()
-        .port(0)
-        .connect::<Vec<u8>>(server_addr)
+    let client = lo().port(0).connect::<Vec<u8>>(server_addr).await.unwrap();
+
+    client
+        .send_unreliable(b"fire and forget".to_vec())
         .await
         .unwrap();
-
-    client.send_unreliable(b"fire and forget".to_vec()).await.unwrap();
 
     let pkt = recv!(server);
     assert_eq!(pkt.msg, b"fire and forget".to_vec());
@@ -249,7 +241,10 @@ async fn key_pinning_wrong_key_rejected() {
     )
     .await;
 
-    assert!(result.is_err(), "connect() should time out with a wrong pinned key");
+    assert!(
+        result.is_err(),
+        "connect() should time out with a wrong pinned key"
+    );
 }
 
 #[cfg(feature = "security")]
@@ -310,8 +305,14 @@ async fn rate_limit_throttled() {
     }
 
     // Rate limiter drops most packets; at most burst+small-refill worth should arrive.
-    assert!(received >= 1, "at least the burst should get through, got {received}");
-    assert!(received <= 5, "rate limiter should have throttled most, got {received}");
+    assert!(
+        received >= 1,
+        "at least the burst should get through, got {received}"
+    );
+    assert!(
+        received <= 5,
+        "rate limiter should have throttled most, got {received}"
+    );
 }
 
 #[tokio::test]
@@ -365,7 +366,9 @@ async fn peer_stats_tracks_rx_and_tx_bytes() {
 
     // Client must have recorded non-zero tx_bytes to the server.
     // (tx_bytes tracks plain-frame bytes including stream header overhead.)
-    let cli = client.peer_stats().expect("server should be in client peer table");
+    let cli = client
+        .peer_stats()
+        .expect("server should be in client peer table");
     assert!(
         cli.tx_bytes > 0,
         "client tx_bytes should be non-zero, got {}",
@@ -518,7 +521,10 @@ async fn relay_allowlist_blocks_unauthorized() {
     client.send(b"blocked".to_vec()).await.unwrap();
 
     let result = timeout(Duration::from_millis(500), real_server.recv()).await;
-    assert!(result.is_err(), "relay should have blocked the unauthorized sender");
+    assert!(
+        result.is_err(),
+        "relay should have blocked the unauthorized sender"
+    );
 }
 
 #[tokio::test]
@@ -559,7 +565,10 @@ async fn relay_table_cap() {
     // Second client's destination is a new relay entry, but cap=1 is full.
     client2.send(b"should be dropped".to_vec()).await.unwrap();
     let result = timeout(Duration::from_millis(500), server2.recv()).await;
-    assert!(result.is_err(), "relay table should be full — second route dropped");
+    assert!(
+        result.is_err(),
+        "relay table should be full — second route dropped"
+    );
 }
 
 /// Bulk request/response with default config: each ~60 KB message must be

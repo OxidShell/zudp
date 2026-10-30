@@ -16,10 +16,9 @@ use tokio::sync::oneshot;
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 
+use crate::cc::CongestionCtrl;
 #[cfg(feature = "security")]
 use crate::security::SecureChannel;
-use crate::cc::CongestionCtrl;
-
 
 /// A fully encoded frame retained for NACK-triggered retransmission.
 pub struct SentPacket {
@@ -140,7 +139,8 @@ impl PeerState {
     }
 
     pub fn record_sent(&self, stream_id: u16, seq: u64, frame: Bytes, max_frames: usize) {
-        self.tx_bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
+        self.tx_bytes
+            .fetch_add(frame.len() as u64, Ordering::Relaxed);
         let mut map = self.sent.lock();
         let stream_buf = map.entry(stream_id).or_default();
         if stream_buf.len() >= max_frames
@@ -154,7 +154,13 @@ impl PeerState {
                 "sent buffer full — evicting oldest frame (NACK for it will not retransmit)"
             );
         }
-        stream_buf.insert(seq, SentPacket { frame, sent_at: Instant::now() });
+        stream_buf.insert(
+            seq,
+            SentPacket {
+                frame,
+                sent_at: Instant::now(),
+            },
+        );
         drop(map);
         *self.last_sent.lock() = Instant::now();
     }
@@ -315,7 +321,9 @@ impl RecvState {
     /// stream resyncs on the next in-order delivery (H.264 picks up from the next
     /// I-frame; other streams tolerate a small discontinuity).
     pub fn prune_gap(&mut self, max_age: Duration) -> bool {
-        let Some(since) = self.gap_since else { return false };
+        let Some(since) = self.gap_since else {
+            return false;
+        };
         if since.elapsed() < max_age {
             return false;
         }

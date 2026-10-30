@@ -142,7 +142,10 @@ mod tests {
         let data = Bytes::from_static(b"hello");
         let result = fa.insert(0, 0, 1, data.clone());
         assert_eq!(result.unwrap(), data);
-        assert!(fa.in_flight.is_empty(), "completed assembly must be removed");
+        assert!(
+            fa.in_flight.is_empty(),
+            "completed assembly must be removed"
+        );
     }
 
     #[test]
@@ -160,8 +163,14 @@ mod tests {
     fn fragment_bomb_above_max_rejected() {
         let mut fa = FragAssembler::new();
         let result = fa.insert(99, 0, MAX_FRAG_RECV + 1, Bytes::from_static(b"evil"));
-        assert!(result.is_none(), "frag_total > MAX_FRAG_RECV must be rejected");
-        assert!(fa.in_flight.is_empty(), "no slot should be allocated for rejected frames");
+        assert!(
+            result.is_none(),
+            "frag_total > MAX_FRAG_RECV must be rejected"
+        );
+        assert!(
+            fa.in_flight.is_empty(),
+            "no slot should be allocated for rejected frames"
+        );
     }
 
     #[test]
@@ -187,7 +196,10 @@ mod tests {
         // Fill exactly MAX_CONCURRENT_ASSEMBLIES incomplete assemblies.
         for id in 0..(MAX_CONCURRENT_ASSEMBLIES as u32) {
             let result = fa.insert(id, 0, 2, Bytes::from_static(b"x"));
-            assert!(result.is_none(), "incomplete assembly should not complete on frag 0");
+            assert!(
+                result.is_none(),
+                "incomplete assembly should not complete on frag 0"
+            );
         }
         assert_eq!(fa.in_flight.len(), MAX_CONCURRENT_ASSEMBLIES);
 
@@ -211,7 +223,10 @@ mod tests {
         let _ = fa.insert(1, 0, 2, piece.clone()); // duplicate of frag 0
         // Assembly should still be waiting for frag 1 — received must be 1, not 2.
         let asm = fa.in_flight.get(&1).expect("assembly should be in flight");
-        assert_eq!(asm.received, 1, "duplicate must not increment received count");
+        assert_eq!(
+            asm.received, 1,
+            "duplicate must not increment received count"
+        );
     }
 
     #[test]
@@ -229,6 +244,10 @@ mod tests {
         // Sleep past the max_age threshold so the assembly is considered stale.
         std::thread::sleep(Duration::from_millis(5));
         fa.prune(Duration::from_millis(1));
-        assert_eq!(fa.in_flight.len(), 0, "stale assembly must be removed by prune");
+        assert_eq!(
+            fa.in_flight.len(),
+            0,
+            "stale assembly must be removed by prune"
+        );
     }
 }

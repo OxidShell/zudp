@@ -761,10 +761,9 @@ pub(crate) fn arm_tail_probe(inner: &Arc<EngineInner>, peer: &Arc<PeerState>, st
 }
 
 fn probe_timeout(peer: &PeerState) -> Duration {
-    peer.cc
-        .lock()
-        .srtt()
-        .map_or(TAIL_PROBE_DEFAULT, |srtt| (srtt * 2).clamp(TAIL_PROBE_MIN, TAIL_PROBE_MAX))
+    peer.cc.lock().srtt().map_or(TAIL_PROBE_DEFAULT, |srtt| {
+        (srtt * 2).clamp(TAIL_PROBE_MIN, TAIL_PROBE_MAX)
+    })
 }
 
 async fn send_tail_probe(

@@ -30,8 +30,12 @@ fn bench_loopback(c: &mut Criterion) {
     let (addr_tx, addr_rx) = std::sync::mpsc::sync_channel::<std::net::SocketAddr>(1);
 
     rt.spawn(async move {
-        let mut server: zudp::ZudpSocket<Vec<u8>> =
-            Zudp::default().port(0).rate_limit(0.0).listen().await.unwrap();
+        let mut server: zudp::ZudpSocket<Vec<u8>> = Zudp::default()
+            .port(0)
+            .rate_limit(0.0)
+            .listen()
+            .await
+            .unwrap();
         addr_tx.send(server.local_addr().unwrap()).unwrap();
         while let Ok(_) = server.recv().await {
             if msg_tx.send(()).is_err() {
@@ -147,5 +151,10 @@ fn bench_encrypted_loopback(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_encode_decode, bench_loopback, bench_encrypted_loopback);
+criterion_group!(
+    benches,
+    bench_encode_decode,
+    bench_loopback,
+    bench_encrypted_loopback
+);
 criterion_main!(benches);

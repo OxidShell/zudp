@@ -14,7 +14,10 @@ use zudp::rkyv::{Archive, Deserialize, Serialize};
 use zudp::{Zudp, ZudpSocket};
 
 #[derive(Debug, Archive, Serialize, Deserialize)]
-#[cfg_attr(feature = "serde", derive(zudp::serde::Serialize, zudp::serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(zudp::serde::Serialize, zudp::serde::Deserialize)
+)]
 enum Msg {
     Greeting(String),
 }

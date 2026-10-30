@@ -1,8 +1,11 @@
-use zudp::rkyv::{Archive, Deserialize, Serialize};
 use zudp::Zudp;
+use zudp::rkyv::{Archive, Deserialize, Serialize};
 
 #[derive(Debug, Archive, Serialize, Deserialize)]
-#[cfg_attr(feature = "serde", derive(zudp::serde::Serialize, zudp::serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(zudp::serde::Serialize, zudp::serde::Deserialize)
+)]
 enum Msg {
     Ping { sent_at_us: u64 },
     Pong { sent_at_us: u64 },

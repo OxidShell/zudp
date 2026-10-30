@@ -14,7 +14,10 @@ use zudp::rkyv::{Archive, Deserialize, Serialize};
 use zudp::{Keypair, Zudp};
 
 #[derive(Debug, Archive, Serialize, Deserialize)]
-#[cfg_attr(feature = "serde", derive(zudp::serde::Serialize, zudp::serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(zudp::serde::Serialize, zudp::serde::Deserialize)
+)]
 enum Msg {
     Hello,
     Hi,
@@ -48,7 +51,10 @@ async fn main() -> anyhow::Result<()> {
 
         // Handle one round for scenario 1 (correct pin).
         let pkt = socket.recv().await.expect("server recv");
-        println!("server  ← {:?} from {} [handshake completed ✓]", pkt.msg, pkt.from);
+        println!(
+            "server  ← {:?} from {} [handshake completed ✓]",
+            pkt.msg, pkt.from
+        );
         socket.send(Msg::Hi, pkt.from).await.expect("server send");
 
         // Scenario 2 never reaches here — the engine silently aborts the handshake
