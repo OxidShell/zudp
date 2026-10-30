@@ -153,7 +153,7 @@ conn.send(Msg::Ping).await?;
 let pkt = conn.recv().await?;
 ```
 
-All three Noise handshake messages complete inside `connect()` — the channel is encrypted and ready before the first `send()`. Once the channel is established, **all** frame types are wrapped in `Secure` except Datagram (unreliable fire-and-forget) and routing/discovery frames (Relay, Probe, Beacon, Handshake). This includes Ping/Pong keepalives (which carry session IDs) and Nack frames (which expose sequence timing) — encrypting them prevents replay-based migration attacks and traffic analysis. NACK retransmits re-encrypt the original plaintext with a fresh nonce; the old ciphertext is never re-sent.
+The Noise handshake and one authenticated round trip complete inside `connect()` — both ends hold the session before the first `send()`. Lost handshake datagrams are retransmitted; `connect()` fails with `Error::HandshakeTimeout` after `handshake_timeout` (default 5 s) and with `Error::KeyMismatch` when a pinned key does not match. Once the channel is established, **all** data — including unreliable datagrams — is wrapped in `Secure`; only handshake, discovery and MTU-probe frames travel in plaintext. A socket with a keypair drops plaintext data and returns `Error::NoSession` instead of sending in the clear. This includes Ping/Pong keepalives (which carry session IDs) and Nack frames (which expose sequence timing) — encrypting them prevents replay-based migration attacks and traffic analysis. NACK retransmits re-encrypt the original plaintext with a fresh nonce; the old ciphertext is never re-sent.
 
 ## LAN discovery
 
@@ -186,7 +186,8 @@ let peer = stream.next().await?;
 // connect to peer.data_addr via Zudp::connect
 ```
 
-`DiscoveryConfig` builder: `.discovery_port(u16)`, `.probe_interval(Duration)`.
+`DiscoveryConfig` builder: `.discovery_port(u16)`, `.probe_interval(Duration)`, `.peer_ttl(Duration)`.
+`ScanStream::next_event()` yields `DiscoveryEvent::{Found, Updated, Lost}`: a peer that restarts (new `instance`) or changes its metadata is reported again, and one that stops answering for `peer_ttl` is reported lost.
 `AppId` is derived from the app name string via a stable FNV-1a hash.
 
 ## Relay
@@ -211,12 +212,27 @@ When the client migrates to a new network, the relay table is updated automatica
 
 ## Network migration
 
-When the local interface changes (WiFi → mobile, DHCP renew, VPN toggle), ZUDP restores the session automatically:
+When a peer's address changes (Wi-Fi → mobile, DHCP renew, VPN toggle, NAT rebinding), the session follows it: secure sessions by the session index in every encrypted frame, plain sessions by the engine instance id in keepalive Pings. The other side emits `PeerEvent::Migrated` — no reconnect, no application-level handling required.
 
-1. Engine detects the socket error and rebinds to a new interface.
-2. Engine sends keepalive Pings carrying a per-peer session ID to all known peers.
-3. Each peer recognises the session ID and migrates the client's address in its peer table.
-4. Traffic resumes — no reconnect, no application-level handling required.
+## Reconnects and peer lifecycle
+
+```rust
+let mut events = socket.events();
+while let Ok(event) = events.recv().await {
+    match event {
+        zudp::PeerEvent::Connected { addr, key } => { /* new session */ }
+        zudp::PeerEvent::Reset { addr, key } => { /* remote restarted: resend state */ }
+        zudp::PeerEvent::Migrated { from, to } => { /* same session, new address */ }
+        zudp::PeerEvent::Disconnected { addr, reason } => { /* timed out / removed */ }
+        _ => {}
+    }
+}
+```
+
+- A peer silent for `peer_timeout` (default 3 × keepalive) is dropped; `ZudpConn::recv()` then fails with `Error::PeerTimeout`.
+- A remote that restarts on the same address gets a fresh session (`Reset`) instead of having its frames discarded as stale.
+- If a secure server restarts, a connected client re-handshakes automatically and emits `Reset`.
+- `remove_peer(addr)` drops a peer immediately.
 
 Works for client→server topologies where the server has a public IP.  P2P connections where both peers are behind NAT require a relay.
 

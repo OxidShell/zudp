@@ -36,11 +36,16 @@ All multi-byte integers are **big-endian**.
 | `0x05` | Fragment | 19 B |
 | `0x06` | Relay | 8 B (IPv4) / 20 B (IPv6) |
 | `0x07` | Probe | 11 B |
-| `0x08` | Beacon | 13 B + meta |
-| `0x09` | Handshake | variable (32–96 B) |
-| `0x0A` | Secure | 9 B + AEAD tag (16 B) |
+| `0x08` | Beacon | 21 B + meta |
+| `0x09` | Handshake | 3 B + Noise message (40–104 B) |
+| `0x0A` | Secure | 17 B + AEAD tag (16 B) |
 | `0x0B` | MtuProbe | 3 B + padding |
 | `0x0C` | MtuAck | 3 B |
+| `0x0D` | SessionUnknown | 9 B |
+
+### Wire version
+
+The session protocol is versioned by `WIRE_VERSION` (currently **2**), carried in every Handshake frame. A responder ignores handshakes from another version, so mismatched peers fail with `HandshakeTimeout` instead of exchanging garbage. Version 2 added the handshake `step`/`version` bytes, the session index in Secure frames and the SessionUnknown frame. Discovery has its own `proto_ver` (see *Discovery*).
 
 ---
 
@@ -86,19 +91,19 @@ Negative acknowledgement. Requests retransmission of one or more sequence number
 
 ### Ping — `0x03`
 
-Keepalive probe.  `echo` is the sender's current Unix timestamp in **microseconds**.  `session_id` is the **sender's own** randomly-generated session identifier, sent so the receiver can recognise this node if its network address changes between Pings.
+Keepalive probe.  `echo` is the sender's current Unix timestamp in **microseconds**.  `session_id` is the **sender's engine instance id**: random per socket (per process run), the same towards every peer. It lets the receiver recognise this node from a new address (migration) and notice when the node at a known address restarted.
 
 ```
 [echo: u64] [session_id: u64] [0x03]
 ```
 
-Sent when no outbound frame has been sent to a peer for `keepalive_interval` (default 5 s).  The keepalive tick runs at `keepalive_interval / 4`.
+Sent when nothing was sent to a peer, or nothing was received from it, for `keepalive_interval` (default 5 s).  The keepalive tick runs at `keepalive_interval / 4`.  A node also pings immediately when a data frame arrives from an address it has never seen, and a plain-mode `connect()` pings before returning, so instance ids are known within one round trip.
 
-On receipt the engine stores `session_id` in its per-peer session registry.  If a Ping arrives from an **unknown address** but carries a **known `session_id`**, the peer's address is migrated transparently (see *Network Migration* below).
+On receipt (Ping or Pong) the engine stores `session_id` in its per-peer session registry.  If it arrives from an **unknown address** but carries a **known `session_id`**, the peer's address is migrated transparently (see *Network Migration* below).  Without security, a **different** `session_id` from a **known address** means the remote restarted: every piece of per-peer state is discarded and a fresh session starts (`PeerEvent::Reset`).
 
 ### Pong — `0x04`
 
-Reply to a Ping.  Mirrors `echo` unchanged; carries the **replier's** own `session_id`.
+Reply to a Ping.  Mirrors `echo` unchanged; carries the **replier's** engine instance id.
 
 ```
 [echo: u64] [session_id: u64] [0x04]
@@ -167,32 +172,45 @@ See **Access control and hardening → Relay abuse protection** for allowlist, t
 One message in a Noise XX key exchange. Three messages are exchanged before the connection is encrypted.
 
 ```
-[noise_message bytes] [0x09]
+[noise_message bytes] [step: u8] [version: u8] [0x09]
 ```
+
+- `step`: 1 = msg1, 2 = msg2, 3 = msg3.
+- `version`: the sender's `WIRE_VERSION`.
 
 Message sizes for `Noise_XX_25519_ChaChaPoly_BLAKE2s`:
 
-| Message | Direction | Size |
-|---|---|---|
-| msg1 | initiator → responder | 32 B |
-| msg2 | responder → initiator | 80 B |
-| msg3 | initiator → responder | 48 B |
+| Message | Direction | Noise size | Noise payload |
+|---|---|---|---|
+| msg1 | initiator → responder | 40 B | initiator session index (u64, plaintext) |
+| msg2 | responder → initiator | 104 B | responder session index (u64, encrypted) |
+| msg3 | initiator → responder | 64 B | — |
 
-After all three messages the handshake is complete. Both sides call `into_stateless_transport_mode()` and all subsequent data frames are wrapped in `Secure` frames.
+After all three messages the handshake is complete. Both sides call `into_stateless_transport_mode()` and all subsequent data frames are wrapped in `Secure` frames addressed with the other side's session index.
 
 ### Secure — `0x0A` *(feature: `security`)*
 
-A Noise-encrypted data frame. The `ciphertext` is the output of `ChaCha20-Poly1305` AEAD applied to any plain inner frame — once the channel is established, all frame types except Handshake and Relay/Probe/Beacon are wrapped in Secure.
+A Noise-encrypted data frame. The `ciphertext` is the output of `ChaCha20-Poly1305` AEAD applied to any plain inner frame — once the channel is established, all frame types except Handshake, SessionUnknown and Probe/Beacon/MtuProbe are wrapped in Secure.
 
 ```
-[ciphertext bytes] [nonce: u64] [0x0A]
+[ciphertext bytes] [nonce: u64] [index: u64] [0x0A]
 ```
+
+- `index`: the session index the **receiver** chose in the handshake. The receiver finds the session by index, not by source address, so a session keeps working after the sender's address changes (see *Network Migration*).
 
 - `nonce`: per-peer send-side counter, strictly increasing per sender. Provided explicitly because UDP packets may arrive out of order — `StatelessTransportState` takes the nonce as a parameter rather than tracking it internally.
 - The AEAD tag (16 B) is appended to the ciphertext by the cipher; it is not a separate field.
 - The decrypting side validates the tag before delivering the plaintext.
 - NACK retransmits re-encrypt the original plaintext with a **fresh nonce** to avoid nonce reuse. The old nonce must not be reused even if the ciphertext is identical.
-- Anti-replay: a 64-bit sliding window (`highest` + bitmask) rejects nonces already seen within the last 64 slots of the highest received nonce. Nonces more than 64 behind the window are rejected unconditionally.
+- Duplicates are discarded by the reliability layer (sequence numbers), not by a crypto replay window, because a 64-slot window rejects legitimate reordering at high frame rates. The highest authenticated nonce per session is tracked so that only a **newer** frame can move a session to a new address; replaying an old datagram from elsewhere cannot redirect it.
+
+### SessionUnknown — `0x0D` *(feature: `security`)*
+
+```
+[index: u64] [0x0D]
+```
+
+Sent in plaintext in reply to a Secure frame whose `index` the receiver does not know (it restarted and lost the session), rate-limited to 5 per second per source IP. The initiator of the session named by `index` starts a new handshake in the background (at most once per handshake timeout); the old session stays in place until the new one replaces it, so a forged SessionUnknown can cost a handshake but cannot tear a session down. Responders ignore it.
 
 ### MtuProbe — `0x0B`
 
@@ -235,10 +253,11 @@ LAN discovery broadcast. Sent to the broadcast address `255.255.255.255` on the 
 LAN discovery reply. Sent as a unicast response to a Probe, back to the probe's source address.
 
 ```
-[meta bytes] [data_port: u16] [proto_ver: u16] [app_id: u64] [0x08]
+[meta bytes] [instance: u64] [data_port: u16] [proto_ver: u16] [app_id: u64] [0x08]
 ```
 
 - `data_port`: the ZUDP data port the advertising node is listening on.
+- `instance`: random per `Discovery::advertise` call; a new value from the same address means the advertiser restarted.
 - `meta`: application-defined metadata encoded with the active codec (may be 0 bytes).
 - `app_id` and `proto_ver`: must match the incoming Probe for the beacon to be accepted by the scanner.
 
@@ -272,7 +291,11 @@ The sender keeps a `BTreeMap<seq, (plain_frame, sent_at)>` per (peer, stream). E
 The receiver keeps a `BTreeMap<seq, Inbound>` per (peer, stream) and an `expected_seq` counter (starts at 1) per stream:
 
 - Frame at `seq == expected_seq`: deliver immediately, then drain consecutive buffered entries.
-- Frame at `seq > expected_seq`: NACK every seq in `[expected_seq, seq)` not already buffered, buffer this frame.
+- Frame at `seq > expected_seq`: NACK the first 128 seqs in `[expected_seq, seq)` not already buffered, buffer this frame.
+- Frame at `seq ≥ expected_seq + window` (window = `max(sent_buffer, 1024)`): dropped, so a forged sequence number cannot make the receiver track an unbounded gap.
+- In-order payloads are handed to the application only when the inbound channel has room; otherwise they stay buffered and delivery resumes as soon as the application reads again (no reliable data is dropped for backpressure).
+- Until a plain-mode peer's instance id is known, only the next in-order frame is accepted, so frames from a previous incarnation of the remote are neither buffered nor NACKed.
+- After a gap stays unresolved for `sent_prune_age`, only the missing seqs are skipped; frames buffered after the hole are still delivered.
 - Frame at `seq < expected_seq`: duplicate — silently discard.
 
 Nacks are sent immediately on gap detection; there is no delayed-NACK timer.
@@ -297,12 +320,14 @@ missing tail frame is delivered, and a hole before it is NACKed.
 | `MAX_CONCURRENT_ASSEMBLIES` | 64 — max concurrent incomplete fragment assemblies per (peer, stream) |
 | `MAX_SENT_FRAMES_PER_STREAM` | 1 024 — per-stream send buffer cap; oldest frame evicted when full |
 | `MAX_RETRANSMIT_TASKS` | 32 — max concurrent NACK retransmit tasks; overflow batches are dropped |
-| `INBOUND_CAP` | 8 192 — bounded inbound channel slots; frames dropped when full (`try_send`) |
+| `INBOUND_CAP` | 8 192 — bounded inbound channel slots; reliable frames wait in the reorder buffer when full, unreliable datagrams are dropped |
 | Default MTU | 1 400 B |
 | Default `sent_prune_age` | 10 s |
 | Default `keepalive_interval` | 5 s |
 | Default `max_peers` | 1 024 |
-| Default `max_pps_per_ip` | 1 000 (burst: 200) |
+| Default `max_pps_per_ip` | 1 000 (burst: 200); handshakes have a separate 20/s budget; peers with an established Noise session are exempt |
+| Default `handshake_timeout` | 5 s |
+| Default `peer_timeout` | 3 × `keepalive_interval` |
 | Default `max_relay_entries` | 256 |
 | Socket send/recv buffer | 4 MiB each |
 | Recv read buffer | 64 KiB (max UDP datagram) |
@@ -334,7 +359,11 @@ FNV-1a 64-bit:
 
 ### Protocol version
 
-The discovery protocol version (`proto_ver`) is a separate `u16` field in both Probe and Beacon frames, currently fixed at `1`. Nodes with mismatched `proto_ver` ignore each other's frames.
+The discovery protocol version (`proto_ver`) is a separate `u16` field in both Probe and Beacon frames, currently `2` (version 2 added `instance` to Beacon). Nodes with mismatched `proto_ver` ignore each other's frames.
+
+### Scan events
+
+`ScanStream::next_event()` reports `DiscoveryEvent::Found` the first time a data address answers, `Updated` when its metadata or `instance` changes, and `Lost` once it has not answered for `peer_ttl` (default 3 × `probe_interval`); a lost peer that answers again is `Found` again. `ScanStream::next()` returns the peers of `Found` and `Updated`. Malformed or foreign datagrams are skipped by scanners and advertisers alike; the advertise task never exits on its own.
 
 ### Probe flow
 
@@ -387,7 +416,15 @@ Initiator                              Responder
 
 The initiator is always the node that called `Zudp::connect()`. The responder is the node that called `Zudp::listen()`. The engine drives the handshake automatically.
 
-`Zudp::connect()` **blocks until all three messages complete** before returning to the caller. This guarantees that no application data can be sent before the `SecureChannel` is established. Implementations must enforce the same invariant: do not expose a send API on the connection handle until `into_stateless_transport_mode()` has been called successfully.
+`Zudp::connect()` **returns only after the handshake completed and one authenticated round trip succeeded** (an encrypted Ping answered by an encrypted Pong), so both ends hold the session. Loss is recovered by retransmission with back-off from 200 ms to 1 s, until `handshake_timeout` (default 5 s) expires with `Error::HandshakeTimeout`:
+
+- msg1 lost: the initiator resends msg1.
+- msg2 lost: the initiator resends msg1; a responder that sees a byte-identical msg1 resends its cached msg2.
+- msg3 lost: the initiator resends msg3 together with the confirming Ping until the responder answers.
+- A msg1 that does not match the responder's half-open state replaces it (the remote restarted mid-handshake). Half-open states expire after `handshake_timeout`.
+- If both sides initiate at once, the one whose msg1 ephemeral key is larger stays initiator.
+
+On a socket with a keypair, plaintext Datagram, Stream, Fragment, Nack, Ping, Pong and Relay frames are dropped (counted in `EngineStats::dropped_unauthenticated`), and sending to a peer without a session fails with `Error::NoSession` instead of falling back to plaintext.
 
 ### Encrypted send path
 
@@ -412,9 +449,10 @@ The initiator is always the node that called `Zudp::connect()`. The responder is
 | Ping / Pong | yes — keepalives carry a session ID; encrypting them prevents replay-based migration attacks |
 | Nack | yes — sequence numbers reveal delivery timing; encrypting prevents traffic analysis |
 | MtuAck | yes |
-| Datagram (unreliable) | no — bypass for latency-critical fire-and-forget data |
+| Datagram (unreliable) | yes (since wire version 2) |
 | Handshake | no (by definition, sent before the channel exists) |
-| Relay / Probe / Beacon | no (routing/discovery frames are always plaintext) |
+| Probe / Beacon / MtuProbe / SessionUnknown | no (discovery and path probing are always plaintext) |
+| Relay | not accepted by a node with a keypair |
 
 ### Nonce exhaustion
 
@@ -422,7 +460,7 @@ The send nonce is a monotonically increasing `u64` starting from 0. At a rate of
 
 ### Remote key pinning *(feature: `security`)*
 
-An endpoint may pin the expected X25519 static public key of its peer. If provided, the key is checked during the Noise XX handshake immediately after the remote's static key becomes available — after `read_message(msg2)` on the initiator side, and after `read_message(msg3)` on the responder side. A mismatch causes the handshake to be aborted silently (no error frame is sent to avoid oracle attacks). The `connect()` call on the initiator will time out rather than return an error, preventing peer enumeration.
+An endpoint may pin the expected X25519 static public key of its peer. If provided, the key is checked during the Noise XX handshake immediately after the remote's static key becomes available — after `read_message(msg2)` on the initiator side, and after `read_message(msg3)` on the responder side. A mismatch aborts the handshake; no error frame is sent. The initiator learns the responder's key from msg2, so `connect()` fails immediately with `Error::KeyMismatch`. A responder that pins a key drops the handshake silently, and the initiator times out.
 
 ---
 
@@ -522,29 +560,33 @@ Implementations should expose per-peer congestion state for application use:
 
 ## Network Migration
 
-When a node changes its local network interface (WiFi → mobile, DHCP renew, VPN toggle), its UDP socket becomes invalid and the far end's peer table still points to the old address.  ZUDP recovers transparently via session IDs embedded in Ping/Pong frames.
+When a node changes network (Wi-Fi → mobile, DHCP renew, VPN toggle, NAT rebinding), the far end sees its datagrams arrive from a new address.  ZUDP keeps the session: with security by the session index in every Secure frame, without security by the engine instance id in Ping/Pong frames.  Either way the far end emits `PeerEvent::Migrated { from, to }`.
 
-### Session IDs
+### Secure sessions (roaming)
 
-Each `PeerState` is assigned a random 64-bit `my_session_id` on creation.  This value is:
+A Secure frame is matched to its session by `index`.  When it authenticates, carries a nonce newer than any before, and comes from a different address, the session is re-keyed to that address (peer table, receive state, MTU re-probe).  No Ping is needed, so the first data frame after the move already arrives on the right session.
 
-- Included in every outbound Ping and Pong as the sender's session identifier.
-- Stored as `their_session_id` by the receiver the first time it arrives.
-- Registered in a `sessions: HashMap<u64, PeerState>` index for O(1) lookup by session ID.
+### Instance ids (plain mode)
 
-### Client-side rebind
+Each engine picks a random 64-bit instance id at start.  It is:
 
-When `recv_from()` returns an unrecoverable I/O error (e.g. `ENETUNREACH` after an interface disappears):
+- Included in every outbound Ping and Pong.
+- Stored per peer by the receiver and indexed in `sessions: HashMap<u64, PeerState>`.
+- Used to detect a restarted remote: a new id from a known address resets that peer.
 
-1. Engine creates a new UDP socket bound to the same local address (fallback: port 0).
-2. Engine replaces `EngineInner.socket` so all future sends use the new interface.
-3. Engine immediately sends Ping to every known peer, carrying `peer.my_session_id`, from the new socket.
+### Receive errors
+
+Errors about a single remote (ICMP port unreachable surfacing as `ConnectionReset` / `ConnectionRefused`, unreachable networks, interruptions) are ignored; on Windows `SIO_UDP_CONNRESET` is switched off so they do not occur.  Other errors are retried with back-off.  Only a socket bound to an ephemeral port is replaced after 10 consecutive hard errors; a socket bound to a requested port is never moved to another port.
+
+### Exclusive ports
+
+Data sockets are bound without `SO_REUSEPORT` / `SO_REUSEADDR` (and with `SO_EXCLUSIVEADDRUSE` on Windows).  A second socket on the same port fails to bind instead of silently receiving part of the traffic, and background tasks hold only weak references so the port is released as soon as the last handle is dropped.
 
 ### Server-side migration detection
 
 When a Ping arrives from an **unknown source address** `new_addr`:
 
-1. Engine looks up `sessions[session_id]`.
+1. Engine looks up `sessions[session_id]` (plain mode; secure sessions roam by index as above).
 2. If found and `old_addr != new_addr`:
    - `peer.migrate_to(new_addr)` — updates the live address Arc.
    - `peers.remove(old_addr); peers.insert(new_addr, peer)` — re-keys the peer map.
@@ -560,11 +602,18 @@ When a Ping arrives from an **unknown source address** `new_addr`:
 
 | Topology | After network change |
 |---|---|
-| Client (any NAT) → Server (public IP) | ✓ migration works |
+| Client (any NAT) → Server (public IP) | ✓ migration works (plain and secure) |
 | Client configured with relay | ✓ relay table updates on first Ping from new addr |
 | P2P both behind NAT (no relay) | ✗ new NAT mappings needed — use relay or re-initiate hole punching |
 
 ---
+
+## Peer liveness and events
+
+- A peer that sends nothing for `peer_timeout` (default 3 × `keepalive_interval` = 15 s) is dropped with all its state; with security only authenticated frames count.  Keepalive Pings keep live, idle peers well inside the timeout.
+- `ZudpSocket::events()` / `ZudpConn::events()` / `ZudpSender::events()` return a `PeerEvents` subscription yielding `PeerEvent::{Connected, Reset, Migrated, Disconnected}`.  `Disconnected` carries a `DisconnectReason`: `TimedOut`, `Removed` (`remove_peer`) or `Evicted` (peer table full).
+- `ZudpConn::recv()` returns `Error::PeerTimeout` once its peer timed out (after any messages that were already received).
+- When a remote restarts or re-handshakes, the old per-peer state (sequence counters, send buffers, receive and fragment state, congestion state, keys) is replaced as a whole and `PeerEvent::Reset` is emitted.
 
 ## Path MTU Discovery (PLPMTUD)
 
@@ -585,7 +634,7 @@ Each probe is a `MtuProbe` frame padded so the total datagram equals the size un
 |---|---|
 | Per-probe timeout | 200 ms |
 | Total probe cap (`connect()`) | 5 s |
-| Fallback on timeout | configured `mtu` (no change) |
+| Fallback when no probe is answered | configured `mtu` (no change) |
 
 ### Effective MTU
 
@@ -622,6 +671,7 @@ Available via `ZudpSocket::engine_stats()` and `ZudpConn::engine_stats()`.
 | `dropped_peer_cap` | `u64` | Times the peer table was full and an LRU eviction occurred |
 | `dropped_relay_blocked` | `u64` | Relay frames from IPs not in the allowlist |
 | `dropped_relay_cap` | `u64` | Relay frames dropped because the routing table was full |
+| `dropped_unauthenticated` | `u64` | Plaintext data frames dropped by a socket with a keypair |
 
 All counters are read with `Ordering::Relaxed`; they may lag by one instruction reorder but are never negative or wrapping in practice over a socket's lifetime.
 
