@@ -51,7 +51,8 @@ pub const DEFAULT_STREAM: u16 = 0;
 pub use codec::{Decode, Encode};
 #[cfg(feature = "discovery")]
 pub use discovery::{
-    AdvertiseHandle, AppId, DISCOVERY_PORT, DiscoveredPeer, Discovery, DiscoveryConfig, ScanStream,
+    AdvertiseHandle, AppId, DISCOVERY_PORT, DiscoveredPeer, Discovery, DiscoveryConfig,
+    DiscoveryEvent, ScanStream,
 };
 pub use error::Error;
 pub use event::{DisconnectReason, PeerEvent, PeerEvents};

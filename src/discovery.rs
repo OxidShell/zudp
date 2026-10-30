@@ -1,20 +1,26 @@
 #![allow(clippy::module_name_repetitions)]
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     marker::PhantomData,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::{Bytes, BytesMut};
 use parking_lot::RwLock;
 use tokio::{net::UdpSocket, task::AbortHandle, time};
 
-use crate::{Decode, Encode, Error, frame::Frame};
+use crate::{Decode, Encode, Error, frame::Frame, socket::is_transient_recv_error};
 
-const PROTO_VER: u16 = 1;
+/// Discovery wire version.  2: beacons carry the advertiser instance id.
+const PROTO_VER: u16 = 2;
+
+const RECV_BUF: usize = 65_536;
+
+/// Pause after a hard receive error on the advertise socket before trying again.
+const ADVERTISE_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Default UDP port for discovery probes and beacons.
 pub const DISCOVERY_PORT: u16 = 7701;
@@ -83,6 +89,7 @@ pub struct DiscoveryConfig<M = ()> {
     pub(crate) discovery_port: u16,
     pub(crate) probe_interval: Duration,
     pub(crate) broadcast_addr: Ipv4Addr,
+    pub(crate) peer_ttl: Option<Duration>,
     pub(crate) meta: M,
 }
 
@@ -99,6 +106,7 @@ impl DiscoveryConfig<()> {
             discovery_port: DISCOVERY_PORT,
             probe_interval: Duration::from_secs(5),
             broadcast_addr: Ipv4Addr::BROADCAST,
+            peer_ttl: None,
             meta: (),
         }
     }
@@ -124,6 +132,7 @@ impl<M> DiscoveryConfig<M> {
             discovery_port: self.discovery_port,
             probe_interval: self.probe_interval,
             broadcast_addr: self.broadcast_addr,
+            peer_ttl: self.peer_ttl,
             meta,
         }
     }
@@ -139,6 +148,14 @@ impl<M> DiscoveryConfig<M> {
     #[must_use]
     pub fn probe_interval(mut self, interval: Duration) -> Self {
         self.probe_interval = interval;
+        self
+    }
+
+    /// How long a scanned peer may stay silent before it is reported
+    /// [`DiscoveryEvent::Lost`] (default: 3 × `probe_interval`).
+    #[must_use]
+    pub fn peer_ttl(mut self, ttl: Duration) -> Self {
+        self.peer_ttl = Some(ttl);
         self
     }
 
@@ -173,6 +190,8 @@ pub struct DiscoveredPeer<M> {
     pub from: SocketAddr,
     /// Address to pass to [`crate::Zudp::connect`] to open a data connection.
     pub data_addr: SocketAddr,
+    /// Random id of the advertiser run; it changes when the peer restarts.
+    pub instance: u64,
     /// Application-defined metadata the peer is advertising.
     pub meta: M,
 }
@@ -198,58 +217,163 @@ impl<M> Drop for AdvertiseHandle<M> {
     }
 }
 
-/// Continuous stream of newly discovered peers.
+/// A change in the set of peers a [`ScanStream`] sees.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum DiscoveryEvent<M> {
+    /// A peer answered for the first time (or again after it was reported [`Lost`](Self::Lost)).
+    Found(DiscoveredPeer<M>),
+    /// A known peer changed its metadata, or restarted (new [`DiscoveredPeer::instance`]).
+    Updated(DiscoveredPeer<M>),
+    /// No beacon from `data_addr` for the configured peer TTL.
+    Lost { data_addr: SocketAddr },
+}
+
+struct Seen {
+    last: Instant,
+    instance: u64,
+    meta: Bytes,
+}
+
+/// Continuous view of the peers on the network.
 ///
-/// Created by [`Discovery::scan_stream`]. Each call to [`next`](Self::next)
-/// blocks until a previously-unseen peer responds, yielding it exactly once
-/// (deduped by data address). Re-probes the network at `probe_interval` to
-/// catch peers that join after the scan begins.
+/// Created by [`Discovery::scan_stream`].  Re-probes every `probe_interval`, reports each
+/// peer when it appears, again when it restarts or changes its metadata, and once more when
+/// it stops answering for `peer_ttl` (see [`next_event`](Self::next_event)).
 pub struct ScanStream<M> {
     socket: Arc<UdpSocket>,
     app_id: u64,
     broadcast_addr: SocketAddr,
     ticker: time::Interval,
-    seen: HashSet<SocketAddr>,
+    peer_ttl: Duration,
+    seen: HashMap<SocketAddr, Seen>,
+    lost: VecDeque<SocketAddr>,
     _phantom: PhantomData<fn() -> M>,
 }
 
 impl<M: Decode> ScanStream<M> {
-    /// Wait for the next newly-discovered peer.
+    /// Wait for the next peer that is new, restarted, or changed its metadata.
     ///
-    /// Never returns `Ok` for a peer already reported in this session.
+    /// Peers that go silent are dropped from the view without being reported here; use
+    /// [`next_event`](Self::next_event) to see them leave.
     ///
     /// # Errors
-    /// Returns `Err` on I/O or message-decode failure.
+    /// Returns `Err` only if the scan socket itself fails.
     pub async fn next(&mut self) -> Result<DiscoveredPeer<M>, Error> {
         loop {
-            tokio::select! {
+            match self.next_event().await? {
+                DiscoveryEvent::Found(peer) | DiscoveryEvent::Updated(peer) => return Ok(peer),
+                DiscoveryEvent::Lost { .. } => {}
+            }
+        }
+    }
+
+    /// Wait for the next change: a peer found, updated or lost.
+    ///
+    /// Malformed or foreign datagrams are skipped, never returned as errors.
+    ///
+    /// # Errors
+    /// Returns `Err` only if the scan socket itself fails.
+    pub async fn next_event(&mut self) -> Result<DiscoveryEvent<M>, Error> {
+        loop {
+            if let Some(data_addr) = self.lost.pop_front() {
+                return Ok(DiscoveryEvent::Lost { data_addr });
+            }
+            let received = tokio::select! {
                 biased;
-
-                result = recv_frame(&self.socket) => {
-                    let (frame, from) = result?;
-                    let Frame::Beacon { app_id, proto_ver, data_port, meta } = frame else {
-                        continue;
-                    };
-                    if app_id != self.app_id || proto_ver != PROTO_VER {
-                        continue;
+                result = recv_datagram(&self.socket) => Some(result),
+                _ = self.ticker.tick() => None,
+            };
+            match received {
+                Some(Ok((buf, from))) => {
+                    if let Ok(frame) = Frame::decode(buf)
+                        && let Some(event) = self.observe(frame, from)
+                    {
+                        return Ok(event);
                     }
-                    let data_addr = SocketAddr::new(from.ip(), data_port);
-                    if !self.seen.insert(data_addr) {
-                        continue;
-                    }
-                    let meta = M::decode_from_bytes(&meta)?;
-                    return Ok(DiscoveredPeer { from, data_addr, meta });
                 }
-
-                _ = self.ticker.tick() => {
+                Some(Err(e)) if is_transient_recv_error(&e) => {}
+                Some(Err(e)) => return Err(e.into()),
+                None => {
+                    self.expire();
                     let probe = Frame::Probe {
                         app_id: self.app_id,
                         proto_ver: PROTO_VER,
-                    }.encode();
+                    }
+                    .encode();
                     let _ = self.socket.send_to(&probe, self.broadcast_addr).await;
                 }
             }
         }
+    }
+
+    fn expire(&mut self) {
+        let ttl = self.peer_ttl;
+        let lost = &mut self.lost;
+        self.seen.retain(|addr, seen| {
+            let keep = seen.last.elapsed() < ttl;
+            if !keep {
+                lost.push_back(*addr);
+            }
+            keep
+        });
+    }
+
+    /// Turn one beacon into an event, if it changes anything.
+    fn observe(&mut self, frame: Frame, from: SocketAddr) -> Option<DiscoveryEvent<M>> {
+        let Frame::Beacon {
+            app_id,
+            proto_ver,
+            data_port,
+            instance,
+            meta,
+        } = frame
+        else {
+            return None;
+        };
+        if app_id != self.app_id || proto_ver != PROTO_VER {
+            return None;
+        }
+        let data_addr = SocketAddr::new(from.ip(), data_port);
+        let now = Instant::now();
+        let changed = match self.seen.get_mut(&data_addr) {
+            Some(seen) => {
+                seen.last = now;
+                let changed = seen.instance != instance || seen.meta != meta;
+                seen.instance = instance;
+                seen.meta = meta.clone();
+                if changed { Some(false) } else { None }
+            }
+            None => {
+                self.seen.insert(
+                    data_addr,
+                    Seen {
+                        last: now,
+                        instance,
+                        meta: meta.clone(),
+                    },
+                );
+                Some(true)
+            }
+        }?;
+        let meta = match M::decode_from_bytes(&meta) {
+            Ok(meta) => meta,
+            Err(e) => {
+                tracing::debug!(target: "zudp::discovery", %from, "beacon meta decode failed: {e}");
+                return None;
+            }
+        };
+        let peer = DiscoveredPeer {
+            from,
+            data_addr,
+            instance,
+            meta,
+        };
+        Some(if changed {
+            DiscoveryEvent::Found(peer)
+        } else {
+            DiscoveryEvent::Updated(peer)
+        })
     }
 }
 
@@ -283,6 +407,7 @@ impl Discovery {
             socket,
             cfg.app_id.raw(),
             cfg.data_port,
+            crate::peer::random_u64(),
             meta_arc,
         ));
         Ok(AdvertiseHandle {
@@ -328,15 +453,19 @@ impl Discovery {
             app_id: cfg.app_id.raw(),
             broadcast_addr,
             ticker,
-            seen: HashSet::new(),
+            peer_ttl: cfg.peer_ttl.unwrap_or(cfg.probe_interval * 3),
+            seen: HashMap::new(),
+            lost: VecDeque::new(),
             _phantom: PhantomData,
         })
     }
 
     /// Scan once and collect all peers that respond within `timeout`.
     ///
+    /// Malformed replies are skipped.
+    ///
     /// # Errors
-    /// Returns `Err` if binding, the probe broadcast, or any response decode fails.
+    /// Returns `Err` if binding or the probe broadcast fails.
     pub async fn scan_once<M>(
         config: impl Into<DiscoveryConfig<()>>,
         timeout: Duration,
@@ -344,54 +473,25 @@ impl Discovery {
     where
         M: Decode,
     {
-        let cfg = config.into();
-        // Same as scan_stream: bind our own port instead of discovery_port.
-        let socket = bind_discovery_socket(0)?;
-        let broadcast_addr = SocketAddr::new(IpAddr::V4(cfg.broadcast_addr), cfg.discovery_port);
-        let app_id = cfg.app_id.raw();
-
-        let probe = Frame::Probe {
-            app_id,
-            proto_ver: PROTO_VER,
-        }
-        .encode();
-        socket.send_to(&probe, broadcast_addr).await?;
-
+        let mut scan = Self::scan_stream::<M>(config).await?;
         let mut peers = Vec::new();
-        let mut seen: HashSet<SocketAddr> = HashSet::new();
+        let mut reported: HashSet<SocketAddr> = HashSet::new();
         let deadline = time::Instant::now() + timeout;
-
         loop {
             let remaining = deadline.saturating_duration_since(time::Instant::now());
             if remaining.is_zero() {
                 break;
             }
-            match time::timeout(remaining, recv_frame(&socket)).await {
+            match time::timeout(remaining, scan.next()).await {
                 Err(_elapsed) => break,
                 Ok(Err(e)) => return Err(e),
-                Ok(Ok((
-                    Frame::Beacon {
-                        app_id: bid,
-                        proto_ver,
-                        data_port,
-                        meta,
-                    },
-                    from,
-                ))) if bid == app_id && proto_ver == PROTO_VER => {
-                    let data_addr = SocketAddr::new(from.ip(), data_port);
-                    if seen.insert(data_addr) {
-                        let meta = M::decode_from_bytes(&meta)?;
-                        peers.push(DiscoveredPeer {
-                            from,
-                            data_addr,
-                            meta,
-                        });
+                Ok(Ok(peer)) => {
+                    if reported.insert(peer.data_addr) {
+                        peers.push(peer);
                     }
                 }
-                Ok(Ok(_)) => {}
             }
         }
-
         Ok(peers)
     }
 }
@@ -409,29 +509,39 @@ fn bind_discovery_socket(port: u16) -> Result<UdpSocket, Error> {
     sock.set_broadcast(true)?;
     sock.set_nonblocking(true)?;
     sock.bind(&socket2::SockAddr::from(addr))?;
+    #[cfg(windows)]
+    crate::socket::win::disable_udp_connreset(&sock)?;
     let std_sock: std::net::UdpSocket = sock.into();
     Ok(UdpSocket::from_std(std_sock)?)
 }
 
-async fn recv_frame(socket: &UdpSocket) -> Result<(Frame, SocketAddr), Error> {
-    let mut buf = BytesMut::with_capacity(65_536);
+async fn recv_datagram(socket: &UdpSocket) -> std::io::Result<(BytesMut, SocketAddr)> {
+    let mut buf = BytesMut::with_capacity(RECV_BUF);
     let (_, addr) = socket.recv_buf_from(&mut buf).await?;
-    Frame::decode(buf).map(|f| (f, addr))
+    Ok((buf, addr))
 }
 
 async fn run_advertise<M: Encode + Send + Sync + 'static>(
     socket: Arc<UdpSocket>,
     app_id: u64,
     data_port: u16,
+    instance: u64,
     meta: Arc<RwLock<M>>,
 ) {
+    // Never exits on its own: one bad datagram or a transient socket error must not
+    // silently end advertising while the handle still looks alive.
     loop {
-        let (frame, from) = match recv_frame(&socket).await {
+        let (buf, from) = match recv_datagram(&socket).await {
             Ok(pair) => pair,
+            Err(e) if is_transient_recv_error(&e) => continue,
             Err(e) => {
                 tracing::warn!(target: "zudp::discovery", "recv error: {e}");
-                break;
+                time::sleep(ADVERTISE_ERROR_BACKOFF).await;
+                continue;
             }
+        };
+        let Ok(frame) = Frame::decode(buf) else {
+            continue;
         };
 
         let Frame::Probe {
@@ -457,6 +567,7 @@ async fn run_advertise<M: Encode + Send + Sync + 'static>(
             app_id,
             proto_ver: PROTO_VER,
             data_port,
+            instance,
             meta: meta_bytes,
         }
         .encode();

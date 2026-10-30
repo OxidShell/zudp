@@ -25,8 +25,8 @@ pub const MAX_NACK_SEQS: usize = 128;
 /// Relay(v4) : [inner][port: u16 BE][ip: 4 bytes][0x00][0x06]                     (8 bytes)
 /// Relay(v6) : [inner][port: u16 BE][ip: 16 bytes][0x01][0x06]                    (20 bytes)
 /// Probe     : [app_id: u64 BE][proto_ver: u16 BE][0x07]                           (11 bytes)
-/// Beacon    : [meta bytes][data_port: u16 BE][proto_ver: u16 BE]
-///                         [app_id: u64 BE][0x08]                                  (13 + meta bytes)
+/// Beacon    : [meta bytes][instance: u64 BE][data_port: u16 BE][proto_ver: u16 BE]
+///                         [app_id: u64 BE][0x08]                                  (21 + meta bytes)
 /// MtuProbe  : [zeros: padding bytes][probe_id: u16 BE][0x0B]                     (3 + padding bytes)
 /// MtuAck    : [probe_id: u16 BE][0x0C]                                            (3 bytes)
 /// Handshake : [noise msg][step: u8][version: u8][0x09]                            (3 bytes)
@@ -91,6 +91,8 @@ pub enum Frame {
         app_id: u64,
         proto_ver: u16,
         data_port: u16,
+        /// Random per advertiser start; a new value from the same address means a restart.
+        instance: u64,
         meta: Bytes,
     },
     /// One Noise XX handshake message (msg1, msg2, or msg3).
@@ -212,10 +214,12 @@ impl Frame {
                 app_id,
                 proto_ver,
                 data_port,
+                instance,
                 meta,
             } => {
-                let mut buf = BytesMut::with_capacity(meta.len() + 13);
+                let mut buf = BytesMut::with_capacity(meta.len() + 21);
                 buf.extend_from_slice(&meta);
+                buf.put_u64(instance);
                 buf.put_u16(data_port);
                 buf.put_u16(proto_ver);
                 buf.put_u64(app_id);
@@ -428,10 +432,15 @@ impl Frame {
                     frame: "beacon",
                     field: "data_port",
                 })?;
+                let instance = pop_u64(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "beacon",
+                    field: "instance",
+                })?;
                 Ok(Frame::Beacon {
                     app_id,
                     proto_ver,
                     data_port,
+                    instance,
                     meta: data.freeze(),
                 })
             }
@@ -699,11 +708,13 @@ mod tests {
             app_id,
             proto_ver,
             data_port,
+            instance,
             meta: out_meta,
         } = roundtrip(Frame::Beacon {
             app_id: 0xdead_beef_cafe_babe,
             proto_ver: 1,
             data_port: 7700,
+            instance: 42,
             meta: meta.clone(),
         })
         else {
@@ -712,6 +723,7 @@ mod tests {
         assert_eq!(app_id, 0xdead_beef_cafe_babe);
         assert_eq!(proto_ver, 1);
         assert_eq!(data_port, 7700);
+        assert_eq!(instance, 42);
         assert_eq!(out_meta, meta);
     }
 
