@@ -22,14 +22,6 @@ use crate::{
     socket::{self, RawSocket},
 };
 
-/// Runtime-mutable relay access control, updateable without socket rebind.
-pub struct RelayPolicy {
-    /// IP allowlist for relay frame sources.  Empty = allow all.
-    pub allowlist: Vec<std::net::IpAddr>,
-    /// Maximum entries in the relay routing table.
-    pub max_entries: usize,
-}
-
 /// Maximum concurrent NACK retransmit tasks across the engine.
 ///
 /// Each task handles one NACK batch (one peer, one burst of missing seqs).  Capping
@@ -90,8 +82,6 @@ pub(crate) struct EngineInner {
     pub shutdown_reason: Mutex<Option<String>>,
     pub dropped_rate_limited: AtomicU64,
     pub dropped_peer_cap: AtomicU64,
-    pub dropped_relay_blocked: AtomicU64,
-    pub dropped_relay_cap: AtomicU64,
     /// Plaintext data frames dropped because a keypair is configured.
     pub dropped_unauthenticated: AtomicU64,
     /// Set when a reliable stream could not deliver because the inbound channel was full;
@@ -106,8 +96,6 @@ pub(crate) struct EngineInner {
     /// Budget for `SessionUnknown` replies per source IP.
     #[cfg(feature = "security")]
     pub hint_limiter: Mutex<crate::rate::RateLimiter>,
-    /// Runtime-mutable relay access policy (allowlist + table cap).
-    pub relay_policy: RwLock<RelayPolicy>,
 }
 
 impl EngineInner {
@@ -254,22 +242,6 @@ async fn run(
 ) {
     // Keyed by (peer_addr, stream_id) so each stream has independent reorder + reassembly.
     let mut recv_states: RecvStates = HashMap::new();
-    // Stateful relay table: maps server_addr → (client_addr, last_seen_gen).
-    // `last_seen_gen` is the relay_gen value at the last Frame::Relay from that client.
-    // Entries pruned when (relay_gen - last_seen_gen) >= relay_ttl_ticks.
-    // No Instant/syscall in the hot path — generation counter is a u32 store.
-    let mut relay_table: HashMap<SocketAddr, (SocketAddr, u32)> = HashMap::new();
-    // Monotonic counter incremented once per background tick.  Wrapping arithmetic
-    // is intentional: correct for the ~170-year lifetime of a u32 at 240 ticks/5 min.
-    let mut relay_gen: u32 = 0;
-    // TTL expressed as a tick delta: 5 minutes / tick_interval.
-    // A small positive tick count, so the float-to-int cast cannot truncate or wrap.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let relay_ttl_ticks = {
-        let tick_secs = inner.config.keepalive_interval.as_secs_f64() / 4.0;
-        (300.0_f64 / tick_secs).ceil() as u32
-    };
-
     let keepalive_interval = inner.config.keepalive_interval;
     let sent_prune_age = inner.config.sent_prune_age;
 
@@ -326,7 +298,7 @@ async fn run(
                         }
                         handle_incoming(
                             data, from, &inner, &inbound_tx,
-                            &mut recv_states, &mut relay_table, relay_gen,
+                            &mut recv_states,
                             &mut retransmit_tasks,
                         ).await;
                     }
@@ -367,8 +339,7 @@ async fn run(
 
             _ = ticker.tick() => {
                 run_background(
-                    &inner, &mut recv_states, &mut relay_table, &mut relay_gen,
-                    relay_ttl_ticks, &mut rate_limiter, keepalive_interval, sent_prune_age,
+                    &inner, &mut recv_states, &mut rate_limiter, keepalive_interval, sent_prune_age,
                 );
             }
         }
@@ -419,21 +390,8 @@ async fn handle_incoming(
     inner: &Arc<EngineInner>,
     inbound_tx: &mpsc::Sender<(Bytes, SocketAddr, u16)>,
     recv_states: &mut RecvStates,
-    relay_table: &mut HashMap<SocketAddr, (SocketAddr, u32)>,
-    relay_gen: u32,
     retransmit_tasks: &mut JoinSet<()>,
 ) {
-    // Stateful relay pass-through: if `from` is a server we're relaying for, forward its raw
-    // reply bytes directly to the mapped client without decoding.  This is checked before
-    // Frame::decode so that encrypted and opaque frames are forwarded transparently.
-    if let Some(&(client_addr, _)) = relay_table.get(&from) {
-        tracing::trace!(target: "zudp::engine", server = %from, client = %client_addr, "relay ← server → client");
-        if let Err(e) = inner.get_socket().send_to(&data, client_addr).await {
-            tracing::warn!(target: "zudp::engine", client = %client_addr, "relay forward to client failed: {e}");
-        }
-        return;
-    }
-
     let frame = match Frame::decode(data) {
         Ok(f) => f,
         Err(e) => {
@@ -478,8 +436,6 @@ async fn handle_incoming(
                     inner,
                     inbound_tx,
                     recv_states,
-                    relay_table,
-                    relay_gen,
                     retransmit_tasks,
                 )
                 .await;
@@ -499,8 +455,6 @@ async fn handle_incoming(
                     inner,
                     inbound_tx,
                     recv_states,
-                    relay_table,
-                    relay_gen,
                     retransmit_tasks,
                 )
                 .await;
@@ -516,8 +470,6 @@ async fn handle_incoming(
         inner,
         inbound_tx,
         recv_states,
-        relay_table,
-        relay_gen,
         retransmit_tasks,
     )
     .await;
@@ -534,8 +486,6 @@ async fn dispatch_frame(
     inner: &Arc<EngineInner>,
     inbound_tx: &mpsc::Sender<(Bytes, SocketAddr, u16)>,
     recv_states: &mut RecvStates,
-    relay_table: &mut HashMap<SocketAddr, (SocketAddr, u32)>,
-    relay_gen: u32,
     retransmit_tasks: &mut JoinSet<()>,
 ) {
     match frame {
@@ -682,42 +632,6 @@ async fn dispatch_frame(
                 inbound_tx,
             )
             .await;
-        }
-
-        Frame::Relay {
-            dest,
-            inner: payload,
-        } => {
-            // Read relay policy atomically — policy may be updated at runtime.
-            let (policy_allowlist, policy_max) = {
-                let p = inner.relay_policy.read();
-                (p.allowlist.clone(), p.max_entries)
-            };
-            // Allowlist check: if non-empty, only listed IPs may use this node as a relay.
-            if !policy_allowlist.is_empty() && !policy_allowlist.contains(&from.ip()) {
-                tracing::warn!(target: "zudp::engine", %from, "relay denied — not in allowlist");
-                inner.dropped_relay_blocked.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            // Cap relay table size to prevent unbounded memory growth under abuse.
-            if !relay_table.contains_key(&dest) && relay_table.len() >= policy_max {
-                tracing::warn!(target: "zudp::engine", "relay table full — dropping entry for {dest}");
-                inner.dropped_relay_cap.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            // Record client→server mapping so replies from `dest` can be routed back to `from`.
-            // Upsert refreshes the generation counter — zero syscall cost.
-            relay_table
-                .entry(dest)
-                .and_modify(|(stored_from, last_gen)| {
-                    *stored_from = from;
-                    *last_gen = relay_gen;
-                })
-                .or_insert((from, relay_gen));
-            tracing::trace!(target: "zudp::engine", client = %from, server = %dest, "relay client → server");
-            if let Err(e) = inner.get_socket().send_to(&payload, dest).await {
-                tracing::warn!(target: "zudp::engine", %dest, "relay forward failed: {e}");
-            }
         }
 
         Frame::MtuProbe { probe_id, .. } => {
@@ -993,17 +907,7 @@ async fn send_tail_probe(
     let Some(wire) = seal(inner, peer, plain_frame) else {
         return;
     };
-    let (wire, dest) = match inner.config.relay_addr {
-        Some(relay) => (
-            Frame::Relay {
-                dest: peer.addr(),
-                inner: wire,
-            }
-            .encode(),
-            relay,
-        ),
-        None => (wire, peer.addr()),
-    };
+    let dest = peer.addr();
     peer.cc.lock().consume(wire.len());
     tracing::debug!(target: "zudp::engine", peer = %peer.addr(), seq, stream_id, "tail loss probe");
     if let Err(e) = inner.get_socket().send_to(&wire, dest).await {
@@ -1039,9 +943,6 @@ async fn send_nack_if_needed(
 fn run_background(
     inner: &Arc<EngineInner>,
     recv_states: &mut RecvStates,
-    relay_table: &mut HashMap<SocketAddr, (SocketAddr, u32)>,
-    relay_gen: &mut u32,
-    relay_ttl_ticks: u32,
     rate_limiter: &mut crate::rate::RateLimiter,
     keepalive_interval: Duration,
     sent_prune_age: Duration,
@@ -1106,13 +1007,6 @@ fn run_background(
             );
         }
     }
-
-    // Advance the relay generation counter and prune stale entries.
-    // Wrapping arithmetic is intentional — correct over the ~170-year u32 lifetime.
-    *relay_gen = relay_gen.wrapping_add(1);
-    let current_gen = *relay_gen;
-    relay_table
-        .retain(|_, (_, last_seen_gen)| current_gen.wrapping_sub(*last_seen_gen) < relay_ttl_ticks);
 
     rate_limiter.tick_prune();
 

@@ -36,7 +36,6 @@ pub enum Error {
         got: usize,
         max: usize,
     },
-    UnknownRelay(SocketAddr),
     /// Packet had no bytes — frame type byte is missing.
     FrameEmpty,
     /// Packet was cut short: a required field was absent.
@@ -114,7 +113,6 @@ impl fmt::Display for Error {
             Self::MessageTooLarge { got, max } => {
                 write!(f, "message needs {got} fragments, max is {max}")
             }
-            Self::UnknownRelay(addr) => write!(f, "no route to relay {addr}"),
             Self::FrameEmpty => f.write_str("frame parse: empty packet"),
             Self::FrameTruncated { frame, field } => {
                 write!(f, "frame parse: {frame} missing `{field}`")

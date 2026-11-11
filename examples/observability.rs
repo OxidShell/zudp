@@ -63,12 +63,8 @@ async fn main() -> anyhow::Result<()> {
             // Engine-wide counters — useful for dashboards / alerting.
             let e = socket.engine_stats();
             println!(
-                "server  engine_stats  rate_limited={}  peer_cap_evictions={}  \
-                 relay_blocked={}  relay_cap={}",
-                e.dropped_rate_limited,
-                e.dropped_peer_cap,
-                e.dropped_relay_blocked,
-                e.dropped_relay_cap,
+                "server  engine_stats  rate_limited={}  peer_cap_evictions={}",
+                e.dropped_rate_limited, e.dropped_peer_cap,
             );
         }
     });

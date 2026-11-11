@@ -431,37 +431,6 @@ async fn engine_stats_peer_cap_counter_increments() {
 }
 
 #[tokio::test]
-async fn engine_stats_relay_blocked_counter_increments() {
-    // Relay only allows 127.0.0.2; our loopback client is 127.0.0.1 — blocked.
-    let relay: zudp::ZudpSocket<Vec<u8>> = Zudp::default()
-        .bind_ip(LOOPBACK)
-        .port(0)
-        .relay_allowlist(vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))])
-        .listen()
-        .await
-        .unwrap();
-    let relay_addr = relay.local_addr().unwrap();
-    let server: zudp::ZudpSocket<Vec<u8>> = lo().port(0).listen().await.unwrap();
-    let server_addr = server.local_addr().unwrap();
-
-    let client = lo()
-        .port(0)
-        .relay(relay_addr)
-        .connect::<Vec<u8>>(server_addr)
-        .await
-        .unwrap();
-    client.send(b"blocked".to_vec()).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let stats = relay.engine_stats();
-    assert!(
-        stats.dropped_relay_blocked >= 1,
-        "dropped_relay_blocked should increment, got {}",
-        stats.dropped_relay_blocked
-    );
-}
-
-#[tokio::test]
 async fn lru_eviction_keeps_most_recently_active_peer() {
     // max_peers=1: when c2 arrives it evicts c1 (c1 is LRU at that moment).
     let server: zudp::ZudpSocket<Vec<u8>> = Zudp::default()
@@ -493,81 +462,6 @@ async fn lru_eviction_keeps_most_recently_active_peer() {
     assert!(
         server.peer_stats(c2_addr).is_some(),
         "c2 should be in the peer table after evicting c1"
-    );
-}
-
-#[tokio::test]
-async fn relay_allowlist_blocks_unauthorized() {
-    let mut real_server: zudp::ZudpSocket<Vec<u8>> = lo().port(0).listen().await.unwrap();
-    let real_server_addr = real_server.local_addr().unwrap();
-
-    // Relay node allows only 127.0.0.2 — our loopback (127.0.0.1) is not in the list.
-    let relay: zudp::ZudpSocket<Vec<u8>> = Zudp::default()
-        .bind_ip(LOOPBACK)
-        .port(0)
-        .relay_allowlist(vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))])
-        .listen()
-        .await
-        .unwrap();
-    let relay_addr = relay.local_addr().unwrap();
-
-    let client = lo()
-        .port(0)
-        .relay(relay_addr)
-        .connect::<Vec<u8>>(real_server_addr)
-        .await
-        .unwrap();
-
-    client.send(b"blocked".to_vec()).await.unwrap();
-
-    let result = timeout(Duration::from_millis(500), real_server.recv()).await;
-    assert!(
-        result.is_err(),
-        "relay should have blocked the unauthorized sender"
-    );
-}
-
-#[tokio::test]
-async fn relay_table_cap() {
-    let mut server1: zudp::ZudpSocket<Vec<u8>> = lo().port(0).listen().await.unwrap();
-    let server1_addr = server1.local_addr().unwrap();
-    let mut server2: zudp::ZudpSocket<Vec<u8>> = lo().port(0).listen().await.unwrap();
-    let server2_addr = server2.local_addr().unwrap();
-
-    // Relay with table cap = 1: only one destination may be tracked at a time.
-    let relay: zudp::ZudpSocket<Vec<u8>> = Zudp::default()
-        .bind_ip(LOOPBACK)
-        .port(0)
-        .max_relay_entries(1)
-        .listen()
-        .await
-        .unwrap();
-    let relay_addr = relay.local_addr().unwrap();
-
-    let client1 = lo()
-        .port(0)
-        .relay(relay_addr)
-        .connect::<Vec<u8>>(server1_addr)
-        .await
-        .unwrap();
-    let client2 = lo()
-        .port(0)
-        .relay(relay_addr)
-        .connect::<Vec<u8>>(server2_addr)
-        .await
-        .unwrap();
-
-    // First client's route should be established.
-    client1.send(b"via relay".to_vec()).await.unwrap();
-    let pkt = recv!(server1);
-    assert_eq!(pkt.msg, b"via relay".to_vec());
-
-    // Second client's destination is a new relay entry, but cap=1 is full.
-    client2.send(b"should be dropped".to_vec()).await.unwrap();
-    let result = timeout(Duration::from_millis(500), server2.recv()).await;
-    assert!(
-        result.is_err(),
-        "relay table should be full — second route dropped"
     );
 }
 

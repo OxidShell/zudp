@@ -152,10 +152,6 @@ pub struct EngineStats {
     pub dropped_rate_limited: u64,
     /// New peers rejected because the peer table was full (triggers LRU eviction).
     pub dropped_peer_cap: u64,
-    /// Relay frames dropped because the source IP was not in the allowlist.
-    pub dropped_relay_blocked: u64,
-    /// Relay frames dropped because the relay routing table was full.
-    pub dropped_relay_cap: u64,
     /// Plaintext data frames dropped because this socket requires encryption.
     pub dropped_unauthenticated: u64,
 }
@@ -237,8 +233,6 @@ pub struct Config {
     pub(crate) mtu: usize,
     /// Ceiling for path MTU discovery (see [`Zudp::max_mtu`]).
     pub(crate) max_mtu: usize,
-    /// Optional relay node to route packets through for NAT traversal.
-    pub(crate) relay_addr: Option<SocketAddr>,
     /// Noise X25519 keypair; when set, all data frames are encrypted end-to-end.
     #[cfg(feature = "security")]
     pub(crate) security: Option<security::Keypair>,
@@ -250,10 +244,6 @@ pub struct Config {
     pub(crate) max_peers: usize,
     /// Per-IP packet rate limit in packets per second (token bucket).  0 = disabled.
     pub(crate) max_pps_per_ip: f64,
-    /// IP allowlist for relay requests.  Empty = allow all (open relay, current behaviour).
-    pub(crate) relay_allowlist: Vec<IpAddr>,
-    /// Maximum number of entries in the relay routing table.
-    pub(crate) max_relay_entries: usize,
     /// Per-stream sent-frame buffer cap for NACK retransmission.
     ///
     /// Each frame slot holds one UDP fragment (~MTU bytes).  At 1 400 B/frame the default
@@ -282,15 +272,12 @@ impl Default for Config {
             sent_prune_age: Duration::from_secs(10),
             mtu: 1400,
             max_mtu: mtu::DEFAULT_MTU_CEILING,
-            relay_addr: None,
             #[cfg(feature = "security")]
             security: None,
             #[cfg(feature = "security")]
             remote_key: None,
             max_peers: 1_024,
             max_pps_per_ip: 1_000.0,
-            relay_allowlist: vec![],
-            max_relay_entries: 256,
             sent_buffer_frames: 1_024,
             handshake_timeout: Duration::from_secs(5),
             peer_timeout: None,
@@ -375,13 +362,6 @@ impl Zudp {
         self
     }
 
-    /// Route all packets through a relay node (useful for NAT traversal).
-    #[must_use]
-    pub fn relay(mut self, relay_addr: SocketAddr) -> Self {
-        self.config.relay_addr = Some(relay_addr);
-        self
-    }
-
     /// Enable Noise XX end-to-end encryption using the given X25519 keypair.
     ///
     /// When set, every data frame is encrypted with `ChaCha20-Poly1305` and
@@ -426,26 +406,6 @@ impl Zudp {
     #[must_use]
     pub fn rate_limit(mut self, max_pps: f64) -> Self {
         self.config.max_pps_per_ip = max_pps;
-        self
-    }
-
-    /// IP allowlist for relay requests (default: empty = open relay).
-    ///
-    /// When non-empty, only packets whose source IP is in the list are allowed
-    /// to use this socket as a relay node.  All others are silently dropped.
-    #[must_use]
-    pub fn relay_allowlist(mut self, ips: Vec<IpAddr>) -> Self {
-        self.config.relay_allowlist = ips;
-        self
-    }
-
-    /// Maximum number of entries in the relay routing table (default: 256).
-    ///
-    /// New relay destinations beyond this cap are dropped; existing routes
-    /// continue to function.
-    #[must_use]
-    pub fn max_relay_entries(mut self, n: usize) -> Self {
-        self.config.max_relay_entries = n;
         self
     }
 
@@ -576,8 +536,6 @@ impl Inner {
             shutdown_reason: parking_lot::Mutex::new(None),
             dropped_rate_limited: AtomicU64::new(0),
             dropped_peer_cap: AtomicU64::new(0),
-            dropped_relay_blocked: AtomicU64::new(0),
-            dropped_relay_cap: AtomicU64::new(0),
             dropped_unauthenticated: AtomicU64::new(0),
             delivery_stalled: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "security")]
@@ -586,10 +544,6 @@ impl Inner {
             by_index: DashMap::new(),
             #[cfg(feature = "security")]
             hint_limiter: parking_lot::Mutex::new(rate::RateLimiter::new(5.0, 5.0)),
-            relay_policy: RwLock::new(engine::RelayPolicy {
-                allowlist: config.relay_allowlist.clone(),
-                max_entries: config.max_relay_entries,
-            }),
         });
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let rx = engine::spawn(engine.clone(), shutdown_rx);
@@ -629,8 +583,6 @@ impl Inner {
     ) -> Result<(), Error> {
         let payload = Bytes::from(msg.encode_to_bytes()?);
 
-        let actual_dest = self.config.relay_addr.unwrap_or(dest);
-        let wrap_relay = self.config.relay_addr.is_some();
         let reliable = reliable && self.config.reliable;
 
         // Single peer lookup covers both MTU discovery and send-side state;
@@ -649,10 +601,10 @@ impl Inner {
         let mtu = peer.effective_mtu_or(self.config.mtu);
 
         if payload.len() <= mtu {
-            self.send_single(payload, peer, actual_dest, wrap_relay, reliable, stream_id)
+            self.send_single(payload, peer, dest, reliable, stream_id)
                 .await
         } else {
-            self.send_fragmented(payload, peer, actual_dest, wrap_relay, stream_id, mtu)
+            self.send_fragmented(payload, peer, dest, stream_id, mtu)
                 .await
         }
     }
@@ -662,7 +614,6 @@ impl Inner {
         payload: Bytes,
         peer: Arc<PeerState>,
         actual_dest: SocketAddr,
-        wrap_relay: bool,
         reliable: bool,
         stream_id: u16,
     ) -> Result<(), Error> {
@@ -675,32 +626,14 @@ impl Inner {
                 payload,
             }
             .encode();
-            let inner_wire = maybe_encrypt(&self.engine, &peer, &plain_frame)?;
-            let wire = if wrap_relay {
-                Frame::Relay {
-                    dest: peer.addr(),
-                    inner: inner_wire,
-                }
-                .encode()
-            } else {
-                inner_wire
-            };
+            let wire = maybe_encrypt(&self.engine, &peer, &plain_frame)?;
             // Track token usage; new sends are never delayed (latency budget).
             peer.cc.lock().consume(wire.len());
             self.engine.get_socket().send_to(&wire, actual_dest).await?;
             peer.record_sent(stream_id, seq, plain_frame, self.config.sent_buffer_frames);
             engine::arm_tail_probe(&self.engine, &peer, stream_id);
-        } else if wrap_relay || self.engine.secured() {
-            let frame = maybe_encrypt(&self.engine, &peer, &Frame::Datagram(payload).encode())?;
-            let wire = if wrap_relay {
-                Frame::Relay {
-                    dest: peer.addr(),
-                    inner: frame,
-                }
-                .encode()
-            } else {
-                frame
-            };
+        } else if self.engine.secured() {
+            let wire = maybe_encrypt(&self.engine, &peer, &Frame::Datagram(payload).encode())?;
             self.engine.get_socket().send_to(&wire, actual_dest).await?;
         } else {
             // Scatter-gather: send payload + 1-byte type tag without copying payload.
@@ -725,7 +658,6 @@ impl Inner {
         payload: Bytes,
         peer: Arc<PeerState>,
         actual_dest: SocketAddr,
-        wrap_relay: bool,
         stream_id: u16,
         mtu: usize,
     ) -> Result<(), Error> {
@@ -748,16 +680,7 @@ impl Inner {
                 payload: chunk,
             }
             .encode();
-            let inner_wire = maybe_encrypt(&self.engine, &peer, &plain_frame)?;
-            let wire = if wrap_relay {
-                Frame::Relay {
-                    dest: peer.addr(),
-                    inner: inner_wire,
-                }
-                .encode()
-            } else {
-                inner_wire
-            };
+            let wire = maybe_encrypt(&self.engine, &peer, &plain_frame)?;
             // Track tokens; new fragment sends are not delayed (65 KB burst budget
             // covers typical game state syncs without any pacing delay).
             peer.cc.lock().consume(wire.len());
@@ -853,8 +776,6 @@ impl<M> ZudpSocket<M> {
         EngineStats {
             dropped_rate_limited: e.dropped_rate_limited.load(Ordering::Relaxed),
             dropped_peer_cap: e.dropped_peer_cap.load(Ordering::Relaxed),
-            dropped_relay_blocked: e.dropped_relay_blocked.load(Ordering::Relaxed),
-            dropped_relay_cap: e.dropped_relay_cap.load(Ordering::Relaxed),
             dropped_unauthenticated: e.dropped_unauthenticated.load(Ordering::Relaxed),
         }
     }
@@ -894,16 +815,6 @@ impl<M> ZudpSocket<M> {
             .peers
             .get(&peer)
             .and_then(|p| p.remote_static_key())
-    }
-
-    /// Update the relay access policy at runtime without rebinding the socket.
-    ///
-    /// - `allowlist`: IPs allowed to submit relay frames.  Pass `vec![]` to allow all.
-    /// - `max_entries`: maximum entries in the relay routing table.
-    pub fn set_relay_policy(&self, allowlist: Vec<IpAddr>, max_entries: usize) {
-        let mut p = self.inner.engine.relay_policy.write();
-        p.allowlist = allowlist;
-        p.max_entries = max_entries;
     }
 
     /// Send a reliable, ordered message to `peer` on stream 0.

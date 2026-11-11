@@ -1,5 +1,3 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-
 use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::Error;
@@ -22,8 +20,6 @@ pub const MAX_NACK_SEQS: usize = 128;
 /// Pong      : [echo: u64 BE][session_id: u64 BE][0x04]                            (17 bytes)
 /// Fragment  : [payload][msg_id: u32 BE][frag_total: u16 BE][frag_idx: u16 BE]
 ///                      [seq: u64 BE][stream_id: u16 BE][0x05]                     (19 bytes)
-/// Relay(v4) : [inner][port: u16 BE][ip: 4 bytes][0x00][0x06]                     (8 bytes)
-/// Relay(v6) : [inner][port: u16 BE][ip: 16 bytes][0x01][0x06]                    (20 bytes)
 /// Probe     : [app_id: u64 BE][proto_ver: u16 BE][0x07]                           (11 bytes)
 /// Beacon    : [meta bytes][instance: u64 BE][data_port: u16 BE][proto_ver: u16 BE]
 ///                         [app_id: u64 BE][0x08]                                  (21 + meta bytes)
@@ -41,7 +37,6 @@ const TYPE_NACK: u8 = 0x02;
 const TYPE_PING: u8 = 0x03;
 const TYPE_PONG: u8 = 0x04;
 const TYPE_FRAGMENT: u8 = 0x05;
-const TYPE_RELAY: u8 = 0x06;
 const TYPE_PROBE: u8 = 0x07;
 const TYPE_BEACON: u8 = 0x08;
 #[cfg(feature = "security")]
@@ -52,9 +47,6 @@ pub(crate) const TYPE_MTU_PROBE: u8 = 0x0B;
 const TYPE_MTU_ACK: u8 = 0x0C;
 #[cfg(feature = "security")]
 const TYPE_SESSION_UNKNOWN: u8 = 0x0D;
-
-const ADDR_V4: u8 = 0x00;
-const ADDR_V6: u8 = 0x01;
 
 #[derive(Debug, Clone)]
 pub enum Frame {
@@ -82,8 +74,6 @@ pub enum Frame {
         stream_id: u16,
         payload: Bytes,
     },
-    /// Relay request: forward `inner` to `dest` unchanged.
-    Relay { dest: SocketAddr, inner: Bytes },
     /// LAN discovery broadcast — asks nodes with matching `app_id` and `proto_ver` to reply.
     Probe { app_id: u64, proto_ver: u16 },
     /// LAN discovery reply — unicast answer to a `Probe`, carrying the node's data port and metadata.
@@ -187,20 +177,6 @@ impl Frame {
                 buf.put_u64(seq);
                 buf.put_u16(stream_id);
                 buf.put_u8(TYPE_FRAGMENT);
-                buf.freeze()
-            }
-            Frame::Relay { dest, inner } => {
-                let (ip_bytes, addr_tag): (Vec<u8>, u8) = match dest.ip() {
-                    IpAddr::V4(ip) => (ip.octets().to_vec(), ADDR_V4),
-                    IpAddr::V6(ip) => (ip.octets().to_vec(), ADDR_V6),
-                };
-                let overhead = 2 + ip_bytes.len() + 2; // port + ip + addr_tag + type
-                let mut buf = BytesMut::with_capacity(inner.len() + overhead);
-                buf.extend_from_slice(&inner);
-                buf.put_u16(dest.port());
-                buf.extend_from_slice(&ip_bytes);
-                buf.put_u8(addr_tag);
-                buf.put_u8(TYPE_RELAY);
                 buf.freeze()
             }
             Frame::Probe { app_id, proto_ver } => {
@@ -371,42 +347,6 @@ impl Frame {
                 })
             }
 
-            TYPE_RELAY => {
-                let addr_tag = pop_u8(&mut data).ok_or(Error::FrameTruncated {
-                    frame: "relay",
-                    field: "addr_tag",
-                })?;
-                let dest = match addr_tag {
-                    ADDR_V4 => {
-                        let ip = pop_bytes::<4>(&mut data).ok_or(Error::FrameTruncated {
-                            frame: "relay",
-                            field: "ipv4_addr",
-                        })?;
-                        let port = pop_u16(&mut data).ok_or(Error::FrameTruncated {
-                            frame: "relay",
-                            field: "port",
-                        })?;
-                        SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port)
-                    }
-                    ADDR_V6 => {
-                        let ip = pop_bytes::<16>(&mut data).ok_or(Error::FrameTruncated {
-                            frame: "relay",
-                            field: "ipv6_addr",
-                        })?;
-                        let port = pop_u16(&mut data).ok_or(Error::FrameTruncated {
-                            frame: "relay",
-                            field: "port",
-                        })?;
-                        SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), port)
-                    }
-                    tag => return Err(Error::UnknownAddrTag { tag }),
-                };
-                Ok(Frame::Relay {
-                    dest,
-                    inner: data.freeze(),
-                })
-            }
-
             TYPE_PROBE => {
                 let proto_ver = pop_u16(&mut data).ok_or(Error::FrameTruncated {
                     frame: "probe",
@@ -563,17 +503,6 @@ fn pop_u64(buf: &mut BytesMut) -> Option<u64> {
     Some(v)
 }
 
-fn pop_bytes<const N: usize>(buf: &mut BytesMut) -> Option<[u8; N]> {
-    if buf.len() < N {
-        return None;
-    }
-    let len = buf.len();
-    let mut out = [0u8; N];
-    out.copy_from_slice(&buf[len - N..]);
-    buf.truncate(len - N);
-    Some(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,24 +601,6 @@ mod tests {
     }
 
     #[test]
-    fn relay_ipv4_roundtrip() {
-        let dest: SocketAddr = "127.0.0.1:9000".parse().unwrap();
-        let inner = Bytes::from_static(b"inner packet");
-        let Frame::Relay {
-            dest: out_dest,
-            inner: out_inner,
-        } = roundtrip(Frame::Relay {
-            dest,
-            inner: inner.clone(),
-        })
-        else {
-            panic!("wrong variant");
-        };
-        assert_eq!(out_dest, dest);
-        assert_eq!(out_inner, inner);
-    }
-
-    #[test]
     fn probe_roundtrip() {
         let Frame::Probe { app_id, proto_ver } = roundtrip(Frame::Probe {
             app_id: 0xdead_beef_cafe_babe,
@@ -725,24 +636,6 @@ mod tests {
         assert_eq!(data_port, 7700);
         assert_eq!(instance, 42);
         assert_eq!(out_meta, meta);
-    }
-
-    #[test]
-    fn relay_ipv6_roundtrip() {
-        let dest: SocketAddr = "[::1]:9001".parse().unwrap();
-        let inner = Bytes::from_static(b"v6 inner");
-        let Frame::Relay {
-            dest: out_dest,
-            inner: out_inner,
-        } = roundtrip(Frame::Relay {
-            dest,
-            inner: inner.clone(),
-        })
-        else {
-            panic!("wrong variant");
-        };
-        assert_eq!(out_dest, dest);
-        assert_eq!(out_inner, inner);
     }
 
     #[cfg(feature = "security")]
