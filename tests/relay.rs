@@ -536,3 +536,192 @@ async fn a_spoofed_source_cannot_move_a_relayed_session() {
         "path moved without validation"
     );
 }
+
+/// A pair of clients whose relayed session was punched to a direct path on both ends.
+async fn punched_pair() -> (Socket, Socket, Socket, SocketAddr, PeerAddr, PeerAddr) {
+    let (r, relay_addr, _) = relay(RelayLimits::default()).await;
+    let fast = || lo().keepalive_interval(Duration::from_millis(200));
+    let (a, a_key) = client(fast(), relay_addr).await;
+    let (b, b_key) = client(fast(), relay_addr).await;
+    let (mut a_events, mut b_events) = (a.events(), b.events());
+    let to_b = a.connect_via(relay_addr, b_key).await.unwrap();
+    let to_a = relayed(relay_addr, a_key);
+    a.punch(to_b).unwrap();
+    b.punch(to_a).unwrap();
+    let direct = |e: &PeerEvent| {
+        matches!(
+            e,
+            PeerEvent::PathChanged {
+                path: Path::Direct(_),
+                ..
+            }
+        )
+    };
+    wait_for(&mut a_events, Duration::from_secs(3), direct).await;
+    wait_for(&mut b_events, Duration::from_secs(3), direct).await;
+    (r, a, b, relay_addr, to_b, to_a)
+}
+
+#[tokio::test]
+async fn direct_and_relayed_session_to_same_peer_coexist() {
+    let (_relay, relay_addr, _) = relay(RelayLimits::default()).await;
+    let (a, _) = client(lo().punching(false), relay_addr).await;
+    let (mut b, b_key) = client(lo().punching(false), relay_addr).await;
+    let (a_addr, b_addr) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+    let mut a_events = a.events();
+    let direct = a.connect(b_addr).await.unwrap();
+    a.send(b"d0".to_vec(), direct).await.unwrap();
+    assert_eq!(drain(&mut b, Duration::from_millis(300)).await.len(), 1);
+
+    let via = a.connect_via(relay_addr, b_key).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    while let Some(event) = a_events.try_recv() {
+        assert!(
+            !matches!(
+                event,
+                PeerEvent::Migrated { .. }
+                    | PeerEvent::Reset { .. }
+                    | PeerEvent::Disconnected { .. }
+            ),
+            "{event:?}"
+        );
+    }
+    a.send(b"over-direct".to_vec(), direct).await.unwrap();
+    a.send(b"over-relay".to_vec(), via).await.unwrap();
+    let got = drain(&mut b, Duration::from_millis(400)).await;
+    assert!(
+        got.iter()
+            .any(|p| p.msg == b"over-direct" && p.from == a_addr),
+        "direct session broken"
+    );
+    assert!(
+        got.iter()
+            .any(|p| p.msg == b"over-relay" && p.from.is_relayed()),
+        "relayed session broken"
+    );
+}
+
+#[tokio::test]
+async fn loss_on_a_punched_path_recovers_without_the_relay() {
+    let (_relay, a, mut b, relay_addr, to_b, to_a) = punched_pair().await;
+    let b_addr = b.local_addr().unwrap();
+    a.debug_block_addr(relay_addr, true);
+    b.debug_block_addr(relay_addr, true);
+    a.debug_block_addr(b_addr, true);
+    a.send(b"m1".to_vec(), to_b).await.unwrap();
+    a.debug_block_addr(b_addr, false);
+    a.send(b"m2".to_vec(), to_b).await.unwrap();
+    let got: Vec<Vec<u8>> = drain(&mut b, Duration::from_millis(800))
+        .await
+        .into_iter()
+        .map(|p| p.msg)
+        .collect();
+    assert_eq!(
+        got,
+        vec![b"m1".to_vec(), b"m2".to_vec()],
+        "stream stalled on the punched path"
+    );
+    // Keepalives and RTT keep working on the direct path alone.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(a.peer_srtt(to_b).is_some() && b.peer_stats(to_a).is_some());
+}
+
+#[tokio::test]
+async fn a_one_way_direct_path_is_never_used() {
+    let (_relay, relay_addr, _) = relay(RelayLimits::default()).await;
+    let fast = || lo().keepalive_interval(Duration::from_millis(200));
+    let (mut a, a_key) = client(fast(), relay_addr).await;
+    let (mut b, b_key) = client(fast(), relay_addr).await;
+    // A hears nothing B sends directly; A's probes still reach B.
+    a.debug_drop_from(b.local_addr().unwrap(), true);
+    let to_b = a.connect_via(relay_addr, b_key).await.unwrap();
+    let to_a = relayed(relay_addr, a_key);
+    a.punch(to_b).unwrap();
+    b.punch(to_a).unwrap();
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert_eq!(a.peer_path(to_b), Some(Path::Relayed(relay_addr)));
+    assert_eq!(b.peer_path(to_a), Some(Path::Relayed(relay_addr)));
+    a.send(b"a->b".to_vec(), to_b).await.unwrap();
+    b.send(b"b->a".to_vec(), to_a).await.unwrap();
+    assert_eq!(drain(&mut b, Duration::from_millis(300)).await.len(), 1);
+    assert_eq!(drain(&mut a, Duration::from_millis(300)).await.len(), 1);
+}
+
+#[tokio::test]
+async fn relayed_fragments_fit_the_relay_whatever_the_mtu() {
+    let (relay, relay_addr, _) = relay(RelayLimits::default()).await;
+    let jumbo = || lo().mtu(1_600).max_mtu(1_600).punching(false);
+    let (a, _) = client(jumbo(), relay_addr).await;
+    let (mut b, b_key) = client(jumbo(), relay_addr).await;
+    let to_b = a.connect_via(relay_addr, b_key).await.unwrap();
+    let big = vec![9u8; 20_000];
+    a.send(big.clone(), to_b).await.unwrap();
+    let got = drain(&mut b, Duration::from_millis(500)).await;
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].msg, big);
+    assert_eq!(relay.engine_stats().relay_dropped_oversize, 0);
+}
+
+#[tokio::test]
+async fn sending_to_a_relayed_peer_without_security_leaves_no_state() {
+    let plain: Socket = lo().port(0).listen().await.unwrap();
+    let ghost = relayed("127.0.0.1:9".parse().unwrap(), [3; 32]);
+    let result = plain.send(b"x".to_vec(), ghost).await;
+    assert!(matches!(result, Err(Error::NoSession { .. })), "{result:?}");
+    assert!(plain.peer_stats(ghost).is_none());
+}
+
+#[tokio::test]
+async fn a_relayed_reset_reports_the_path_back_on_the_relay() {
+    let (_relay, relay_addr, _) = relay(RelayLimits::default()).await;
+    let fast = || {
+        lo().keepalive_interval(Duration::from_millis(200))
+            .accept_relayed_from(relay_addr)
+    };
+    let a_keys = Keypair::generate();
+    let a_client = || async {
+        let a: Socket = fast()
+            .port(0)
+            .security(a_keys.clone())
+            .listen()
+            .await
+            .unwrap();
+        a.connect(relay_addr).await.unwrap();
+        a
+    };
+    let a = a_client().await;
+    let (b, b_key) = client(fast(), relay_addr).await;
+    let mut b_events = b.events();
+    let to_b = a.connect_via(relay_addr, b_key).await.unwrap();
+    let to_a = relayed(relay_addr, a_keys.public);
+    a.punch(to_b).unwrap();
+    b.punch(to_a).unwrap();
+    wait_for(&mut b_events, Duration::from_secs(3), |e| {
+        matches!(
+            e,
+            PeerEvent::PathChanged {
+                path: Path::Direct(_),
+                ..
+            }
+        )
+    })
+    .await;
+
+    // A restarts with the same key and opens a fresh session through the relay.
+    drop(a);
+    let a = a_client().await;
+    a.connect_via(relay_addr, b_key).await.unwrap();
+    wait_for(&mut b_events, Duration::from_secs(2), |e| {
+        *e == PeerEvent::PathChanged {
+            addr: to_a,
+            path: Path::Relayed(relay_addr),
+        }
+    })
+    .await;
+    wait_for(
+        &mut b_events,
+        Duration::from_secs(1),
+        |e| matches!(e, PeerEvent::Reset { addr, .. } if *addr == to_a),
+    )
+    .await;
+}
