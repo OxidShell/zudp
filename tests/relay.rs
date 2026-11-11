@@ -23,13 +23,13 @@ use zudp::{
 
 type Socket = ZudpSocket<Vec<u8>>;
 
-/// A relay node on loopback: the socket, its address and its static key.
+/// An open relay node on loopback: the socket, its address and its static key.
 async fn relay(limits: RelayLimits) -> (Socket, SocketAddr, [u8; 32]) {
     let key = Keypair::generate();
     let socket: Socket = lo()
         .port(0)
         .security(key.clone())
-        .relay_node(limits)
+        .relay_node(limits, |_: &[u8; 32], _: &[u8; 32]| true)
         .listen()
         .await
         .unwrap();
@@ -37,8 +37,14 @@ async fn relay(limits: RelayLimits) -> (Socket, SocketAddr, [u8; 32]) {
     (socket, addr, key.public)
 }
 
-/// A client socket already holding a session with the relay at `relay`.
+/// A client socket already holding a session with the relay at `relay`, accepting the
+/// relayed sessions it delivers.
 async fn client(builder: Zudp, relay: SocketAddr) -> (Socket, [u8; 32]) {
+    client_of(builder.accept_relayed_from(relay), relay).await
+}
+
+/// Like [`client`] without accepting inbound relayed sessions.
+async fn client_of(builder: Zudp, relay: SocketAddr) -> (Socket, [u8; 32]) {
     let key = Keypair::generate();
     let socket: Socket = builder
         .port(0)
@@ -287,6 +293,9 @@ async fn punching_moves_to_direct_and_falls_back_to_the_relay() {
 
     let to_b = a.connect_via(relay_addr, b_key).await.unwrap();
     let to_a = relayed(relay_addr, a_key);
+    // Both applications approve the other side; only then is anything punched.
+    a.punch(to_b).unwrap();
+    b.punch(to_a).unwrap();
     let punched = |addr: PeerAddr| move |e: &PeerEvent| matches!(e, PeerEvent::PathChanged { addr: a, path: Path::Direct(_) } if *a == addr);
     wait_for(&mut a_events, Duration::from_secs(2), punched(to_b)).await;
     wait_for(&mut b_events, Duration::from_secs(2), punched(to_a)).await;
@@ -366,5 +375,164 @@ async fn pinned_keys_apply_to_relayed_peers() {
     assert!(
         matches!(result, Err(Error::HandshakeTimeout { .. })),
         "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn relays_must_be_accepted_to_open_sessions_toward_us() {
+    let (_relay, relay_addr, _) = relay(RelayLimits::default()).await;
+    let (a, _) = client(
+        lo().handshake_timeout(Duration::from_millis(600)),
+        relay_addr,
+    )
+    .await;
+    let (b, b_key) = client_of(lo(), relay_addr).await;
+    let result = a.connect_via(relay_addr, b_key).await;
+    assert!(
+        matches!(result, Err(Error::HandshakeTimeout { .. })),
+        "{result:?}"
+    );
+    assert!(b.engine_stats().dropped_relay_unaccepted >= 1);
+
+    // Accepting the relay later lets the next attempt through.
+    b.accept_relayed_from(relay_addr);
+    a.connect_via(relay_addr, b_key).await.unwrap();
+}
+
+#[tokio::test]
+async fn relayed_sessions_respect_the_peer_cap() {
+    let (_relay, relay_addr, _) = relay(RelayLimits::default()).await;
+    let (b, b_key) = client(lo().max_peers(4), relay_addr).await;
+    let mut clients = vec![];
+    for _ in 0..4 {
+        let (a, a_key) = client(lo(), relay_addr).await;
+        a.connect_via(relay_addr, b_key).await.unwrap();
+        clients.push((a, a_key));
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // One relay may fill at most half of B's peer table; the relay session itself stays.
+    assert!(
+        b.peer_stats(relay_addr).is_some(),
+        "the relay session was evicted"
+    );
+    let held = clients
+        .iter()
+        .filter(|(_, key)| b.peer_stats(relayed(relay_addr, *key)).is_some())
+        .count();
+    assert_eq!(held, 2, "relayed sessions held");
+    let newest = clients.last().unwrap().1;
+    assert!(
+        b.peer_stats(relayed(relay_addr, newest)).is_some(),
+        "evicted the newcomer"
+    );
+}
+
+#[tokio::test]
+async fn relayed_handshake_floods_do_not_starve_direct_handshakes() {
+    let (relay, relay_addr, _) = relay(RelayLimits::default()).await;
+    let (a, _) = client(
+        lo().handshake_timeout(Duration::from_millis(500)),
+        relay_addr,
+    )
+    .await;
+    let (b, b_key) = client(lo().max_peers(8), relay_addr).await;
+    // The relay turns every msg1 into hundreds of msg1s from made-up keys.
+    let flood: RelayTap = Arc::new(move |from, _to, inner: &Bytes| {
+        let is_msg1 =
+            inner.len() >= 3 && inner[inner.len() - 1] == 0x09 && inner[inner.len() - 3] == 1;
+        if !is_msg1 {
+            return vec![(*from, inner.clone())];
+        }
+        (0..300u16)
+            .map(|i| {
+                let mut fake = [0u8; 32];
+                fake[..2].copy_from_slice(&i.to_be_bytes());
+                (fake, inner.clone())
+            })
+            .collect()
+    });
+    relay.set_relay_tap(Some(flood));
+    let _ = a.connect_via(relay_addr, b_key).await;
+    assert!(b.engine_stats().dropped_rate_limited >= 200);
+
+    // A direct handshake to B still goes through.
+    let b_addr = b.local_addr().unwrap();
+    let d: Socket = lo()
+        .port(0)
+        .security(Keypair::generate())
+        .listen()
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), d.connect(b_addr))
+        .await
+        .expect("direct handshake starved")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn nothing_is_punched_without_approval_and_without_a_policy_nothing_is_relayed() {
+    let (relay, relay_addr, _) = relay(RelayLimits::default()).await;
+    let fast = || lo().keepalive_interval(Duration::from_millis(200));
+    let (a, _) = client(fast(), relay_addr).await;
+    let (_b, b_key) = client(fast(), relay_addr).await;
+    let to_b = a.connect_via(relay_addr, b_key).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(a.peer_path(to_b), Some(Path::Relayed(relay_addr)));
+    assert_eq!(relay.engine_stats().relay_introductions, 0);
+
+    // A relay without a policy relays nothing — not even to a connected client.
+    relay.set_relay_policy(None);
+    let (c, _) = client(lo(), relay_addr).await;
+    let result = c.connect_via(relay_addr, b_key).await;
+    assert!(
+        matches!(result, Err(Error::Unreachable { .. })),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_spoofed_source_cannot_move_a_relayed_session() {
+    let (relay, relay_addr, _) = relay(RelayLimits::default()).await;
+    let (a, _) = client(lo(), relay_addr).await;
+    let (mut b, b_key) = client(lo(), relay_addr).await;
+    let to_b = a.connect_via(relay_addr, b_key).await.unwrap();
+
+    // The relay holds back one authenticated A→B frame...
+    let held: Arc<Mutex<Option<Bytes>>> = Arc::default();
+    let stash = held.clone();
+    relay.set_relay_tap(Some(Arc::new(move |from, _to, inner: &Bytes| {
+        let mut slot = stash.lock();
+        if slot.is_none() && inner.last() == Some(&0x0A) {
+            *slot = Some(inner.clone());
+            return vec![];
+        }
+        vec![(*from, inner.clone())]
+    })));
+    a.send_unreliable(b"held back".to_vec(), to_b)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let frame = held.lock().take().expect("nothing held back");
+    relay.set_relay_tap(None);
+
+    // ...and delivers it to B straight from an address of its choosing.
+    let spoofer = tokio::net::UdpSocket::bind((common::LO, 0)).await.unwrap();
+    spoofer
+        .send_to(&frame, b.local_addr().unwrap())
+        .await
+        .unwrap();
+    let mut buf = [0u8; 2048];
+    let challenge = timeout(Duration::from_millis(500), spoofer.recv_from(&mut buf)).await;
+    assert!(challenge.is_ok(), "B did not challenge the new address");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let a_handle = drain(&mut b, Duration::from_millis(200))
+        .await
+        .first()
+        .map(|p| p.from);
+    let a_handle = a_handle.expect("the held-back frame itself is still authentic");
+    assert_eq!(
+        b.peer_path(a_handle),
+        Some(Path::Relayed(relay_addr)),
+        "path moved without validation"
     );
 }
