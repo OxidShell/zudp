@@ -247,7 +247,7 @@ alice.punch(bob_handle)?;
 
 ### Relay node
 
-A relay node is a secure socket with `.relay_node(limits, policy)`. It only ever sends to static keys that hold a session with it — never to an address a client names — so it cannot be used to reflect traffic. Budgets apply per client key, per source network (an IPv4 address or an IPv6 /64) and for the whole node; a frame has to fit all three. Sessions are capped per source network and per IPv6 /48, and a full session table makes room in its heaviest prefix — a flood from one allocation only ever displaces its own sessions, never a long-lived client from elsewhere. IPv4 is accounted per address: users behind one carrier-grade NAT share one budget (the alternative, per /24, would lump even more strangers together). Handshakes are budgeted per network (/64), so rotating addresses inside an allocation buys nothing. A client's pending introductions are released when its session ends.
+A relay node is a secure socket with `.relay_node(limits, policy)`. It only ever sends to static keys that hold a session with it — never to an address a client names — so it cannot be used to reflect traffic. Budgets apply per client key, per source network (an IPv4 address or an IPv6 /64) and for the whole node; a frame has to fit all three. Sessions are capped per source network and per IPv6 /48, and a full session table makes room in its heaviest prefix: a newcomer whose prefix is at least as heavy as any other displaces its own prefix's least recently seen session, otherwise the least recently seen session among the prefixes tied for the most sessions goes. A flood from one allocation therefore displaces its own sessions first; a client elsewhere is only displaced once its prefix holds as many sessions as the heaviest one. IPv4 is accounted per address: users behind one carrier-grade NAT share one budget (the alternative, per /24, would lump even more strangers together). Handshakes are budgeted per network (/64), so rotating addresses inside an allocation buys nothing. A client's pending introductions are released when its session ends.
 
 | Limit (`RelayLimits`) | Default | When exceeded |
 |---|---|---|
@@ -257,7 +257,7 @@ A relay node is a secure socket with `.relay_node(limits, policy)`. It only ever
 | `max_inner(bytes)` | 1 500 | dropped, `relay_dropped_oversize` |
 | `max_sessions_per_ip(per_network, per_prefix)` | 64 per /64 (or IPv4 address), 256 per IPv6 /48 | that scope's least recently seen session evicted, `relay_sessions_evicted` |
 | full session table (`max_peers`) | 1 024 | the heaviest prefix's least recently seen session evicted, `relay_sessions_evicted` |
-| pending introductions | 16 per client, 64 per network (own oldest evicted), 4 096 total (new ones refused) | — |
+| pending introductions | 16 per client, 64 per network, 256 per IPv6 /48 (own oldest evicted), 4 096 total (heaviest prefix makes room) | — |
 | `max_peers` (socket-wide) | 1 024 | LRU eviction of clients |
 | handshakes per source network (socket-wide) | 20/s | dropped, `dropped_rate_limited` |
 
