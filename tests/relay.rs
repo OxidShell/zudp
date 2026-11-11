@@ -846,3 +846,33 @@ async fn session_unknown_reaches_the_relayed_session_sharing_an_address() {
     )
     .await;
 }
+
+/// The relay is slower than the direct path, so the delayed `PathResponse` is the newest
+/// frame when it arrives, well after the challenge retry interval: it must still validate.
+#[tokio::test]
+async fn a_late_path_response_that_is_the_newest_frame_still_validates() {
+    let (_relay, relay_addr, _) = relay(RelayLimits::default()).await;
+    let (a, a_key) = client(lo(), relay_addr).await;
+    let (b, b_key) = client(lo(), relay_addr).await;
+    let (a_addr, b_addr) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+    a.debug_delay_to(b_addr, Some(Duration::from_millis(400)));
+    b.debug_delay_to(a_addr, Some(Duration::from_millis(400)));
+    a.debug_delay_to(relay_addr, Some(Duration::from_millis(600)));
+    b.debug_delay_to(relay_addr, Some(Duration::from_millis(600)));
+    let (mut a_events, mut b_events) = (a.events(), b.events());
+    let to_b = a.connect_via(relay_addr, b_key).await.unwrap();
+    let to_a = relayed(relay_addr, a_key);
+    a.punch(to_b).unwrap();
+    b.punch(to_a).unwrap();
+    let direct = |e: &PeerEvent| {
+        matches!(
+            e,
+            PeerEvent::PathChanged {
+                path: Path::Direct(_),
+                ..
+            }
+        )
+    };
+    wait_for(&mut a_events, Duration::from_secs(8), direct).await;
+    wait_for(&mut b_events, Duration::from_secs(8), direct).await;
+}
