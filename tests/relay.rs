@@ -725,3 +725,124 @@ async fn a_relayed_reset_reports_the_path_back_on_the_relay() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn punching_validates_paths_with_a_long_round_trip() {
+    let (_relay, relay_addr, _) = relay(RelayLimits::default()).await;
+    let (a, a_key) = client(lo(), relay_addr).await;
+    let (b, b_key) = client(lo(), relay_addr).await;
+    let (a_addr, b_addr) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+    // 800 ms round trip on the direct path, far above the challenge retry interval.
+    a.debug_delay_to(b_addr, Some(Duration::from_millis(400)));
+    b.debug_delay_to(a_addr, Some(Duration::from_millis(400)));
+    let (mut a_events, mut b_events) = (a.events(), b.events());
+    let to_b = a.connect_via(relay_addr, b_key).await.unwrap();
+    let to_a = relayed(relay_addr, a_key);
+    a.punch(to_b).unwrap();
+    b.punch(to_a).unwrap();
+    let direct = |e: &PeerEvent| {
+        matches!(
+            e,
+            PeerEvent::PathChanged {
+                path: Path::Direct(_),
+                ..
+            }
+        )
+    };
+    wait_for(&mut a_events, Duration::from_secs(6), direct).await;
+    wait_for(&mut b_events, Duration::from_secs(6), direct).await;
+    let started = Instant::now();
+    let mut a = a;
+    b.send(b"slow".to_vec(), to_a).await.unwrap();
+    timeout(Duration::from_secs(3), a.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(350),
+        "the delay hook did nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_full_relay_makes_room_in_the_heaviest_source() {
+    let key = Keypair::generate();
+    let relay: Socket = lo()
+        .port(0)
+        .max_peers(4)
+        .security(key)
+        .relay_node(RelayLimits::default(), |_: &[u8; 32], _: &[u8; 32]| true)
+        .listen()
+        .await
+        .unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    // One long-lived client from its own address...
+    let other_ip: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+    let (legit, _) = client_of(Zudp::default().bind_ip(other_ip), relay_addr).await;
+    let legit_addr = legit.local_addr().unwrap();
+    // ...then a stream of fresh sessions from a single other address.
+    let mut flood = vec![];
+    for _ in 0..8 {
+        flood.push(client_of(lo(), relay_addr).await);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        relay.peer_stats(legit_addr).is_some(),
+        "the long-lived client was evicted by the flood"
+    );
+    assert!(relay.engine_stats().relay_sessions_evicted >= 4);
+}
+
+#[tokio::test]
+async fn session_unknown_reaches_the_relayed_session_sharing_an_address() {
+    let (_relay, relay_addr, _) = relay(RelayLimits::default()).await;
+    let (a_keys, b_keys) = (Keypair::generate(), Keypair::generate());
+    let a_port = common::free_port();
+    let a_socket = || async {
+        let a: Socket = lo()
+            .port(a_port)
+            .security(a_keys.clone())
+            .accept_relayed_from(relay_addr)
+            .listen()
+            .await
+            .unwrap();
+        a.connect(relay_addr).await.unwrap();
+        a
+    };
+    let a = a_socket().await;
+    let a_addr = a.local_addr().unwrap();
+    let b: Socket = lo()
+        .port(0)
+        .security(b_keys.clone())
+        .listen()
+        .await
+        .unwrap();
+    b.connect(relay_addr).await.unwrap();
+    let mut b_events = b.events();
+    // B opens a direct and a relayed session to A and punches the relayed one: both now
+    // answer from A's address.
+    b.connect(a_addr).await.unwrap();
+    let to_a = b.connect_via(relay_addr, a_keys.public).await.unwrap();
+    b.punch(to_a).unwrap();
+    a.punch(relayed(relay_addr, b_keys.public)).unwrap();
+    wait_for(
+        &mut b_events,
+        Duration::from_secs(3),
+        |e| matches!(e, PeerEvent::PathChanged { addr, path: Path::Direct(_) } if *addr == to_a),
+    )
+    .await;
+
+    // A restarts on the same port: B's relayed session is unknown to it now.
+    drop(a);
+    while std::net::UdpSocket::bind((common::LO, a_port)).is_err() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let _a = a_socket().await;
+    b.send(b"anyone?".to_vec(), to_a).await.unwrap();
+    wait_for(
+        &mut b_events,
+        Duration::from_secs(3),
+        |e| matches!(e, PeerEvent::Reset { addr, .. } if *addr == to_a),
+    )
+    .await;
+}
