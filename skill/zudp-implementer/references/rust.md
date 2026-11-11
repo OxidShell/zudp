@@ -127,8 +127,9 @@ Zudp::default()
     .reliable(true)                          // enable NACK retransmission (default: true)
     .mtu(1400)                               // fragmentation threshold in bytes (default: 1400)
     .keepalive_interval(Duration::from_secs(5))  // idle ping interval (default: 5 s)
-    .relay(relay_addr)                       // route all packets through a relay node
     .security(Keypair::generate())           // enable Noise XX encryption (feature = "security")
+    .punching(true)                          // punch relayed sessions to direct (default: true)
+    .relay_node(RelayLimits::default())      // act as a relay node (feature = "relay")
     .listen::<Msg>()                         // → ZudpSocket<M>
     // or
     .connect::<Msg>(peer_addr)              // → ZudpConn<M>
@@ -210,25 +211,25 @@ Maximum message size: `mtu * 65535` bytes.
 
 ## Relay / NAT traversal
 
-The relay is **stateful and bidirectional** — no special configuration needed.  When the client sends through it, the relay records a routing table entry and automatically forwards server replies back to the client.
+Peers are named by `zudp::PeerAddr` (`Direct(SocketAddr)` or `Relayed { relay, key }`); every
+method that takes a peer accepts a `SocketAddr` too.  Two clients of a relay node reach each
+other by static key with end-to-end encryption; the relay forwards ciphertext only.
 
 ```rust
-// client — wraps every packet via relay
-let conn = Zudp::default()
-    .port(0)
-    .relay("relay.example.com:7800".parse()?)
-    .connect::<Msg>(server_addr)
-    .await?;
+// relay node (features = ["relay"])
+let relay = Zudp::default().port(7800).security(relay_kp)
+    .relay_node(RelayLimits::default()).listen::<Msg>().await?;
 
-// relay node — plain ZudpSocket; bidirectional routing table maintained by the engine
-let _relay = Zudp::default().port(7800).listen::<()>().await?;
-// relay does NOT need to call recv() — engine handles all forwarding internally
+// each client: connect to the relay first
+let socket = Zudp::default().security(kp).listen::<Msg>().await?;
+socket.connect(relay_addr).await?;
+let peer = socket.connect_via(relay_addr, their_public_key).await?;  // PeerAddr::Relayed
+socket.send(msg, peer).await?;
+// the other side sees PeerEvent::Connected { addr: PeerAddr::Relayed { .. }, .. }
 ```
 
-- Server sees `from == relay_addr`, not the real client address.
-- NACK retransmission is end-to-end (client retransmits to relay; relay re-forwards).
-- When client migrates to a new IP, the relay table updates automatically on the next outbound packet.
-- Encrypted traffic (`security` feature) flows through relay transparently — raw bytes are forwarded before decoding.
+- Hole punching is automatic (`.punching(false)` disables it); `PeerEvent::PathChanged` reports moves between the relay and a direct path.  The handle never changes.
+- `Error::Unreachable { key }` when the target is offline or not allowed (indistinguishable on purpose).
 
 ## Network migration
 
@@ -253,7 +254,7 @@ println!("peer is now {}", conn.peer());
 
 **Works for:**
 - Client (behind any NAT) → Server (public IP)
-- Client configured with `.relay(...)` — relay table updates automatically
+- Relay clients (their relayed sessions are unaffected when they migrate)
 
 **Does not work for:** P2P where both peers are behind NAT without a relay (NAT mappings expire on network change).
 

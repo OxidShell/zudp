@@ -68,14 +68,17 @@ Nack      (0x02): [seq_0:u64] … [seq_N:u64] [stream_id:u16]                   
 Ping      (0x03): [echo:u64] [session_id:u64]                                                + [0x03]
 Pong      (0x04): [echo:u64] [session_id:u64]                                                + [0x04]
 Fragment  (0x05): [payload] [msg_id:u32] [frag_total:u16] [frag_idx:u16] [seq:u64] [stream_id:u16] + [0x05]
-Relay/v4  (0x06): [inner]   [port:u16]  [ip:4B]  [0x00]                                     + [0x06]
-Relay/v6  (0x06): [inner]   [port:u16]  [ip:16B] [0x01]                                     + [0x06]
+Via       (0x06): [inner] [to:32B]                                                          + [0x06]  ← inside Secure only
 Probe     (0x07): [app_id:u64] [proto_ver:u16]                                               + [0x07]
 Beacon    (0x08): [meta]   [data_port:u16] [proto_ver:u16] [app_id:u64]                      + [0x08]
 Handshake (0x09): [noise_msg]                                                                + [0x09]  ← security feature
 Secure    (0x0A): [ciphertext] [nonce:u64]                                                   + [0x0A]  ← security feature
 MtuProbe  (0x0B): [zeros:padding_bytes] [probe_id:u16]                                       + [0x0B]  total = padding + 3 B
 MtuAck    (0x0C): [probe_id:u16]                                                             + [0x0C]  always 3 B
+ViaFrom   (0x0E): [inner] [from:32B]                                                        + [0x0E]  ← inside Secure only
+Unreach.  (0x0F): [to:32B]                                                                  + [0x0F]  ← inside Secure only
+IntroReq  (0x10): [peer:32B]                                                                + [0x10]  ← inside Secure only
+Intro     (0x11): [port:u16] [ip:4B|16B] [0x00 v4|0x01 v6] [peer:32B]                       + [0x11]  ← inside Secure only
 ```
 
 **Parsing is always from the tail.**  To decode a datagram:
@@ -196,16 +199,12 @@ if tokens < 0: suggest_sleep = min(−tokens / pacing_rate, 10 ms)
 - The engine delivers decoded payloads to the application via a bounded channel (`INBOUND_CAP = 8 192` slots).
 - Use non-blocking send (`try_send` / `offer`) at every delivery site.  If the channel is full, log a warning and drop the frame — **never block the recv loop waiting for the application to consume**.  A slow consumer should drop frames, not stall the engine.
 
-### Relay (stateful, bidirectional)
-- The relay node is a plain ZUDP socket — no special configuration flag.
-- On receiving `Frame::Relay { dest, inner }` from `client_addr`:
-  1. If an IP allowlist is configured and `client_addr.ip()` is not in it, drop and return.
-  2. If adding `dest` would exceed `max_relay_entries` and `dest` is not already in the table, drop and return.
-  3. Update routing table: `relay_table[dest] = (client_addr, now)` (upsert, handles migration).
-  4. Forward `inner` verbatim to `dest`.
-- Before decoding any incoming frame, check if `from` is in `relay_table`.  If so, forward the **raw bytes** to `relay_table[from]` and return — do not decode.  This ensures encrypted or opaque server replies are forwarded transparently.
-- The server sees `from == relay_addr`.  Reliable framing is end-to-end.
-- Prune entries idle for more than 300 s on each background tick.
+### Relayed sessions (wire v3, security required)
+- Peers behind NAT keep a secure session with a relay node and reach each other **by static key**: the end-to-end Noise handshake and Secure frames travel as opaque `inner` bytes in `Via { to }` (client → relay) and `ViaFrom { from }` (relay → client), each sealed in that client's session with the relay.  See PROTOCOL.md *Relayed sessions*.
+- Receiver rules: a relayed handshake must authenticate exactly the claimed `from`; a relayed Secure frame's index must name the session with `from` through that relay.  Otherwise drop.
+- Relay node: forward only to keys that hold a session with it (never to client-supplied addresses); per-client packet + byte token buckets; cap inner size and concurrent pairs; policy hook; answer `Unreachable { to }` for offline, denied and over-cap alike.
+- Hole punching: both ends send `IntroRequest`; the relay answers `Intro { peer, addr }` to both only when both asked.  Probe with encrypted Pings; only the newest authenticated frame from a new address moves the path; fall back to the relay when the direct path is silent.
+- Secure frames carry an anti-replay window (4 096 nonces).
 
 ### Network Migration
 - Each peer has a random `my_session_id` included in every outgoing Ping/Pong.
@@ -319,8 +318,9 @@ Do not mark the implementation done until every item passes.
 ### Access control and hardening (if implemented)
 - [ ] Rate limiting: sending N packets in a burst from one IP lets at most `burst` through initially; subsequent packets are dropped until tokens refill.
 - [ ] Peer table cap: with `max_peers = 1`, connecting a second peer causes the first (least-recently-seen) to be evicted; the second peer's packet is processed normally.
-- [ ] Relay allowlist: a Relay frame from an IP not in the allowlist is dropped and never forwarded.
-- [ ] Relay table cap: a Relay frame that would add a new destination beyond `max_relay_entries` is dropped.
+- [ ] Relayed session: handshake + data both ways + a fragmented payload through a relay node; the relay never sees plaintext.
+- [ ] Forged sender: a `ViaFrom` attributing frames to another key is dropped; replayed inner frames are delivered once.
+- [ ] Relay limits: offline and denied targets both get `Unreachable`; rate limit and max inner size drop and count.
 - [ ] Fragment bomb: Fragment frame with `frag_total > 1024` is rejected; no slot array is allocated.
 - [ ] Concurrent assembly cap: more than 64 incomplete assemblies per (peer, stream) causes the oldest to be dropped.
 - [ ] Send buffer cap: after `MAX_SENT_FRAMES_PER_STREAM` (1024) frames on one stream, the oldest entry is evicted rather than growing unboundedly.

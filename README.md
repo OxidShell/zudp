@@ -1,6 +1,6 @@
 # zudp
 
-Minimal UDP protocol for real-time applications. NACK-based reliability, automatic fragmentation, relay/NAT traversal, RTT-based congestion control, optional end-to-end encryption, and optional LAN discovery.
+Minimal UDP protocol for real-time applications. NACK-based reliability, automatic fragmentation, RTT-based congestion control, optional end-to-end encryption, relayed sessions with hole punching for peers behind NAT, and optional LAN discovery.
 
 ## Quick start
 
@@ -13,7 +13,7 @@ enum Msg { Ping, Pong }
 
 // listener — accepts any peer
 let mut socket = Zudp::default().port(5000).listen::<Msg>().await?;
-let pkt = socket.recv().await?;   // pkt.msg, pkt.from, pkt.stream
+let pkt = socket.recv().await?;   // pkt.msg, pkt.from (a PeerAddr), pkt.stream
 socket.send(Msg::Pong, pkt.from).await?;
 
 // single-peer connection
@@ -31,16 +31,30 @@ Zudp::default()
     .reliable(true)                          // NACK retransmission on/off
     .mtu(1400)                               // fragmentation threshold in bytes
     .keepalive_interval(Duration::from_secs(5))
-    .relay(relay_addr)                       // wrap every packet in a relay header
     .security(Keypair::generate())           // enable Noise XX encryption
-    .pin_remote_key(server_keypair.public_key().clone()) // reject peers with wrong key
+    .pin_remote_key(*server_keypair.public_key()) // only accept pinned keys (repeatable)
+    .punching(true)                          // punch relayed sessions to direct (default on)
+    .relay_node(RelayLimits::default())      // act as a public relay node (`relay` feature)
+    .relay_policy(|from: &[u8; 32], to: &[u8; 32]| true) // who may reach whom via this relay
     .max_peers(1024)                         // LRU-evict oldest peer at cap
     .rate_limit(1000.0)                      // per-IP token-bucket PPS (0.0 = off)
-    .relay_allowlist(vec![trusted_ip])       // restrict who may use this node as relay
-    .max_relay_entries(256)                  // relay routing table cap
     .listen::<Msg>()                         // ZudpSocket<Msg>  — multi-peer
     .connect::<Msg>(peer)                    // ZudpConn<Msg>    — single-peer
+    .connect_via::<Msg>(relay, peer_key)     // ZudpConn<Msg>    — single peer through a relay
 ```
+
+## Addressing peers
+
+Every API that names a peer — `send*`, `Packet::from`, `peer_stats`, `remove_peer`, `PeerEvent` — uses `PeerAddr`:
+
+```rust
+pub enum PeerAddr {
+    Direct(SocketAddr),                          // reached at a UDP address
+    Relayed { relay: SocketAddr, key: [u8; 32] }, // reached by static key through a relay
+}
+```
+
+Direct peers keep the `SocketAddr` API: methods take `impl Into<PeerAddr>`, so `socket.send(msg, addr)` with a `SocketAddr` still works, and a `PeerAddr` compares equal to the `SocketAddr` of a direct peer (`pkt.from == addr`). A direct handle follows the peer when it migrates (`PeerEvent::Migrated`). A relayed handle is stable for the whole session, whichever path the traffic currently takes (`socket.peer_path(peer)`).
 
 ## Multiple streams
 
@@ -94,12 +108,13 @@ if let Some(stats) = socket.peer_stats(peer_addr) {
 
 // Engine-wide drop counters (monotonically increasing since socket creation).
 let e = socket.engine_stats();
-println!("rate-limited {} / peer-cap {} / relay-blocked {} / relay-cap {}",
-    e.dropped_rate_limited, e.dropped_peer_cap, e.dropped_relay_blocked, e.dropped_relay_cap);
+println!("rate-limited {} / peer-cap {} / forged {}",
+    e.dropped_rate_limited, e.dropped_peer_cap, e.dropped_forged);
 ```
 
 `dropped_peer_cap` increments each time the peer table is full and an LRU eviction occurs.
-`dropped_rate_limited`, `dropped_relay_blocked`, `dropped_relay_cap` are self-explanatory.
+`dropped_forged` counts relayed frames whose relay-claimed sender did not match the session they authenticate into.
+A relay node also reports `relay_forwarded_packets` / `relay_forwarded_bytes`, `relay_dropped_rate_limited`, `relay_dropped_oversize`, `relay_unreachable` (of which `relay_denied` and `relay_routes_full`) and `relay_introductions`.
 
 ## Hardening
 
@@ -113,14 +128,9 @@ Zudp::default().rate_limit(500.0) …
 // Peer table cap — evicts least-recently-seen peer when full.
 Zudp::default().max_peers(512) …
 
-// Relay allowlist — empty means open relay (default); non-empty restricts relay use.
-Zudp::default()
-    .relay_allowlist(vec!["10.0.0.0".parse()?, "10.0.0.1".parse()?])
-    .max_relay_entries(64) …
-
-// Update relay policy at runtime without rebinding the socket.
-socket.set_relay_policy(new_allowlist, new_max_entries);
 ```
+
+Relay nodes add their own limits; see [Relay node](#relay-node).
 
 Fragment bombs are also capped: `frag_total > 1 024` and more than 64 concurrent assemblies per (peer, stream) are rejected at the engine level before any allocation occurs.
 
@@ -153,7 +163,9 @@ conn.send(Msg::Ping).await?;
 let pkt = conn.recv().await?;
 ```
 
-The Noise handshake and one authenticated round trip complete inside `connect()` — both ends hold the session before the first `send()`. Lost handshake datagrams are retransmitted; `connect()` fails with `Error::HandshakeTimeout` after `handshake_timeout` (default 5 s) and with `Error::KeyMismatch` when a pinned key does not match. Once the channel is established, **all** data — including unreliable datagrams — is wrapped in `Secure`; only handshake, discovery and MTU-probe frames travel in plaintext. A socket with a keypair drops plaintext data and returns `Error::NoSession` instead of sending in the clear. This includes Ping/Pong keepalives (which carry session IDs) and Nack frames (which expose sequence timing) — encrypting them prevents replay-based migration attacks and traffic analysis. NACK retransmits re-encrypt the original plaintext with a fresh nonce; the old ciphertext is never re-sent.
+The Noise handshake and one authenticated round trip complete inside `connect()` — both ends hold the session before the first `send()`. A multi-peer socket opens sessions with `socket.connect(addr)` the same way. Lost handshake datagrams are retransmitted; `connect()` fails with `Error::HandshakeTimeout` after `handshake_timeout` (default 5 s) and with `Error::KeyMismatch` when a pinned key does not match. Once the channel is established, **all** data — including unreliable datagrams — is wrapped in `Secure`; only handshake, discovery and MTU-probe frames travel in plaintext. A socket with a keypair drops plaintext data and returns `Error::NoSession` instead of sending in the clear. This includes Ping/Pong keepalives (which carry session IDs) and Nack frames (which expose sequence timing) — encrypting them prevents replay-based migration attacks and traffic analysis. NACK retransmits re-encrypt the original plaintext with a fresh nonce; the old ciphertext is never re-sent. Every secure session keeps a 4 096-nonce anti-replay window: a replayed datagram is dropped, whatever it carries.
+
+`pin_remote_key` may be called several times; any pinned key is accepted. Pins apply to every handshake on the socket, direct and relayed alike — a relay client pins the relay node and the peers it reaches through it.
 
 ## LAN discovery
 
@@ -190,25 +202,62 @@ let peer = stream.next().await?;
 `ScanStream::next_event()` yields `DiscoveryEvent::{Found, Updated, Lost}`: a peer that restarts (new `instance`) or changes its metadata is reported again, and one that stops answering for `peer_ttl` is reported lost.
 `AppId` is derived from the app name string via a stable FNV-1a hash.
 
-## Relay
+## Relay and NAT traversal
 
-The relay node is a plain `ZudpSocket` — no special configuration needed.
-The relay is **stateful and bidirectional**: when a client sends through it, the relay records a routing table entry so server replies are automatically forwarded back to the client.
+Requires `features = ["security"]` for clients and `features = ["relay"]` for the relay node. Two peers behind NAT, both connected to a public relay node, talk through it with **end-to-end** Noise and move to a direct path when NAT allows.
 
 ```rust
-// client — wrap every packet via relay
-let conn = Zudp::default()
-    .relay("relay.example.com:7800".parse()?)
-    .connect::<Msg>(server_addr)
+// relay node — public, anyone may run one
+let relay = Zudp::default()
+    .port(7800)
+    .security(relay_keypair)
+    .relay_node(RelayLimits::default())
+    .relay_policy(|from: &[u8; 32], to: &[u8; 32]| allowed(from, to))
+    .listen::<Msg>()
     .await?;
 
-// relay node — just a listening socket; routing table maintained automatically by the engine
-let _relay = Zudp::default().port(7800).listen::<()>().await?;
-// (relay doesn't need to call recv() — the engine handles all forwarding internally)
+// bob — connects to the relay and waits; incoming relayed sessions just show up
+let mut bob = Zudp::default().security(bob_keypair).listen::<Msg>().await?;
+bob.connect(relay_addr).await?;
+let pkt = bob.recv().await?;              // pkt.from == PeerAddr::Relayed { relay, key: alice }
+bob.send(reply, pkt.from).await?;
+
+// alice — reaches bob by his static key
+let alice = Zudp::default().security(alice_keypair).listen::<Msg>().await?;
+alice.connect(relay_addr).await?;
+let bob_handle = alice.connect_via(relay_addr, bob_public_key).await?;
+alice.send(msg, bob_handle).await?;
 ```
 
-Server replies flow back through the relay to the client without any extra configuration.
-When the client migrates to a new network, the relay table is updated automatically on the next outbound packet.
+`Zudp::connect_via::<M>(relay, key)` does the same for a single-peer `ZudpConn`. See `examples/relay.rs`.
+
+**How it works.** Alice's handshake with Bob and every frame of their session travel as opaque bytes inside Alice's and Bob's own secure sessions with the relay (`Via { to }` from Alice, `ViaFrom { from }` to Bob). The relay picks the session by static key; it cannot decrypt what it forwards. Identity comes from the Alice↔Bob handshake, not from the relay: a handshake whose authenticated key differs from the key the relay claims is aborted, and a frame whose session belongs to another peer than the one claimed is dropped (`dropped_forged`). Pinned keys apply as for direct peers. Relayed sessions get reliability, NACKs, fragmentation (at an MTU 66 bytes smaller, the relay overhead), congestion control, keepalives, timeouts and peer events.
+
+**Failing fast.** When the target is not connected to the relay, or the relay's policy refuses, the relay answers `Unreachable` at once: `connect_via` fails with `Error::Unreachable` and an established relayed session ends with `PeerEvent::Disconnected { reason: DisconnectReason::Unreachable }`. Denied and offline look exactly the same, so the relay is no presence oracle.
+
+**Hole punching** (default on; `.punching(false)` to disable). Once a relayed session is up, both ends ask the relay for an introduction. Only when *both* asked does the relay tell each the public address it observes for the other. Both then send authenticated keepalives straight there; the first authenticated frame that arrives directly moves the session onto the direct path, with `PeerEvent::PathChanged { addr, path: Path::Direct(..) }` — same session, same handle. Unauthenticated packets never move a path, and only the newest nonce can. If the direct path goes silent for 3/5 of the peer timeout, traffic falls back to the relay (`PathChanged { path: Path::Relayed(relay) }`) without losing the session; while on the relay, the introduction is retried every 30 s. Where NAT does not allow punching (symmetric NAT on both sides), the session stays on the relay, without errors.
+
+### Relay node
+
+A relay node is a secure socket with `.relay_node(limits)`. It only ever sends to static keys that hold a session with it — never to an address a client names — so it cannot be used to reflect traffic. Its limits:
+
+| Limit | Default | When exceeded |
+|---|---|---|
+| `packet_rate(per_sec, burst)` per client key | 2 000 / 400 | dropped, `relay_dropped_rate_limited` |
+| `byte_rate(per_sec, burst)` per client key | 4 MB/s / 1 MB | dropped, `relay_dropped_rate_limited` |
+| `max_inner(bytes)` | 1 500 | dropped, `relay_dropped_oversize` |
+| `max_routes(pairs)` concurrent client pairs | 4 096 | `Unreachable`, `relay_routes_full` |
+| `max_peers` (socket-wide) | 1 024 | LRU eviction of clients |
+
+The policy (`RelayPolicy`, or any `Fn(&[u8; 32], &[u8; 32]) -> bool`) is consulted for every relayed frame and introduction and can be replaced at runtime with `socket.set_relay_policy(Some(Arc::new(policy)))`.
+
+### Threat model
+
+The relay **sees**: the static keys of its own clients and their public addresses; who talks to whom, when, how often and how much (frame sizes and timing); who asked to be introduced to whom.
+
+The relay **cannot**: read anything (end-to-end ChaCha20-Poly1305 under keys it never holds); forge a frame or a sender (the end-to-end handshake authenticates the peer, the claimed sender is checked against it); replay frames (anti-replay window); impersonate a peer (Noise XX, plus pins); redirect a session to another address (only authenticated, newest frames move a path); learn a client's address for a client that did not ask to be introduced to it.
+
+The relay **can**: drop, delay or reorder traffic (a denial of service any on-path router has); lie in an introduction, which makes the clients send a few authenticated probes to a wrong address and then stay on the relay. A relayed session is bound to the relay it was opened through (and to that relay's address as the client sees it).
 
 ## Network migration
 
@@ -223,6 +272,7 @@ while let Ok(event) = events.recv().await {
         zudp::PeerEvent::Connected { addr, key } => { /* new session */ }
         zudp::PeerEvent::Reset { addr, key } => { /* remote restarted: resend state */ }
         zudp::PeerEvent::Migrated { from, to } => { /* same session, new address */ }
+        zudp::PeerEvent::PathChanged { addr, path } => { /* relayed session punched / fell back */ }
         zudp::PeerEvent::Disconnected { addr, reason } => { /* timed out / removed */ }
         _ => {}
     }
@@ -234,7 +284,17 @@ while let Ok(event) = events.recv().await {
 - If a secure server restarts, a connected client re-handshakes automatically and emits `Reset`.
 - `remove_peer(addr)` drops a peer immediately.
 
-Works for client→server topologies where the server has a public IP.  P2P connections where both peers are behind NAT require a relay.
+Direct connections work for client→server topologies where the server has a public IP. Peers that are both behind NAT connect through a relay node (see [Relay and NAT traversal](#relay-and-nat-traversal)).
+
+## Wire version 3
+
+`WIRE_VERSION` is 3; peers on another version ignore each other's handshakes. Changes from 2:
+
+- The plaintext, socket-wide `Relay` frame (and `relay()`, `relay_allowlist`, `max_relay_entries`, `set_relay_policy(allowlist, cap)`) is gone.
+- Relayed sessions use `Via` (`0x06`), `ViaFrom` (`0x0E`) and `Unreachable` (`0x0F`); hole punching uses `IntroRequest` (`0x10`) and `Intro` (`0x11`). All of them only ever travel inside a `Secure` frame; a plaintext one is dropped.
+- Secure frames are checked against an anti-replay window.
+
+API changes that come with it: peers are addressed by `PeerAddr` (see [Addressing peers](#addressing-peers)); `Packet::from`, `PeerEvent` fields and the peer in `Error::{NoSession, PeerTimeout, HandshakeTimeout}` are `PeerAddr`; `ZudpConn::peer()` returns `PeerAddr`. Code that kept peers in a `HashMap<SocketAddr, _>` switches the key type to `PeerAddr`.
 
 ## License
 

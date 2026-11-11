@@ -6,7 +6,7 @@ Version 0.2 — wire format is not yet stable.
 
 ## Overview
 
-ZUDP is a UDP-based protocol that adds optional reliability, ordered delivery, transparent fragmentation, keepalives, relay/NAT traversal, and LAN peer discovery on top of raw UDP datagrams.
+ZUDP is a UDP-based protocol that adds optional reliability, ordered delivery, transparent fragmentation, keepalives, end-to-end relayed sessions with hole punching for NAT traversal, and LAN peer discovery on top of raw UDP datagrams.
 
 Every packet is a single UDP datagram. The protocol has no handshake, no connection state at the network level, and no acknowledgement of received packets — only negative acknowledgement (NACK) of missing ones.
 
@@ -34,7 +34,7 @@ All multi-byte integers are **big-endian**.
 | `0x03` | Ping | 17 B |
 | `0x04` | Pong | 17 B |
 | `0x05` | Fragment | 19 B |
-| `0x06` | Relay | 8 B (IPv4) / 20 B (IPv6) |
+| `0x06` | Via *(inside Secure only)* | 33 B |
 | `0x07` | Probe | 11 B |
 | `0x08` | Beacon | 21 B + meta |
 | `0x09` | Handshake | 3 B + Noise message (40–104 B) |
@@ -42,10 +42,14 @@ All multi-byte integers are **big-endian**.
 | `0x0B` | MtuProbe | 3 B + padding |
 | `0x0C` | MtuAck | 3 B |
 | `0x0D` | SessionUnknown | 9 B |
+| `0x0E` | ViaFrom *(inside Secure only)* | 33 B |
+| `0x0F` | Unreachable *(inside Secure only)* | 33 B |
+| `0x10` | IntroRequest *(inside Secure only)* | 33 B |
+| `0x11` | Intro *(inside Secure only)* | 40 B (IPv4) / 52 B (IPv6) |
 
 ### Wire version
 
-The session protocol is versioned by `WIRE_VERSION` (currently **2**), carried in every Handshake frame. A responder ignores handshakes from another version, so mismatched peers fail with `HandshakeTimeout` instead of exchanging garbage. Version 2 added the handshake `step`/`version` bytes, the session index in Secure frames and the SessionUnknown frame. Discovery has its own `proto_ver` (see *Discovery*).
+The session protocol is versioned by `WIRE_VERSION` (currently **3**), carried in every Handshake frame. A responder ignores handshakes from another version, so mismatched peers fail with `HandshakeTimeout` instead of exchanging garbage. Version 2 added the handshake `step`/`version` bytes, the session index in Secure frames and the SessionUnknown frame. Version 3 removed the plaintext `Relay` frame, added the relay frames `Via`, `ViaFrom`, `Unreachable`, `IntroRequest` and `Intro` (all only valid inside a Secure frame), and an anti-replay window on Secure frames. Discovery has its own `proto_ver` (see *Discovery*).
 
 ---
 
@@ -59,7 +63,7 @@ Unreliable, unordered delivery. No sequence number; no retransmission.
 [payload bytes] [0x00]
 ```
 
-The unreliable fast path avoids copying the payload: when no relay is configured the sender uses scatter-gather I/O to write the payload and the 1-byte type tag in a single syscall.
+The unreliable fast path avoids copying the payload: on a socket without a keypair, to a direct peer, the sender uses scatter-gather I/O to write the payload and the 1-byte type tag in a single syscall.
 
 ### Stream — `0x01`
 
@@ -129,43 +133,32 @@ One slice of a fragmented reliable message on a specific stream. Messages exceed
 
 Reassembly uses a pre-allocated `Vec<Option<Bytes>>` of length `frag_total`. When all slots are filled the fragments are concatenated in index order. Incomplete assemblies are pruned after `sent_prune_age`.
 
-### Relay — `0x06`
+### Relay frames — `0x06`, `0x0E`–`0x11` *(feature: `security`)*
 
-Relay forwarding request.  The sending node wraps an inner frame and addresses it to a relay node; the relay node strips the outer header and forwards `inner` verbatim to `dest`.
-
-**IPv4 format** (addr tag `0x00`):
+Relay frames are only ever sent inside a Secure frame between a relay node and one of its direct clients; a plaintext one is dropped, and one found inside a relayed (end-to-end) session is dropped too — relaying does not nest. Keys are X25519 static public keys.
 
 ```
-[inner bytes] [port: u16] [ip: 4 bytes] [0x00] [0x06]
+Via          : [inner bytes] [to: 32 bytes]   [0x06]   client → relay
+ViaFrom      : [inner bytes] [from: 32 bytes] [0x0E]   relay → client
+Unreachable  : [to: 32 bytes]                 [0x0F]   relay → client
+IntroRequest : [peer: 32 bytes]               [0x10]   client → relay
+Intro        : [port: u16] [ip: 4|16 bytes] [addr tag: 0x00 v4 | 0x01 v6] [peer: 32 bytes] [0x11]   relay → client
 ```
 
-**IPv6 format** (addr tag `0x01`):
+- `inner` is a complete wire frame of the end-to-end session between two relay clients: a `Handshake`, a `Secure` or a `SessionUnknown` frame. The relay never decrypts it (it has no key for it).
+- `Via { to }`: deliver `inner` to the client whose session with the relay authenticated static key `to`. The relay answers `Unreachable { to }` when no such client is connected, when its policy refuses the pair, or when its route cap is reached — the same answer in every case.
+- `ViaFrom { from }`: `inner` came from the client with key `from`. The receiver treats this as a claim: a handshake must authenticate exactly `from`, and a Secure frame's session index must name the session with `from` through this relay; otherwise the frame is dropped (`EngineStats::dropped_forged`).
+- `IntroRequest { peer }` / `Intro { peer, addr }`: hole punching (see *Relayed sessions*).
 
-```
-[inner bytes] [port: u16] [ip: 16 bytes] [0x01] [0x06]
-```
+A relayed frame carries 66 bytes more than a direct one (`Via`/`ViaFrom` header 33 B, relay session Secure header 17 B and AEAD tag 16 B); relayed peers fragment at `mtu - 66`.
 
-- The relay node is a plain ZUDP socket with no special configuration; it handles both client→server and server→client routing automatically.
-- The destination sees `from == relay_addr`, not the originator's address.
-- Reliable frames can be relayed; NACK-triggered retransmission is end-to-end (originator retransmits to relay, relay re-forwards).
+### Relayed sessions *(feature: `security`)*
 
-#### Stateful relay (bidirectional routing)
+A client with a secure session to relay node R opens a session with key `T` through R (`connect_via(R, T)`): the Noise XX handshake and all subsequent Secure frames of that session travel as `inner` bytes. Each end addresses the other as `PeerAddr::Relayed { relay: R, key }`; the handle stays the same for the whole session. Reliability, fragmentation, congestion control, keepalives, timeouts and peer events work as for direct peers. Pinned keys apply to relayed handshakes exactly as to direct ones. An `Unreachable` answer fails a pending handshake with `Error::Unreachable`, and ends an established session that has no direct path with `PeerEvent::Disconnected { reason: Unreachable }`.
 
-Every ZUDP engine that receives Relay frames automatically maintains a **relay routing table**:
+**Hole punching.** After installing a relayed session, both ends send `IntroRequest { peer }` to R (and again every 30 s while their traffic still goes through R). R only answers when both requests are present within 10 s and its policy allows the pair: it sends each side `Intro { peer, addr }` with the public address it observes for the other. Each side then sends up to 10 encrypted Pings, 100 ms apart, of the end-to-end session straight to `addr`. The first frame of that session that authenticates, is fresh, carries the newest nonce so far and arrives from an address other than R moves the session's path there (`PeerEvent::PathChanged { path: Direct(addr) }`); from then on everything is sent directly. Nothing unauthenticated ever moves a path. When nothing authenticated arrives on the direct path for 3/5 of `peer_timeout`, traffic goes back through R (`PathChanged { path: Relayed(R) }`) and a Ping is sent through R at once; the session is unaffected. With `punching(false)` no introduction is requested and directly-arriving frames of relayed sessions are dropped.
 
-```
-relay_table: HashMap<server_addr, client_addr>
-```
-
-**Client → Server**: when a Relay frame arrives from `client_addr` destined for `server_addr`, the engine records `relay_table[server_addr] = client_addr` and forwards `inner` to `server_addr`.
-
-**Server → Client**: when any frame arrives from `server_addr` (which appears in `relay_table`), the relay engine forwards the **raw bytes** to `relay_table[server_addr]` without decoding.  This happens before Frame::decode, so encrypted, opaque, and partially-formed frames are forwarded transparently.
-
-**Migration**: if the client migrates to a new address and sends a Relay frame from the new address, `relay_table[server_addr]` is updated automatically.  Future server replies are delivered to the new address with no relay reconfiguration.
-
-The routing table is maintained per relay-engine instance and is not persisted across restarts.  One server address maps to exactly one client address (the most recent sender); for multi-client scenarios a dedicated relay with per-session allocation is required.
-
-See **Access control and hardening → Relay abuse protection** for allowlist, table-cap, and TTL semantics.
+**Relay node.** A socket built with `relay_node(limits)` keeps an index from static key to session and forwards `Via` frames as `ViaFrom` frames to the session of the named key. It never sends to an address a client supplies, so it cannot reflect traffic. Per client key it applies a packet and a byte token bucket (default 2 000 frames/s burst 400, 4 MB/s burst 1 MB); it drops inner frames above `max_inner` (default 1 500 B) and refuses new client pairs beyond `max_routes` (default 4 096; a pair idle for 60 s no longer counts). A `RelayPolicy` (`allow(from, to) -> bool`, replaceable at runtime) gates both relaying and introductions.
 
 ### Handshake — `0x09` *(feature: `security`)*
 
@@ -202,7 +195,7 @@ A Noise-encrypted data frame. The `ciphertext` is the output of `ChaCha20-Poly13
 - The AEAD tag (16 B) is appended to the ciphertext by the cipher; it is not a separate field.
 - The decrypting side validates the tag before delivering the plaintext.
 - NACK retransmits re-encrypt the original plaintext with a **fresh nonce** to avoid nonce reuse. The old nonce must not be reused even if the ciphertext is identical.
-- Duplicates are discarded by the reliability layer (sequence numbers), not by a crypto replay window, because a 64-slot window rejects legitimate reordering at high frame rates. The highest authenticated nonce per session is tracked so that only a **newer** frame can move a session to a new address; replaying an old datagram from elsewhere cannot redirect it.
+- Each session keeps an anti-replay window over the last 4 096 nonces (wire version 3): an authenticated frame whose nonce was already accepted, or is more than 4 096 behind the newest, is dropped. Only authenticated frames advance the window. The window is wide so legitimate reordering at high frame rates is never rejected. The highest authenticated nonce per session is tracked as well, so that only a **newer** frame can move a session to a new address or path; replaying an old datagram from elsewhere cannot redirect it.
 
 ### SessionUnknown — `0x0D` *(feature: `security`)*
 
@@ -328,7 +321,6 @@ missing tail frame is delivered, and a hole before it is NACKed.
 | Default `max_pps_per_ip` | 1 000 (burst: 200); handshakes have a separate 20/s budget; peers with an established Noise session are exempt |
 | Default `handshake_timeout` | 5 s |
 | Default `peer_timeout` | 3 × `keepalive_interval` |
-| Default `max_relay_entries` | 256 |
 | Socket send/recv buffer | 4 MiB each |
 | Recv read buffer | 64 KiB (max UDP datagram) |
 
@@ -424,7 +416,7 @@ The initiator is always the node that called `Zudp::connect()`. The responder is
 - A msg1 that does not match the responder's half-open state replaces it (the remote restarted mid-handshake). Half-open states expire after `handshake_timeout`.
 - If both sides initiate at once, the one whose msg1 ephemeral key is larger stays initiator.
 
-On a socket with a keypair, plaintext Datagram, Stream, Fragment, Nack, Ping, Pong and Relay frames are dropped (counted in `EngineStats::dropped_unauthenticated`), and sending to a peer without a session fails with `Error::NoSession` instead of falling back to plaintext.
+On a socket with a keypair, plaintext Datagram, Stream, Fragment, Nack, Ping, Pong and relay frames are dropped (counted in `EngineStats::dropped_unauthenticated`), and sending to a peer without a session fails with `Error::NoSession` instead of falling back to plaintext.
 
 ### Encrypted send path
 
@@ -452,7 +444,7 @@ On a socket with a keypair, plaintext Datagram, Stream, Fragment, Nack, Ping, Po
 | Datagram (unreliable) | yes (since wire version 2) |
 | Handshake | no (by definition, sent before the channel exists) |
 | Probe / Beacon / MtuProbe / SessionUnknown | no (discovery and path probing are always plaintext) |
-| Relay | not accepted by a node with a keypair |
+| Via / ViaFrom / Unreachable / IntroRequest / Intro | always — never valid in plaintext |
 
 ### Nonce exhaustion
 
@@ -460,7 +452,7 @@ The send nonce is a monotonically increasing `u64` starting from 0. At a rate of
 
 ### Remote key pinning *(feature: `security`)*
 
-An endpoint may pin the expected X25519 static public key of its peer. If provided, the key is checked during the Noise XX handshake immediately after the remote's static key becomes available — after `read_message(msg2)` on the initiator side, and after `read_message(msg3)` on the responder side. A mismatch aborts the handshake; no error frame is sent. The initiator learns the responder's key from msg2, so `connect()` fails immediately with `Error::KeyMismatch`. A responder that pins a key drops the handshake silently, and the initiator times out.
+An endpoint may pin one or more expected X25519 static public keys (`pin_remote_key` is repeatable; any pinned key is accepted, and the pins cover direct and relayed handshakes alike). If provided, the key is checked during the Noise XX handshake immediately after the remote's static key becomes available — after `read_message(msg2)` on the initiator side, and after `read_message(msg3)` on the responder side. A mismatch aborts the handshake; no error frame is sent. The initiator learns the responder's key from msg2, so `connect()` fails immediately with `Error::KeyMismatch`. A responder that pins a key drops the handshake silently, and the initiator times out.
 
 ---
 
@@ -485,15 +477,7 @@ This bounds memory usage at any load while preserving service to genuinely activ
 
 ### Relay abuse protection
 
-A relay engine enforces two additional limits on its routing table:
-
-**Allowlist** — if configured, only source IPs present in the allowlist may submit Relay frames. Frames from any other IP are dropped before the routing table is updated. An empty allowlist (the default) allows any source.
-
-**Table cap** — the routing table is bounded by `max_relay_entries`. A Relay frame that would add a new destination beyond the cap is dropped; existing entries are unaffected.
-
-**Entry TTL** — routing entries expire after 300 seconds of inactivity (no Relay frames received for that destination). Expiry is implemented as a generation counter rather than wall-clock timestamps to avoid per-packet syscalls.
-
-- Defaults: no allowlist, `max_relay_entries = 256`.
+See *Relayed sessions → Relay node*: per-client packet and byte token buckets, a maximum inner frame size, a cap on concurrent client pairs, and a pluggable policy. A denied, offline or over-cap target gets the same `Unreachable` answer, so the relay reveals nothing about who is connected. Introductions are only given out when both sides asked for each other, so no client can look up another's address.
 
 ---
 
@@ -596,22 +580,23 @@ When a Ping arrives from an **unknown source address** `new_addr`:
 
 ### `ZudpConn` tracking
 
-`ZudpConn.peer` is an `Arc<RwLock<SocketAddr>>` that shares storage with `PeerState.addr`.  When the remote peer migrates, `ZudpConn.peer()` automatically returns the new address and `recv()` accepts frames from it — no reconnect needed.
+`ZudpConn.peer` is an `Arc<RwLock<PeerAddr>>` that shares storage with `PeerState.addr`.  When the remote peer migrates, `ZudpConn.peer()` automatically returns the new address and `recv()` accepts frames from it — no reconnect needed.
 
 ### Limitations
 
 | Topology | After network change |
 |---|---|
 | Client (any NAT) → Server (public IP) | ✓ migration works (plain and secure) |
-| Client configured with relay | ✓ relay table updates on first Ping from new addr |
-| P2P both behind NAT (no relay) | ✗ new NAT mappings needed — use relay or re-initiate hole punching |
+| Relay client (any NAT) → relay node (public IP) | ✓ migration works; its relayed sessions are unaffected |
+| Relayed session on a punched direct path | ✓ the newest authenticated frame from a new address moves the path; a silent path falls back to the relay |
+| P2P both behind NAT without a relay | ✗ new NAT mappings needed — use a relay node |
 
 ---
 
 ## Peer liveness and events
 
 - A peer that sends nothing for `peer_timeout` (default 3 × `keepalive_interval` = 15 s) is dropped with all its state; with security only authenticated frames count.  Keepalive Pings keep live, idle peers well inside the timeout.
-- `ZudpSocket::events()` / `ZudpConn::events()` / `ZudpSender::events()` return a `PeerEvents` subscription yielding `PeerEvent::{Connected, Reset, Migrated, Disconnected}`.  `Disconnected` carries a `DisconnectReason`: `TimedOut`, `Removed` (`remove_peer`) or `Evicted` (peer table full).
+- `ZudpSocket::events()` / `ZudpConn::events()` / `ZudpSender::events()` return a `PeerEvents` subscription yielding `PeerEvent::{Connected, Reset, Migrated, PathChanged, Disconnected}`.  `PathChanged` reports a relayed session moving between its relay and a punched direct path.  `Disconnected` carries a `DisconnectReason`: `TimedOut`, `Removed` (`remove_peer`), `Evicted` (peer table full) or `Unreachable` (the relay reported a relayed peer gone).
 - `ZudpConn::recv()` returns `Error::PeerTimeout` once its peer timed out (after any messages that were already received).
 - When a remote restarts or re-handshakes, the old per-peer state (sequence counters, send buffers, receive and fragment state, congestion state, keys) is replaced as a whole and `PeerEvent::Reset` is emitted.
 
@@ -669,9 +654,13 @@ Available via `ZudpSocket::engine_stats()` and `ZudpConn::engine_stats()`.
 |---|---|---|
 | `dropped_rate_limited` | `u64` | Packets dropped by the per-IP rate limiter |
 | `dropped_peer_cap` | `u64` | Times the peer table was full and an LRU eviction occurred |
-| `dropped_relay_blocked` | `u64` | Relay frames from IPs not in the allowlist |
-| `dropped_relay_cap` | `u64` | Relay frames dropped because the routing table was full |
 | `dropped_unauthenticated` | `u64` | Plaintext data frames dropped by a socket with a keypair |
+| `dropped_forged` | `u64` | Relayed frames whose relay-claimed sender did not match their session |
+| `relay_forwarded_packets` / `relay_forwarded_bytes` | `u64` | Relay node: frames / inner bytes forwarded |
+| `relay_dropped_rate_limited` | `u64` | Relay node: frames over a client's packet or byte budget |
+| `relay_dropped_oversize` | `u64` | Relay node: inner frames above `max_inner` |
+| `relay_unreachable` | `u64` | Relay node: `Unreachable` answers (of which `relay_denied` by policy, `relay_routes_full` by the route cap) |
+| `relay_introductions` | `u64` | Relay node: client pairs introduced for hole punching |
 
 All counters are read with `Ordering::Relaxed`; they may lag by one instruction reorder but are never negative or wrapping in practice over a socket's lifetime.
 

@@ -1,7 +1,7 @@
 //! # ZUDP — Zero UDP
 //!
 //! A minimal, low-overhead UDP protocol with optional reliability, fragmentation,
-//! keepalives, and relay/tunnel support.
+//! keepalives, end-to-end encryption, and relayed sessions with hole punching.
 //!
 //! ## Quick start
 //!
@@ -25,6 +25,16 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! ## Peers, direct and relayed
+//!
+//! Peers are named by [`PeerAddr`].  A direct peer is its UDP address — every method that
+//! takes a peer accepts a `SocketAddr` through `impl Into<PeerAddr>`.  With the `security`
+//! feature, a client connected to a relay node (a socket built with `Zudp::relay_node`,
+//! `relay` feature) reaches other clients of that relay by static public key with
+//! `ZudpSocket::connect_via`; the session is end-to-end encrypted, the relay only forwards
+//! ciphertext, and hole punching moves it onto a direct path when NAT allows.  Such a peer
+//! is a `PeerAddr::Relayed` handle that stays the same whichever path its traffic takes.
 
 mod addr;
 mod cc;

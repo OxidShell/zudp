@@ -66,6 +66,11 @@ name = "fragmentation"
 path = "examples/fragmentation.rs"
 
 [[example]]
+name = "relay"
+path = "examples/relay.rs"
+required-features = ["relay"]
+
+[[example]]
 name = "discovery_advertise"
 path = "examples/discovery_advertise.rs"
 required-features = ["discovery"]
