@@ -215,7 +215,7 @@ pub struct EngineStats {
     /// one their end-to-end session authenticates.
     pub dropped_forged: u64,
     /// Relayed frames dropped because their relay was neither accepted
-    /// ([`Zudp::accept_relayed_from`]) nor carrying a session we opened through it.
+    /// (`Zudp::accept_relayed_from`) nor carrying a session we opened through it.
     pub dropped_relay_unaccepted: u64,
     /// Relay node: frames forwarded between clients.
     pub relay_forwarded_packets: u64,
@@ -1115,7 +1115,7 @@ impl<M> ZudpSocket<M> {
     /// Same as [`Zudp::connect`] without binding a new socket: with security on, the
     /// handshake and one authenticated round trip complete before it returns, and a session
     /// that is already up is reused.  Typically used to reach a relay node before
-    /// [`connect_via`](Self::connect_via).
+    /// `connect_via` (`security` feature).
     ///
     /// # Errors
     /// `Error::HandshakeTimeout` or `Error::KeyMismatch` when the handshake fails;
