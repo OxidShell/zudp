@@ -78,6 +78,8 @@ MtuAck    (0x0C): [probe_id:u16]                                                
 ViaFrom   (0x0E): [inner] [from:32B]                                                        + [0x0E]  ← inside Secure only
 Unreach.  (0x0F): [to:32B]                                                                  + [0x0F]  ← inside Secure only
 IntroReq  (0x10): [peer:32B]                                                                + [0x10]  ← inside Secure only
+PathChal. (0x12): [token:u64]                                                              + [0x12]  ← inside Secure only
+PathResp. (0x13): [token:u64]                                                              + [0x13]  ← inside Secure only
 Intro     (0x11): [port:u16] [ip:4B|16B] [0x00 v4|0x01 v6] [peer:32B]                       + [0x11]  ← inside Secure only
 ```
 
@@ -203,7 +205,8 @@ if tokens < 0: suggest_sleep = min(−tokens / pacing_rate, 10 ms)
 - Peers behind NAT keep a secure session with a relay node and reach each other **by static key**: the end-to-end Noise handshake and Secure frames travel as opaque `inner` bytes in `Via { to }` (client → relay) and `ViaFrom { from }` (relay → client), each sealed in that client's session with the relay.  See PROTOCOL.md *Relayed sessions*.
 - Receiver rules: a relayed handshake must authenticate exactly the claimed `from`; a relayed Secure frame's index must name the session with `from` through that relay.  Otherwise drop.
 - Relay node: forward only to keys that hold a session with it (never to client-supplied addresses); per-client packet + byte token buckets; cap inner size and concurrent pairs; policy hook; answer `Unreachable { to }` for offline, denied and over-cap alike.
-- Hole punching: both ends send `IntroRequest`; the relay answers `Intro { peer, addr }` to both only when both asked.  Probe with encrypted Pings; only the newest authenticated frame from a new address moves the path; fall back to the relay when the direct path is silent.
+- Receivers accept `ViaFrom` only from relays they accepted or opened the session through; bound relayed handshakes per relay.  Relay policy is mandatory (default-deny); relay budgets and tables are per key, per network and total, evicting LRU instead of refusing.
+- Hole punching only for approved peers (pinned or `punch()`): both ends send `IntroRequest`; the relay answers `Intro { peer, addr }` to both only when both asked; accept an `Intro` only shortly after asking, one campaign per peer, plausible addresses only.  Probe with encrypted Pings; move the path only after a `PathChallenge` sent to the new address is answered from it; fall back to the relay when the direct path is silent.
 - Secure frames carry an anti-replay window (4 096 nonces).
 
 ### Network Migration

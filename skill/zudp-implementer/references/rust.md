@@ -129,7 +129,8 @@ Zudp::default()
     .keepalive_interval(Duration::from_secs(5))  // idle ping interval (default: 5 s)
     .security(Keypair::generate())           // enable Noise XX encryption (feature = "security")
     .punching(true)                          // punch relayed sessions to direct (default: true)
-    .relay_node(RelayLimits::default())      // act as a relay node (feature = "relay")
+    .accept_relayed_from(relay_addr)         // accept inbound relayed sessions from it
+    .relay_node(RelayLimits::default(), policy) // act as a relay node (feature = "relay")
     .listen::<Msg>()                         // → ZudpSocket<M>
     // or
     .connect::<Msg>(peer_addr)              // → ZudpConn<M>
@@ -218,7 +219,8 @@ other by static key with end-to-end encryption; the relay forwards ciphertext on
 ```rust
 // relay node (features = ["relay"])
 let relay = Zudp::default().port(7800).security(relay_kp)
-    .relay_node(RelayLimits::default()).listen::<Msg>().await?;
+    .relay_node(RelayLimits::default(), |from: &[u8; 32], to: &[u8; 32]| allowed(from, to))
+    .listen::<Msg>().await?;
 
 // each client: connect to the relay first
 let socket = Zudp::default().security(kp).listen::<Msg>().await?;
@@ -228,7 +230,8 @@ socket.send(msg, peer).await?;
 // the other side sees PeerEvent::Connected { addr: PeerAddr::Relayed { .. }, .. }
 ```
 
-- Hole punching is automatic (`.punching(false)` disables it); `PeerEvent::PathChanged` reports moves between the relay and a direct path.  The handle never changes.
+- The receiving side must accept the relay: `.accept_relayed_from(relay_addr)`.
+- Hole punching starts for pinned keys, or after `socket.punch(peer)` on both ends (`.punching(false)` disables it); direct paths are validated with an encrypted challenge; `PeerEvent::PathChanged` reports moves between the relay and a direct path.  The handle never changes.
 - `Error::Unreachable { key }` when the target is offline or not allowed (indistinguishable on purpose).
 
 ## Network migration

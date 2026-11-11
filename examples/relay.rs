@@ -34,22 +34,31 @@ async fn main() -> anyhow::Result<()> {
     let relay: ZudpSocket<Msg> = Zudp::default()
         .bind_ip("127.0.0.1".parse()?)
         .security(Keypair::generate())
-        .relay_node(RelayLimits::default())
-        // Who may reach whom; here everyone connected to the relay.
-        .relay_policy(|_from: &[u8; 32], _to: &[u8; 32]| true)
+        // Who may reach whom; here anyone connected (an open relay).  A real deployment
+        // checks the keys against its own directory instead.
+        .relay_node(
+            RelayLimits::default(),
+            |_from: &[u8; 32], _to: &[u8; 32]| true,
+        )
         .listen()
         .await?;
     let relay_addr = relay.local_addr()?;
     println!("relay: listening on {relay_addr}");
 
-    // Bob connects to the relay and waits; he needs no call to accept relayed sessions.
+    // Bob connects to the relay and accepts sessions it delivers.
     let bob_key = Keypair::generate();
     let bob_public = bob_key.public;
-    let mut bob: ZudpSocket<Msg> = Zudp::default().security(bob_key).listen().await?;
+    let mut bob: ZudpSocket<Msg> = Zudp::default()
+        .security(bob_key)
+        .accept_relayed_from(relay_addr)
+        .listen()
+        .await?;
     bob.connect(relay_addr).await?;
     let bob_task = tokio::spawn(async move {
         let pkt = bob.recv().await?;
         println!("bob:   received {:?} from {}", pkt.msg, pkt.from);
+        // Bob knows Alice now (a real app checks her key first): allow a direct path.
+        bob.punch(pkt.from)?;
         bob.send(Msg::Greeting("hi alice".into()), pkt.from).await?;
         // Keep the socket alive long enough to finish punching.
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -62,6 +71,8 @@ async fn main() -> anyhow::Result<()> {
     let mut events = alice.events();
     alice.connect(relay_addr).await?;
     let bob_handle = alice.connect_via(relay_addr, bob_public).await?;
+    // Alice trusts Bob's key — she looked it up — so she lets the session go direct.
+    alice.punch(bob_handle)?;
     println!(
         "alice: session with {bob_handle} over {:?}",
         alice.peer_path(bob_handle)

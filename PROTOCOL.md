@@ -46,10 +46,12 @@ All multi-byte integers are **big-endian**.
 | `0x0F` | Unreachable *(inside Secure only)* | 33 B |
 | `0x10` | IntroRequest *(inside Secure only)* | 33 B |
 | `0x11` | Intro *(inside Secure only)* | 40 B (IPv4) / 52 B (IPv6) |
+| `0x12` | PathChallenge *(inside Secure only)* | 9 B |
+| `0x13` | PathResponse *(inside Secure only)* | 9 B |
 
 ### Wire version
 
-The session protocol is versioned by `WIRE_VERSION` (currently **3**), carried in every Handshake frame. A responder ignores handshakes from another version, so mismatched peers fail with `HandshakeTimeout` instead of exchanging garbage. Version 2 added the handshake `step`/`version` bytes, the session index in Secure frames and the SessionUnknown frame. Version 3 removed the plaintext `Relay` frame, added the relay frames `Via`, `ViaFrom`, `Unreachable`, `IntroRequest` and `Intro` (all only valid inside a Secure frame), and an anti-replay window on Secure frames. Discovery has its own `proto_ver` (see *Discovery*).
+The session protocol is versioned by `WIRE_VERSION` (currently **3**), carried in every Handshake frame. A responder ignores handshakes from another version, so mismatched peers fail with `HandshakeTimeout` instead of exchanging garbage. Version 2 added the handshake `step`/`version` bytes, the session index in Secure frames and the SessionUnknown frame. Version 3 removed the plaintext `Relay` frame, added the relay frames `Via`, `ViaFrom`, `Unreachable`, `IntroRequest`, `Intro`, `PathChallenge` and `PathResponse` (all only valid inside a Secure frame), and an anti-replay window on Secure frames. Discovery has its own `proto_ver` (see *Discovery*).
 
 ---
 
@@ -156,9 +158,18 @@ A relayed frame carries 66 bytes more than a direct one (`Via`/`ViaFrom` header 
 
 A client with a secure session to relay node R opens a session with key `T` through R (`connect_via(R, T)`): the Noise XX handshake and all subsequent Secure frames of that session travel as `inner` bytes. Each end addresses the other as `PeerAddr::Relayed { relay: R, key }`; the handle stays the same for the whole session. Reliability, fragmentation, congestion control, keepalives, timeouts and peer events work as for direct peers. Pinned keys apply to relayed handshakes exactly as to direct ones. An `Unreachable` answer fails a pending handshake with `Error::Unreachable`, and ends an established session that has no direct path with `PeerEvent::Disconnected { reason: Unreachable }`.
 
-**Hole punching.** After installing a relayed session, both ends send `IntroRequest { peer }` to R (and again every 30 s while their traffic still goes through R). R only answers when both requests are present within 10 s and its policy allows the pair: it sends each side `Intro { peer, addr }` with the public address it observes for the other. Each side then sends up to 10 encrypted Pings, 100 ms apart, of the end-to-end session straight to `addr`. The first frame of that session that authenticates, is fresh, carries the newest nonce so far and arrives from an address other than R moves the session's path there (`PeerEvent::PathChanged { path: Direct(addr) }`); from then on everything is sent directly. Nothing unauthenticated ever moves a path. When nothing authenticated arrives on the direct path for 3/5 of `peer_timeout`, traffic goes back through R (`PathChanged { path: Relayed(R) }`) and a Ping is sent through R at once; the session is unaffected. With `punching(false)` no introduction is requested and directly-arriving frames of relayed sessions are dropped.
+**Accepted relays.** A client processes `ViaFrom` only from relays it accepted for inbound sessions (`accept_relayed_from`), or for sessions it opened through that relay itself (a pending or established handshake with that handle); everything else is dropped (`dropped_relay_unaccepted`). Relayed handshake initiations (msg1) are limited to 20/s per relay, each relay has its own budget of half-open handshakes (`max_peers / 4`, at least 8) separate from direct ones, and established sessions through one relay may take at most `max_peers / 2` slots (the least recently seen of them is evicted). Installing any session respects `max_peers` (LRU eviction).
 
-**Relay node.** A socket built with `relay_node(limits)` keeps an index from static key to session and forwards `Via` frames as `ViaFrom` frames to the session of the named key. It never sends to an address a client supplies, so it cannot reflect traffic. Per client key it applies a packet and a byte token bucket (default 2 000 frames/s burst 400, 4 MB/s burst 1 MB); it drops inner frames above `max_inner` (default 1 500 B) and refuses new client pairs beyond `max_routes` (default 4 096; a pair idle for 60 s no longer counts). A `RelayPolicy` (`allow(from, to) -> bool`, replaceable at runtime) gates both relaying and introductions.
+**Hole punching.** Punching is only started for approved peers: keys pinned with `pin_remote_key`, or keys the application approved with `punch(peer)`. For those, both ends send `IntroRequest { peer }` to R after installing the session (again every 30 s while their traffic still goes through R; `punch` asks at once). R only answers when both requests are present within 10 s and its policy allows the pair: it sends each side `Intro { peer, addr }` with the public address it observes for the other. A client accepts an `Intro` only within 10 s of its own request for that peer (once per request), runs one punch campaign per peer at a time, and refuses unspecified, multicast and broadcast addresses, port 0, and private / link-local (loopback) addresses unless the relay's own address is private (loopback). It then sends up to 10 encrypted Pings, 100 ms apart, of the end-to-end session straight to `addr`.
+
+**Path validation.** An authenticated, fresh frame of a relayed session that carries the newest nonce so far and arrives directly from an address `X` other than R and other than the current direct path makes the receiver send `PathChallenge { token }` (random u64) inside the session straight to `X`, at most once per 250 ms per address. The peer answers every challenge with `PathResponse { token }` sent back to the address the challenge came from. Only an authenticated `PathResponse` with the outstanding token that arrives from `X` moves the path there (`PeerEvent::PathChanged { path: Direct(X) }`); from then on everything is sent directly, and `X` is exempt from the per-IP rate limit. A frame captured and re-sent from a spoofed address therefore costs one challenge to that address and moves nothing. When nothing authenticated arrives on the direct path for 3/5 of `peer_timeout`, traffic goes back through R (`PathChanged { path: Relayed(R) }`) and a Ping is sent through R at once; the session is unaffected. With `punching(false)` no introduction is requested and directly-arriving frames of relayed sessions are dropped.
+
+```
+PathChallenge : [token: u64] [0x12]
+PathResponse  : [token: u64] [0x13]
+```
+
+**Relay node.** A socket built with `relay_node(limits, policy)` keeps an index from static key to session and forwards `Via` frames as `ViaFrom` frames to the session of the named key. It never sends to an address a client supplies, so it cannot reflect traffic. Without a policy (`set_relay_policy(None)`) it relays nothing. Every frame is charged to three packet+byte token buckets — per client key, per source network (IPv4 address or IPv6 /64) and for the whole node (defaults: 2 000/s burst 400 and 4 MB/s burst 1 MB; 4 000/s burst 800 and 8 MB/s burst 2 MB; 50 000/s burst 10 000 and 50 MB/s burst 10 MB). Inner frames above `max_inner` (1 500 B) are dropped. Client pairs are tracked up to 64 per key, 256 per network and 4 096 in total; a new pair beyond a cap evicts the least recently used pair of that scope (never refusing), and pairs idle for 60 s or whose client left are forgotten. Pending introduction requests are capped the same way (16 per client, 256 per network, 4 096 total). At most `max_sessions_per_ip` (64) secure sessions are kept per source network; a new one evicts that network's least recently seen session. The relay can always end a relayed session early (`Unreachable`, forged `SessionUnknown`), which is no more than it could do by dropping traffic.
 
 ### Handshake — `0x09` *(feature: `security`)*
 
@@ -477,7 +488,7 @@ This bounds memory usage at any load while preserving service to genuinely activ
 
 ### Relay abuse protection
 
-See *Relayed sessions → Relay node*: per-client packet and byte token buckets, a maximum inner frame size, a cap on concurrent client pairs, and a pluggable policy. A denied, offline or over-cap target gets the same `Unreachable` answer, so the relay reveals nothing about who is connected. Introductions are only given out when both sides asked for each other, so no client can look up another's address.
+See *Relayed sessions → Relay node*: packet and byte token buckets per client key, per source network and in total, a maximum inner frame size, per-client / per-network / total caps on client pairs and pending introductions that evict rather than refuse, a per-network session cap, and a mandatory policy (default-deny). A denied and an offline target get the same `Unreachable` answer; only clients the policy lets through can learn whether a target is connected. Introductions are only given out when both sides asked for each other, so no client can look up another's address.
 
 ---
 
@@ -659,7 +670,9 @@ Available via `ZudpSocket::engine_stats()` and `ZudpConn::engine_stats()`.
 | `relay_forwarded_packets` / `relay_forwarded_bytes` | `u64` | Relay node: frames / inner bytes forwarded |
 | `relay_dropped_rate_limited` | `u64` | Relay node: frames over a client's packet or byte budget |
 | `relay_dropped_oversize` | `u64` | Relay node: inner frames above `max_inner` |
-| `relay_unreachable` | `u64` | Relay node: `Unreachable` answers (of which `relay_denied` by policy, `relay_routes_full` by the route cap) |
+| `dropped_relay_unaccepted` | `u64` | Relayed frames from a relay that was not accepted |
+| `relay_unreachable` | `u64` | Relay node: `Unreachable` answers (of which `relay_denied` by policy) |
+| `relay_routes_evicted` / `relay_sessions_evicted` | `u64` | Relay node: client pairs / sessions evicted to stay within their caps |
 | `relay_introductions` | `u64` | Relay node: client pairs introduced for hole punching |
 
 All counters are read with `Ordering::Relaxed`; they may lag by one instruction reorder but are never negative or wrapping in practice over a socket's lifetime.
