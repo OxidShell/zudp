@@ -1,6 +1,6 @@
 # ZUDP Protocol Specification
 
-Version 0.2 — wire format is not yet stable.
+Wire version 3 — the wire format is not yet stable.
 
 ---
 
@@ -152,7 +152,7 @@ Intro        : [port: u16] [ip: 4|16 bytes] [addr tag: 0x00 v4 | 0x01 v6] [peer:
 - `ViaFrom { from }`: `inner` came from the client with key `from`. The receiver treats this as a claim: a handshake must authenticate exactly `from`, and a Secure frame's session index must name the session with `from` through this relay; otherwise the frame is dropped (`EngineStats::dropped_forged`).
 - `IntroRequest { peer }` / `Intro { peer, addr }`: hole punching (see *Relayed sessions*).
 
-A relayed frame carries 66 bytes more than a direct one (`Via`/`ViaFrom` header 33 B, relay session Secure header 17 B and AEAD tag 16 B); relayed peers fragment at `mtu - 66`.
+A relayed frame carries 66 bytes more than a direct one (`Via`/`ViaFrom` header 33 B, relay session Secure header 17 B and AEAD tag 16 B); relayed peers fragment at `min(relay path MTU, mtu) - 66`, and never above 1 448 B, so the inner frame (chunk + 19 B Fragment header + 33 B Secure overhead) stays within 1 500 B, the default `max_inner` of a relay node. A relay configured with a smaller `max_inner` drops larger fragments (`relay_dropped_oversize`). The relayed size applies even after punching, because the path can fall back to the relay at any time.
 
 ### Relayed sessions *(feature: `security`)*
 
@@ -160,9 +160,13 @@ A client with a secure session to relay node R opens a session with key `T` thro
 
 **Accepted relays.** A client processes `ViaFrom` only from relays it accepted for inbound sessions (`accept_relayed_from`), or for sessions it opened through that relay itself (a pending or established handshake with that handle); everything else is dropped (`dropped_relay_unaccepted`). Relayed handshake initiations (msg1) are limited to 20/s per relay, each relay has its own budget of half-open handshakes (`max_peers / 4`, at least 8) separate from direct ones, and established sessions through one relay may take at most `max_peers / 2` slots (the least recently seen of them is evicted). Installing any session respects `max_peers` (LRU eviction).
 
-**Hole punching.** Punching is only started for approved peers: keys pinned with `pin_remote_key`, or keys the application approved with `punch(peer)`. For those, both ends send `IntroRequest { peer }` to R after installing the session (again every 30 s while their traffic still goes through R; `punch` asks at once). R only answers when both requests are present within 10 s and its policy allows the pair: it sends each side `Intro { peer, addr }` with the public address it observes for the other. A client accepts an `Intro` only within 10 s of its own request for that peer (once per request), runs one punch campaign per peer at a time, and refuses unspecified, multicast and broadcast addresses, port 0, and private / link-local (loopback) addresses unless the relay's own address is private (loopback). It then sends up to 10 encrypted Pings, 100 ms apart, of the end-to-end session straight to `addr`.
+**Hole punching.** Punching is only started for approved peers: keys pinned with `pin_remote_key`, or keys the application approved with `punch(peer)`. For those, both ends send `IntroRequest { peer }` to R after installing the session (again every 30 s while their traffic still goes through R; `punch` asks at once). R only answers when both requests are present within 10 s and its policy allows the pair: it sends each side `Intro { peer, addr }` with the public address it observes for the other. A client accepts an `Intro` only within 10 s of its own request for that peer (once per request), runs one punch campaign per peer at a time, and refuses unspecified, multicast and broadcast addresses, port 0, and private / link-local (loopback) addresses unless the relay's own address is private (loopback). Each side then sends up to 10 encrypted Pings, 100 ms apart, of the end-to-end session straight to `addr`.
 
-**Path validation.** An authenticated, fresh frame of a relayed session that carries the newest nonce so far and arrives directly from an address `X` other than R and other than the current direct path makes the receiver send `PathChallenge { token }` (random u64) inside the session straight to `X`, at most once per 250 ms per address. The peer answers every challenge with `PathResponse { token }` sent back to the address the challenge came from. Only an authenticated `PathResponse` with the outstanding token that arrives from `X` moves the path there (`PeerEvent::PathChanged { path: Direct(X) }`); from then on everything is sent directly, and `X` is exempt from the per-IP rate limit. A frame captured and re-sent from a spoofed address therefore costs one challenge to that address and moves nothing. When nothing authenticated arrives on the direct path for 3/5 of `peer_timeout`, traffic goes back through R (`PathChanged { path: Relayed(R) }`) and a Ping is sent through R at once; the session is unaffected. With `punching(false)` no introduction is requested and directly-arriving frames of relayed sessions are dropped.
+Once punched, *everything* of the session — data, NACKs, retransmits, tail-loss probes, keepalives, Pongs, SessionUnknown hints — goes over the direct path, so the session keeps working, loss recovery included, even if the relay disappears. Handshake messages (including re-handshakes) always go through the relay. A new session with the same handle (the peer restarted) starts on the relay again and reports `PathChanged { path: Relayed(R) }` before its `Reset`.
+
+A peer can hold a direct session and a relayed session at the same time (say, on the same LAN and through a relay); they are separate sessions with separate handles. Relayed sessions never take part in instance-id migration, so one never absorbs the other.
+
+**Path validation.** An authenticated, fresh frame of a relayed session that carries the newest nonce so far and arrives directly from an address `X` other than R and other than the current direct path makes the receiver send `PathChallenge { token }` (random u64) inside the session straight to `X`, at most once per 250 ms per address. The peer answers every challenge with `PathResponse { token }` sent back to the address the challenge came from. Only an authenticated `PathResponse` with the outstanding token that arrives from `X` moves the path there (`PeerEvent::PathChanged { path: Direct(X) }`); from then on everything is sent directly, and `X` is exempt from the per-IP rate limit. A frame captured and re-sent from a spoofed address therefore costs one challenge to that address and moves nothing, and a path that only works in one direction is never used: the challenge or its answer would not get through. When nothing authenticated arrives on the direct path for 3/5 of `peer_timeout`, traffic goes back through R (`PathChanged { path: Relayed(R) }`) and a Ping is sent through R at once; the session is unaffected. With `punching(false)` no introduction is requested and directly-arriving frames of relayed sessions are dropped.
 
 ```
 PathChallenge : [token: u64] [0x12]
@@ -206,7 +210,7 @@ A Noise-encrypted data frame. The `ciphertext` is the output of `ChaCha20-Poly13
 - The AEAD tag (16 B) is appended to the ciphertext by the cipher; it is not a separate field.
 - The decrypting side validates the tag before delivering the plaintext.
 - NACK retransmits re-encrypt the original plaintext with a **fresh nonce** to avoid nonce reuse. The old nonce must not be reused even if the ciphertext is identical.
-- Each session keeps an anti-replay window over the last 4 096 nonces (wire version 3): an authenticated frame whose nonce was already accepted, or is more than 4 096 behind the newest, is dropped. Only authenticated frames advance the window. The window is wide so legitimate reordering at high frame rates is never rejected. The highest authenticated nonce per session is tracked as well, so that only a **newer** frame can move a session to a new address or path; replaying an old datagram from elsewhere cannot redirect it.
+- Each session keeps an anti-replay window over the last 4 096 nonces (wire version 3): an authenticated frame whose nonce was already accepted, or is 4 096 or more behind the newest, is dropped. Only authenticated frames advance the window. The window is wide so legitimate reordering at high frame rates is never rejected. The highest authenticated nonce per session is tracked as well, so that only a **newer** frame can move a session to a new address or path; replaying an old datagram from elsewhere cannot redirect it.
 
 ### SessionUnknown — `0x0D` *(feature: `security`)*
 
@@ -214,7 +218,7 @@ A Noise-encrypted data frame. The `ciphertext` is the output of `ChaCha20-Poly13
 [index: u64] [0x0D]
 ```
 
-Sent in plaintext in reply to a Secure frame whose `index` the receiver does not know (it restarted and lost the session), rate-limited to 5 per second per source IP. The initiator of the session named by `index` starts a new handshake in the background (at most once per handshake timeout); the old session stays in place until the new one replaces it, so a forged SessionUnknown can cost a handshake but cannot tear a session down. Responders ignore it.
+Sent in plaintext in reply to a Secure frame whose `index` the receiver does not know (it restarted and lost the session), rate-limited to 5 per second per source IP (per relayed peer for sessions through a relay, so peers behind one relay do not share a budget). The initiator of the session named by `index` starts a new handshake in the background (at most once per handshake timeout); the old session stays in place until the new one replaces it, so a forged SessionUnknown can cost a handshake but cannot tear a session down. Responders ignore it.
 
 ### MtuProbe — `0x0B`
 
