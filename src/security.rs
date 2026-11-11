@@ -51,8 +51,8 @@ pub fn build_responder(kp: &Keypair) -> Result<snow::HandshakeState, snow::Error
 /// Tracks which nonces have been seen in the last 64 slots relative to `highest`.
 /// Nonces more than 64 behind `highest` are unconditionally rejected.
 ///
-/// Not used inside `SecureChannel` — ZUDP's own per-stream sequence tracking
-/// handles deduplication. Exported for callers that want an explicit window.
+/// Exported for callers that want an explicit window of their own; ZUDP's secure
+/// channels already reject replayed frames with a wider internal window.
 #[derive(Default)]
 pub struct ReplayWindow {
     highest: u64,
@@ -85,18 +85,87 @@ impl ReplayWindow {
     }
 }
 
+/// Nonces tracked by [`NonceWindow`].  Sized for reordering, not for loss: at 10 000
+/// frames per second a frame may still arrive 400 ms behind the newest one.
+const NONCE_WINDOW: u64 = 4_096;
+const NONCE_WORDS: usize = (NONCE_WINDOW / 64) as usize;
+
+/// Anti-replay window over the last [`NONCE_WINDOW`] authenticated nonces.
+///
+/// Every Secure frame is accepted at most once, whichever path it arrived on — a relay
+/// that re-sends an old frame, or an attacker that replays a captured datagram, gets
+/// nothing delivered.  Frames older than the window are rejected too.
+struct NonceWindow {
+    /// Highest nonce accepted so far; `None` before the first one.
+    highest: Option<u64>,
+    /// Bit `n % NONCE_WINDOW` is set once nonce `n` (within the window) was accepted.
+    seen: [u64; NONCE_WORDS],
+}
+
+impl Default for NonceWindow {
+    fn default() -> Self {
+        Self {
+            highest: None,
+            seen: [0; NONCE_WORDS],
+        }
+    }
+}
+
+impl NonceWindow {
+    fn bit(nonce: u64) -> (usize, u64) {
+        let slot = nonce % NONCE_WINDOW;
+        // slot / 64 < NONCE_WORDS, so the cast cannot truncate.
+        #[allow(clippy::cast_possible_truncation)]
+        let word = (slot / 64) as usize;
+        (word, 1 << (slot % 64))
+    }
+
+    /// Record `nonce`; `false` when it was already accepted or is too old.
+    fn accept(&mut self, nonce: u64) -> bool {
+        let highest = match self.highest {
+            Some(highest) if nonce <= highest => {
+                if highest - nonce >= NONCE_WINDOW {
+                    return false;
+                }
+                let (word, mask) = Self::bit(nonce);
+                let fresh = self.seen[word] & mask == 0;
+                self.seen[word] |= mask;
+                return fresh;
+            }
+            Some(highest) => highest,
+            None => {
+                self.highest = Some(nonce);
+                let (word, mask) = Self::bit(nonce);
+                self.seen[word] |= mask;
+                return true;
+            }
+        };
+        // Slide forward: the slots between the old and the new highest are now unseen.
+        if nonce - highest >= NONCE_WINDOW {
+            self.seen = [0; NONCE_WORDS];
+        } else {
+            for skipped in highest + 1..nonce {
+                let (word, mask) = Self::bit(skipped);
+                self.seen[word] &= !mask;
+            }
+        }
+        let (word, mask) = Self::bit(nonce);
+        self.seen[word] |= mask;
+        self.highest = Some(nonce);
+        true
+    }
+}
+
 /// Established Noise transport state for one peer.
 ///
 /// Wraps `StatelessTransportState` so each send/recv carries an explicit nonce,
-/// which is necessary for UDP where packets may arrive out of order.
-///
-/// Replay deduplication is intentionally left to ZUDP's per-stream sequence
-/// layer (`RecvState`). A crypto-layer replay window sized for normal traffic
-/// rejects legitimate out-of-order fragments at high frame rates (e.g. >64
-/// packets behind at 446 frags/sec ≈ 143 ms of jitter → false reject).
+/// which is necessary for UDP where packets may arrive out of order.  Received nonces
+/// go through a [`NonceWindow`], so a replayed frame is rejected even when it carries
+/// something the stream layer would not deduplicate (an unreliable datagram, a Ping).
 pub struct SecureChannel {
     transport: Mutex<snow::StatelessTransportState>,
     send_nonce: AtomicU64,
+    replay: Mutex<NonceWindow>,
     /// Session index we chose; the remote stamps it on Secure frames it sends us.
     local_index: u64,
     /// Session index the remote chose; stamped on every Secure frame we send it.
@@ -112,6 +181,7 @@ impl SecureChannel {
         Self {
             transport: Mutex::new(transport),
             send_nonce: AtomicU64::new(0),
+            replay: Mutex::new(NonceWindow::default()),
             local_index,
             remote_index,
         }
@@ -143,15 +213,18 @@ impl SecureChannel {
 
     /// Decrypt `ciphertext` authenticated with `nonce`.
     ///
-    /// Returns an error only if the AEAD authentication tag is wrong (wrong key,
-    /// tampered payload, or mismatched nonce). True replay deduplication is
-    /// handled by ZUDP's sequence layer, not here.
+    /// Fails when the AEAD tag is wrong (wrong key, tampered payload, mismatched nonce) and
+    /// when the nonce was already accepted or fell out of the replay window.  Only an
+    /// authenticated frame advances the window, so forged frames cannot burn nonces.
     pub fn decrypt(&self, nonce: u64, ciphertext: &[u8]) -> Result<Vec<u8>, snow::Error> {
         let mut buf = vec![0u8; ciphertext.len()];
         let written = self
             .transport
             .lock()
             .read_message(nonce, ciphertext, &mut buf)?;
+        if !self.replay.lock().accept(nonce) {
+            return Err(snow::Error::Decrypt);
+        }
         buf.truncate(written);
         Ok(buf)
     }
@@ -194,6 +267,21 @@ mod tests {
     }
 
     #[test]
+    fn nonce_window_rejects_replays_and_stale_nonces() {
+        let mut w = NonceWindow::default();
+        assert!(w.accept(0));
+        assert!(!w.accept(0));
+        assert!(w.accept(5));
+        assert!(w.accept(3), "reordered but fresh");
+        assert!(!w.accept(3));
+        assert!(w.accept(NONCE_WINDOW + 10));
+        assert!(!w.accept(5), "slid out of the window");
+        assert!(w.accept(NONCE_WINDOW + 9));
+        assert!(w.accept(3 * NONCE_WINDOW), "a jump clears the window");
+        assert!(!w.accept(3 * NONCE_WINDOW));
+    }
+
+    #[test]
     fn noise_handshake_and_roundtrip() {
         let kp_i = Keypair::generate();
         let kp_r = Keypair::generate();
@@ -233,6 +321,10 @@ mod tests {
         let (nonce, ciphertext) = ch_i.encrypt(plaintext).unwrap();
         let decrypted = ch_r.decrypt(nonce, &ciphertext).unwrap();
         assert_eq!(decrypted, plaintext);
+        assert!(
+            ch_r.decrypt(nonce, &ciphertext).is_err(),
+            "replayed frame accepted"
+        );
     }
 
     #[test]
