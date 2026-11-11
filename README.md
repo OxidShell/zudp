@@ -115,7 +115,7 @@ println!("rate-limited {} / peer-cap {} / forged {}",
 `dropped_peer_cap` increments each time the peer table is full and an LRU eviction occurs.
 `dropped_forged` counts relayed frames whose relay-claimed sender did not match the session they authenticate into.
 `dropped_relay_unaccepted` counts relayed frames from a relay that was not accepted (see below).
-A relay node also reports `relay_forwarded_packets` / `relay_forwarded_bytes`, `relay_dropped_rate_limited`, `relay_dropped_oversize`, `relay_unreachable` (of which `relay_denied`), `relay_routes_evicted`, `relay_sessions_evicted` and `relay_introductions`.
+A relay node also reports `relay_forwarded_packets` / `relay_forwarded_bytes`, `relay_dropped_rate_limited`, `relay_dropped_oversize`, `relay_unreachable` (of which `relay_denied`), `relay_sessions_evicted` and `relay_introductions`.
 
 ## Hardening
 
@@ -247,7 +247,7 @@ alice.punch(bob_handle)?;
 
 ### Relay node
 
-A relay node is a secure socket with `.relay_node(limits, policy)`. It only ever sends to static keys that hold a session with it — never to an address a client names — so it cannot be used to reflect traffic. Budgets apply per client key, per source network (an IPv4 address or an IPv6 /64) and for the whole node; a frame has to fit all three. Tables that fill up evict the least recently used entry of the client or network that filled them instead of refusing anyone, and a client's routes and pending introductions are released when its session ends.
+A relay node is a secure socket with `.relay_node(limits, policy)`. It only ever sends to static keys that hold a session with it — never to an address a client names — so it cannot be used to reflect traffic. Budgets apply per client key, per source network (an IPv4 address or an IPv6 /64) and for the whole node; a frame has to fit all three. Sessions are capped per source network and per IPv6 /48, and a full session table makes room in its heaviest prefix — a flood from one allocation only ever displaces its own sessions, never a long-lived client from elsewhere. IPv4 is accounted per address: users behind one carrier-grade NAT share one budget (the alternative, per /24, would lump even more strangers together). Handshakes are budgeted per network (/64), so rotating addresses inside an allocation buys nothing. A client's pending introductions are released when its session ends.
 
 | Limit (`RelayLimits`) | Default | When exceeded |
 |---|---|---|
@@ -255,11 +255,11 @@ A relay node is a secure socket with `.relay_node(limits, policy)`. It only ever
 | `ip_packet_rate` / `ip_byte_rate` per source network | 4 000 frames/s (burst 800), 8 MB/s (burst 2 MB) | dropped, `relay_dropped_rate_limited` |
 | `total_packet_rate` / `total_byte_rate` whole node | 50 000 frames/s (burst 10 000), 50 MB/s (burst 10 MB) | dropped, `relay_dropped_rate_limited` |
 | `max_inner(bytes)` | 1 500 | dropped, `relay_dropped_oversize` |
-| `max_routes(total, per_client, per_ip)` client pairs | 4 096 / 64 / 256 | oldest pair of that scope evicted, `relay_routes_evicted` |
-| `max_sessions_per_ip` | 64 | that network's least recently seen session evicted, `relay_sessions_evicted` |
-| pending introductions | 16 per client, 256 per network, 4 096 total | oldest of that scope evicted |
+| `max_sessions_per_ip(per_network, per_prefix)` | 64 per /64 (or IPv4 address), 256 per IPv6 /48 | that scope's least recently seen session evicted, `relay_sessions_evicted` |
+| full session table (`max_peers`) | 1 024 | the heaviest prefix's least recently seen session evicted, `relay_sessions_evicted` |
+| pending introductions | 16 per client, 64 per network (own oldest evicted), 4 096 total (new ones refused) | — |
 | `max_peers` (socket-wide) | 1 024 | LRU eviction of clients |
-| handshakes per source IP (socket-wide) | 20/s | dropped, `dropped_rate_limited` |
+| handshakes per source network (socket-wide) | 20/s | dropped, `dropped_rate_limited` |
 
 The policy (`RelayPolicy`, or any `Fn(&[u8; 32], &[u8; 32]) -> bool`) is consulted for every relayed frame and introduction and can be replaced at runtime with `socket.set_relay_policy(Some(Arc::new(policy)))`; `None` relays nothing.
 
