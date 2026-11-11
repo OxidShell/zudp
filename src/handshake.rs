@@ -20,7 +20,6 @@
 
 use std::{
     collections::HashMap,
-    net::SocketAddr,
     sync::Weak,
     time::{Duration, Instant},
 };
@@ -29,7 +28,7 @@ use bytes::Bytes;
 use tokio::sync::oneshot;
 
 use crate::{
-    Error,
+    Error, PeerAddr,
     engine::EngineInner,
     frame::{Frame, WIRE_VERSION},
     peer::random_u64,
@@ -84,7 +83,7 @@ pub(crate) struct Pending {
     waiter: Option<oneshot::Sender<Outcome>>,
 }
 
-pub(crate) type PendingMap = HashMap<SocketAddr, Pending>;
+pub(crate) type PendingMap = HashMap<PeerAddr, Pending>;
 
 /// A finished handshake and whoever is waiting for it.
 pub(crate) type Done = (Established, Option<oneshot::Sender<Outcome>>);
@@ -146,7 +145,7 @@ fn into_established(pending: Pending, finish_wire: Option<Bytes>) -> Result<Done
 /// install.  The caller installs the session before notifying any waiter.
 pub(crate) fn on_message(
     inner: &EngineInner,
-    from: SocketAddr,
+    from: PeerAddr,
     step: u8,
     version: u8,
     payload: &Bytes,
@@ -172,7 +171,7 @@ fn respond(
     inner: &EngineInner,
     kp: &crate::security::Keypair,
     pending: &mut PendingMap,
-    from: SocketAddr,
+    from: PeerAddr,
     payload: &Bytes,
 ) -> StepResult {
     let mut waiter = None;
@@ -244,7 +243,7 @@ fn respond(
 fn finish_as_initiator(
     inner: &EngineInner,
     pending: &mut PendingMap,
-    from: SocketAddr,
+    from: PeerAddr,
     payload: &Bytes,
 ) -> StepResult {
     let Some(state) = pending.get_mut(&from).filter(|p| p.role == Role::Initiator) else {
@@ -300,7 +299,7 @@ fn finish_as_initiator(
 fn restart_initiator(
     inner: &EngineInner,
     pending: &mut PendingMap,
-    from: SocketAddr,
+    from: PeerAddr,
     stale: Pending,
 ) {
     let Some(kp) = inner.keypair.as_ref() else {
@@ -316,7 +315,7 @@ fn restart_initiator(
 fn finish_as_responder(
     inner: &EngineInner,
     pending: &mut PendingMap,
-    from: SocketAddr,
+    from: PeerAddr,
     payload: &Bytes,
 ) -> StepResult {
     let Some(state) = pending.get_mut(&from).filter(|p| p.role == Role::Responder) else {
@@ -389,7 +388,7 @@ pub(crate) fn is_pending_index(inner: &EngineInner, index: u64) -> bool {
 ///
 /// Returns once the session is established on both ends: something authenticated has come
 /// back from the remote.  Fails with [`Error::HandshakeTimeout`] or [`Error::KeyMismatch`].
-pub(crate) async fn initiate(engine: &Weak<EngineInner>, peer: SocketAddr) -> Result<(), Error> {
+pub(crate) async fn initiate(engine: &Weak<EngineInner>, peer: PeerAddr) -> Result<(), Error> {
     let (deadline, rx) = {
         let inner = engine.upgrade().ok_or_else(stopped)?;
         let Some(kp) = inner.keypair.as_ref() else {
@@ -427,7 +426,7 @@ pub(crate) async fn initiate(engine: &Weak<EngineInner>, peer: SocketAddr) -> Re
 /// Resend whatever `next_wire` yields with back-off until `rx` resolves or `deadline`.
 async fn retransmit_until<F>(
     engine: &Weak<EngineInner>,
-    peer: SocketAddr,
+    peer: PeerAddr,
     deadline: Instant,
     mut rx: oneshot::Receiver<Outcome>,
     next_wire: F,
@@ -440,10 +439,12 @@ where
         let wire = {
             let inner = engine.upgrade()?;
             let sock = inner.get_socket();
-            next_wire(&inner).map(|w| (w, sock))
+            next_wire(&inner)
+                .and_then(|w| inner.outbound_to(peer, w))
+                .map(|w| (w, sock))
         };
-        if let Some((wire, sock)) = wire
-            && let Err(e) = sock.send_to(&wire, peer).await
+        if let Some(((wire, dest), sock)) = wire
+            && let Err(e) = sock.send_to(&wire, dest).await
         {
             tracing::debug!(target: "zudp::handshake", %peer, "send: {e}");
         }
@@ -462,7 +463,7 @@ where
 /// Wait for the first authenticated frame from `peer`, resending msg3 and a Ping meanwhile.
 async fn confirm(
     engine: &Weak<EngineInner>,
-    peer: SocketAddr,
+    peer: PeerAddr,
     deadline: Instant,
     generation: u64,
 ) -> Result<(), Error> {
@@ -486,14 +487,14 @@ async fn confirm(
             return Ok(());
         }
         let sock = inner.get_socket();
-        let ping = crate::engine::ping_for(&inner, &session);
-        let finish = session.finish_wire();
+        let ping =
+            crate::engine::ping_for(&inner, &session).and_then(|p| inner.outbound(&session, p));
+        let finish = session
+            .finish_wire()
+            .and_then(|f| inner.outbound_to(peer, f));
         drop(inner);
-        if let Some(finish) = finish {
-            let _ = sock.send_to(&finish, peer).await;
-        }
-        if let Some(ping) = ping {
-            let _ = sock.send_to(&ping, peer).await;
+        for (wire, dest) in [finish, ping].into_iter().flatten() {
+            let _ = sock.send_to(&wire, dest).await;
         }
         let now = Instant::now();
         if now >= deadline {

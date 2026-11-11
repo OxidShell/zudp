@@ -1,10 +1,8 @@
 //! Peer lifecycle notifications.
 
-use std::net::SocketAddr;
-
 use tokio::sync::broadcast;
 
-use crate::Error;
+use crate::{Error, PeerAddr};
 
 /// Events buffered per subscriber before the oldest are dropped.
 pub(crate) const EVENT_CAPACITY: usize = 256;
@@ -21,20 +19,20 @@ pub enum PeerEvent {
     /// security) the first frame arrived from that address.  `key` is the remote's static
     /// public key when security is on.
     Connected {
-        addr: SocketAddr,
+        addr: PeerAddr,
         key: Option<[u8; 32]>,
     },
     /// The remote at `addr` restarted or re-handshook; all per-peer state was discarded and a
     /// fresh session replaced it.  Anything in flight on the old session is gone.
     Reset {
-        addr: SocketAddr,
+        addr: PeerAddr,
         key: Option<[u8; 32]>,
     },
     /// The same session is now reachable at `to` (NAT rebinding, Wi-Fi switch, new IP).
-    Migrated { from: SocketAddr, to: SocketAddr },
+    Migrated { from: PeerAddr, to: PeerAddr },
     /// The peer at `addr` is gone and its state was dropped.
     Disconnected {
-        addr: SocketAddr,
+        addr: PeerAddr,
         reason: DisconnectReason,
     },
 }

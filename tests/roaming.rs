@@ -56,7 +56,11 @@ async fn migrate(secure: bool) {
 
     let mut migrated = false;
     while let Some(event) = events.try_recv() {
-        migrated |= event == PeerEvent::Migrated { from: old, to: new };
+        migrated |= event
+            == PeerEvent::Migrated {
+                from: old.into(),
+                to: new.into(),
+            };
     }
     assert!(migrated, "no Migrated event");
 

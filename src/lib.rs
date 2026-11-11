@@ -26,6 +26,7 @@
 //! }
 //! ```
 
+mod addr;
 mod cc;
 mod codec;
 #[cfg(feature = "discovery")]
@@ -48,6 +49,7 @@ mod socket;
 /// or use `send` / `recv` which implicitly target this stream.
 pub const DEFAULT_STREAM: u16 = 0;
 
+pub use addr::{Path, PeerAddr};
 pub use codec::{Decode, Encode};
 #[cfg(feature = "discovery")]
 pub use discovery::{
@@ -99,8 +101,8 @@ impl ZudpSender {
     /// [`PeerEvent::Disconnected`] with [`DisconnectReason::Removed`].  Returns `false` when
     /// the peer was unknown.
     #[must_use = "false means the peer was not known"]
-    pub fn remove_peer(&self, peer: SocketAddr) -> bool {
-        self.inner.engine.remove_peer(peer)
+    pub fn remove_peer(&self, peer: impl Into<PeerAddr>) -> bool {
+        self.inner.engine.remove_peer(peer.into())
     }
 
     /// Send `msg` to `peer` on `stream_id`.
@@ -110,17 +112,19 @@ impl ZudpSender {
     pub async fn send_stream<M: Encode>(
         &self,
         msg: M,
-        peer: SocketAddr,
+        peer: impl Into<PeerAddr>,
         stream_id: u16,
     ) -> Result<(), Error> {
-        self.inner.send_msg(&msg, peer, true, stream_id).await
+        self.inner
+            .send_msg(&msg, peer.into(), true, stream_id)
+            .await
     }
 
     /// Smoothed RTT to `peer` as measured by transport-level Ping/Pong.
     /// Returns `None` until the first Pong has been received.
     #[must_use]
-    pub fn peer_srtt(&self, peer: SocketAddr) -> Option<std::time::Duration> {
-        self.inner.engine.peers.get(&peer)?.cc.lock().srtt()
+    pub fn peer_srtt(&self, peer: impl Into<PeerAddr>) -> Option<std::time::Duration> {
+        self.inner.engine.peers.get(&peer.into())?.cc.lock().srtt()
     }
 }
 
@@ -178,8 +182,9 @@ pub struct EngineStats {
 pub struct Packet<M> {
     /// The decoded application message.
     pub msg: M,
-    /// Address the message was received from.
-    pub from: std::net::SocketAddr,
+    /// The peer the message came from.  For a direct peer this compares equal to its
+    /// `SocketAddr`; see [`PeerAddr`].
+    pub from: PeerAddr,
     /// Stream the message was sent on (`0` = [`DEFAULT_STREAM`]).
     pub stream: u16,
 }
@@ -480,11 +485,15 @@ impl Zudp {
         };
         let socket = ZudpSocket::new(self.config).await?;
         // Pre-create the peer entry so ZudpConn can share the live-address Arc.
-        let peer_state = socket.inner.get_or_create_peer(peer);
+        let peer_state = socket.inner.get_or_create_peer(PeerAddr::Direct(peer));
         let peer_addr = peer_state.addr_arc();
         #[cfg(feature = "security")]
         if socket.inner.config.security.is_some() {
-            handshake::initiate(&Arc::downgrade(&socket.inner.engine), peer).await?;
+            handshake::initiate(
+                &Arc::downgrade(&socket.inner.engine),
+                PeerAddr::Direct(peer),
+            )
+            .await?;
         }
         if !socket.inner.engine.secured()
             && let Some(ping) = engine::ping_for(&socket.inner.engine, &peer_state)
@@ -520,7 +529,7 @@ struct Inner {
 impl Inner {
     async fn new(
         config: Config,
-    ) -> Result<(Arc<Self>, mpsc::Receiver<(Bytes, SocketAddr, u16)>), Error> {
+    ) -> Result<(Arc<Self>, mpsc::Receiver<(Bytes, PeerAddr, u16)>), Error> {
         let addr = SocketAddr::new(config.bind_ip, config.port);
         let socket = RawSocket::bind(addr).await?;
         let config = Arc::new(config);
@@ -566,7 +575,7 @@ impl Inner {
         self.next_msg_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn get_or_create_peer(&self, addr: SocketAddr) -> Arc<PeerState> {
+    fn get_or_create_peer(&self, addr: PeerAddr) -> Arc<PeerState> {
         self.engine.get_or_create_peer(addr)
     }
 
@@ -577,7 +586,7 @@ impl Inner {
     async fn send_msg<M: Encode>(
         &self,
         msg: &M,
-        dest: SocketAddr,
+        dest: PeerAddr,
         reliable: bool,
         stream_id: u16,
     ) -> Result<(), Error> {
@@ -601,11 +610,9 @@ impl Inner {
         let mtu = peer.effective_mtu_or(self.config.mtu);
 
         if payload.len() <= mtu {
-            self.send_single(payload, peer, dest, reliable, stream_id)
-                .await
+            self.send_single(payload, peer, reliable, stream_id).await
         } else {
-            self.send_fragmented(payload, peer, dest, stream_id, mtu)
-                .await
+            self.send_fragmented(payload, peer, stream_id, mtu).await
         }
     }
 
@@ -613,7 +620,6 @@ impl Inner {
         &self,
         payload: Bytes,
         peer: Arc<PeerState>,
-        actual_dest: SocketAddr,
         reliable: bool,
         stream_id: u16,
     ) -> Result<(), Error> {
@@ -626,16 +632,13 @@ impl Inner {
                 payload,
             }
             .encode();
-            let wire = maybe_encrypt(&self.engine, &peer, &plain_frame)?;
+            let (wire, dest) = routed(&self.engine, &peer, &plain_frame)?;
             // Track token usage; new sends are never delayed (latency budget).
             peer.cc.lock().consume(wire.len());
-            self.engine.get_socket().send_to(&wire, actual_dest).await?;
+            self.engine.get_socket().send_to(&wire, dest).await?;
             peer.record_sent(stream_id, seq, plain_frame, self.config.sent_buffer_frames);
             engine::arm_tail_probe(&self.engine, &peer, stream_id);
-        } else if self.engine.secured() {
-            let wire = maybe_encrypt(&self.engine, &peer, &Frame::Datagram(payload).encode())?;
-            self.engine.get_socket().send_to(&wire, actual_dest).await?;
-        } else {
+        } else if let (false, PeerAddr::Direct(dest)) = (self.engine.secured(), peer.addr()) {
             // Scatter-gather: send payload + 1-byte type tag without copying payload.
             let type_tag = [frame::TYPE_DATAGRAM];
             self.engine
@@ -645,9 +648,12 @@ impl Inner {
                         std::io::IoSlice::new(&payload),
                         std::io::IoSlice::new(&type_tag),
                     ],
-                    actual_dest,
+                    dest,
                 )
                 .await?;
+        } else {
+            let (wire, dest) = routed(&self.engine, &peer, &Frame::Datagram(payload).encode())?;
+            self.engine.get_socket().send_to(&wire, dest).await?;
         }
         peer.mark_sent();
         Ok(())
@@ -657,7 +663,6 @@ impl Inner {
         &self,
         payload: Bytes,
         peer: Arc<PeerState>,
-        actual_dest: SocketAddr,
         stream_id: u16,
         mtu: usize,
     ) -> Result<(), Error> {
@@ -680,11 +685,11 @@ impl Inner {
                 payload: chunk,
             }
             .encode();
-            let wire = maybe_encrypt(&self.engine, &peer, &plain_frame)?;
+            let (wire, dest) = routed(&self.engine, &peer, &plain_frame)?;
             // Track tokens; new fragment sends are not delayed (65 KB burst budget
             // covers typical game state syncs without any pacing delay).
             peer.cc.lock().consume(wire.len());
-            self.engine.get_socket().send_to(&wire, actual_dest).await?;
+            self.engine.get_socket().send_to(&wire, dest).await?;
             peer.record_sent(stream_id, seq, plain_frame, self.config.sent_buffer_frames);
         }
         engine::arm_tail_probe(&self.engine, &peer, stream_id);
@@ -692,11 +697,15 @@ impl Inner {
     }
 }
 
-/// Encrypt `plain` using the peer's Noise channel if one exists; otherwise return `plain` as-is.
-// Result is needed when the `security` feature is enabled (channel.encrypt can fail).
-#[allow(clippy::unnecessary_wraps)]
-fn maybe_encrypt(engine: &EngineInner, peer: &PeerState, plain: &Bytes) -> Result<Bytes, Error> {
-    engine::seal(engine, peer, plain).ok_or(Error::NoSession { peer: peer.addr() })
+/// Seal `plain` for `peer` (see [`engine::seal`]) and wrap it for the peer's current path.
+fn routed(
+    engine: &EngineInner,
+    peer: &PeerState,
+    plain: &Bytes,
+) -> Result<(Bytes, SocketAddr), Error> {
+    engine::seal(engine, peer, plain)
+        .and_then(|wire| engine.outbound(peer, wire))
+        .ok_or(Error::NoSession { peer: peer.addr() })
 }
 
 /// A ZUDP socket that sends and receives messages from any remote peer.
@@ -704,7 +713,7 @@ fn maybe_encrypt(engine: &EngineInner, peer: &PeerState, plain: &Bytes) -> Resul
 /// Created by [`Zudp::listen`].
 pub struct ZudpSocket<M> {
     inner: Arc<Inner>,
-    rx: mpsc::Receiver<(Bytes, SocketAddr, u16)>,
+    rx: mpsc::Receiver<(Bytes, PeerAddr, u16)>,
     _phantom: PhantomData<fn() -> M>,
 }
 
@@ -729,8 +738,8 @@ impl<M> ZudpSocket<M> {
 
     /// Smoothed RTT to `peer`.  `None` until the first Pong from that peer.
     #[must_use]
-    pub fn peer_srtt(&self, peer: SocketAddr) -> Option<Duration> {
-        self.inner.engine.peers.get(&peer)?.cc.lock().srtt()
+    pub fn peer_srtt(&self, peer: impl Into<PeerAddr>) -> Option<Duration> {
+        self.inner.engine.peers.get(&peer.into())?.cc.lock().srtt()
     }
 
     /// Congestion factor for `peer` (SRTT / `min_RTT`).
@@ -738,11 +747,11 @@ impl<M> ZudpSocket<M> {
     /// Values near 1.0 mean the path is clear; above 1.25 indicates buffer bloat.
     /// `None` until at least one RTT sample has been taken.
     #[must_use]
-    pub fn peer_congestion_factor(&self, peer: SocketAddr) -> Option<f64> {
+    pub fn peer_congestion_factor(&self, peer: impl Into<PeerAddr>) -> Option<f64> {
         self.inner
             .engine
             .peers
-            .get(&peer)?
+            .get(&peer.into())?
             .cc
             .lock()
             .congestion_factor()
@@ -750,8 +759,8 @@ impl<M> ZudpSocket<M> {
 
     /// Full statistics snapshot for `peer`.  `None` if the peer is not in the table.
     #[must_use]
-    pub fn peer_stats(&self, peer: SocketAddr) -> Option<PeerStats> {
-        let p = self.inner.engine.peers.get(&peer)?.value().clone();
+    pub fn peer_stats(&self, peer: impl Into<PeerAddr>) -> Option<PeerStats> {
+        let p = self.inner.engine.peers.get(&peer.into())?.value().clone();
         let (srtt, congestion_factor, pacing_rate_bps) = {
             let cc = p.cc.lock();
             // pacing_rate is bounded to [10_000, 100_000_000] — cast is safe.
@@ -800,8 +809,8 @@ impl<M> ZudpSocket<M> {
     /// [`PeerEvent::Disconnected`] with [`DisconnectReason::Removed`].  Returns `false` when
     /// the peer was unknown.
     #[must_use = "false means the peer was not known"]
-    pub fn remove_peer(&self, peer: SocketAddr) -> bool {
-        self.inner.engine.remove_peer(peer)
+    pub fn remove_peer(&self, peer: impl Into<PeerAddr>) -> bool {
+        self.inner.engine.remove_peer(peer.into())
     }
 
     /// The remote peer's X25519 static public key as negotiated by the Noise
@@ -809,11 +818,11 @@ impl<M> ZudpSocket<M> {
     /// not yet completed.
     #[cfg(feature = "security")]
     #[must_use]
-    pub fn peer_remote_static_key(&self, peer: SocketAddr) -> Option<[u8; 32]> {
+    pub fn peer_remote_static_key(&self, peer: impl Into<PeerAddr>) -> Option<[u8; 32]> {
         self.inner
             .engine
             .peers
-            .get(&peer)
+            .get(&peer.into())
             .and_then(|p| p.remote_static_key())
     }
 
@@ -825,11 +834,13 @@ impl<M> ZudpSocket<M> {
     ///
     /// # Errors
     /// Returns `Err` on I/O failure or if the message is too large to fragment.
-    pub async fn send(&self, msg: M, peer: SocketAddr) -> Result<(), Error>
+    pub async fn send(&self, msg: M, peer: impl Into<PeerAddr>) -> Result<(), Error>
     where
         M: Encode,
     {
-        self.inner.send_msg(&msg, peer, true, DEFAULT_STREAM).await
+        self.inner
+            .send_msg(&msg, peer.into(), true, DEFAULT_STREAM)
+            .await
     }
 
     /// Send a reliable, ordered message to `peer` on the given `stream_id`.
@@ -839,11 +850,18 @@ impl<M> ZudpSocket<M> {
     ///
     /// # Errors
     /// Returns `Err` on I/O failure or if the message is too large to fragment.
-    pub async fn send_stream(&self, msg: M, peer: SocketAddr, stream_id: u16) -> Result<(), Error>
+    pub async fn send_stream(
+        &self,
+        msg: M,
+        peer: impl Into<PeerAddr>,
+        stream_id: u16,
+    ) -> Result<(), Error>
     where
         M: Encode,
     {
-        self.inner.send_msg(&msg, peer, true, stream_id).await
+        self.inner
+            .send_msg(&msg, peer.into(), true, stream_id)
+            .await
     }
 
     /// Send an unreliable, unordered datagram to `peer`.
@@ -852,11 +870,13 @@ impl<M> ZudpSocket<M> {
     ///
     /// # Errors
     /// Returns `Err` on I/O failure.
-    pub async fn send_unreliable(&self, msg: M, peer: SocketAddr) -> Result<(), Error>
+    pub async fn send_unreliable(&self, msg: M, peer: impl Into<PeerAddr>) -> Result<(), Error>
     where
         M: Encode,
     {
-        self.inner.send_msg(&msg, peer, false, DEFAULT_STREAM).await
+        self.inner
+            .send_msg(&msg, peer.into(), false, DEFAULT_STREAM)
+            .await
     }
 
     /// Receive the next message from any peer on any stream.
@@ -900,7 +920,7 @@ impl<M> ZudpSocket<M> {
 pub struct ZudpConn<M> {
     socket: ZudpSocket<M>,
     /// Shared with `PeerState.addr`; updated in-place when the remote migrates.
-    peer: Arc<RwLock<SocketAddr>>,
+    peer: Arc<RwLock<PeerAddr>>,
     events: PeerEvents,
 }
 
@@ -911,11 +931,12 @@ impl<M> ZudpConn<M> {
         self.socket.events()
     }
 
-    /// Current remote peer address.
+    /// Current handle of the remote peer.
     ///
-    /// Updated automatically when the peer migrates to a new network interface.
+    /// For a direct peer it is updated automatically when the peer migrates to a new
+    /// network interface; a relayed peer keeps its handle for the whole session.
     #[must_use]
-    pub fn peer(&self) -> SocketAddr {
+    pub fn peer(&self) -> PeerAddr {
         *self.peer.read()
     }
 

@@ -9,7 +9,7 @@ use std::{
 
 use tokio::sync::oneshot;
 
-use crate::{engine::EngineInner, frame::Frame};
+use crate::{PeerAddr, engine::EngineInner, frame::Frame};
 
 /// Minimum guaranteed IPv4 MTU (RFC 791).
 const MTU_MIN: usize = 576;
@@ -95,7 +95,11 @@ async fn probe_once(inner: &Weak<EngineInner>, peer_addr: SocketAddr, size: usiz
     let probe_id = PROBE_ID.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = oneshot::channel::<()>();
 
-    let Some(peer) = inner.peers.get(&peer_addr).map(|r| r.value().clone()) else {
+    let Some(peer) = inner
+        .peers
+        .get(&PeerAddr::Direct(peer_addr))
+        .map(|r| r.value().clone())
+    else {
         return false;
     };
     {

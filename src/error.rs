@@ -1,4 +1,6 @@
-use std::{fmt, net::SocketAddr};
+use std::fmt;
+
+use crate::PeerAddr;
 
 #[derive(Debug)]
 pub enum Error {
@@ -66,7 +68,7 @@ pub enum Error {
     /// The Noise handshake with `peer` did not complete in time.
     #[cfg(feature = "security")]
     HandshakeTimeout {
-        peer: SocketAddr,
+        peer: PeerAddr,
     },
 
     /// Packet dropped — source IP exceeded configured rate limit.
@@ -74,13 +76,13 @@ pub enum Error {
 
     /// Nothing was heard from `peer` for the configured peer timeout; its state was dropped.
     PeerTimeout {
-        peer: SocketAddr,
+        peer: PeerAddr,
     },
 
     /// Security is configured but there is no established session with `peer` (never
     /// connected, timed out, removed, or being re-established), so nothing was sent.
     NoSession {
-        peer: SocketAddr,
+        peer: PeerAddr,
     },
 }
 

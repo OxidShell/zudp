@@ -35,14 +35,17 @@ async fn dead_peer_times_out_and_is_reported() {
         let addr = std::net::SocketAddr::new(LO, addr.port());
         assert_eq!(
             next_event(&mut events, Duration::from_secs(1)).await,
-            PeerEvent::Connected { addr, key: None }
+            PeerEvent::Connected {
+                addr: addr.into(),
+                key: None
+            }
         );
         addr
     };
     assert_eq!(
         next_event(&mut events, Duration::from_secs(3)).await,
         PeerEvent::Disconnected {
-            addr: client_addr,
+            addr: client_addr.into(),
             reason: DisconnectReason::TimedOut
         }
     );
@@ -151,7 +154,7 @@ async fn secure_sessions_report_connected_and_reset_with_the_key() {
     assert_eq!(
         next_event(&mut events, Duration::from_secs(1)).await,
         PeerEvent::Connected {
-            addr,
+            addr: addr.into(),
             key: Some(first.public)
         }
     );
@@ -168,7 +171,7 @@ async fn secure_sessions_report_connected_and_reset_with_the_key() {
     assert_eq!(
         next_event(&mut events, Duration::from_secs(1)).await,
         PeerEvent::Reset {
-            addr,
+            addr: addr.into(),
             key: Some(second.public)
         }
     );

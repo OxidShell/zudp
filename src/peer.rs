@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     hash::{Hash, Hasher},
-    net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -17,6 +16,7 @@ use tokio::sync::oneshot;
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 
+use crate::PeerAddr;
 use crate::cc::CongestionCtrl;
 use crate::frame::MAX_NACK_SEQS;
 #[cfg(feature = "security")]
@@ -31,7 +31,7 @@ pub struct SentPacket {
 /// Send-side state for one remote peer, shared between the caller and the engine task.
 pub struct PeerState {
     /// Current remote address; updated transparently on network migration.
-    addr: Arc<RwLock<SocketAddr>>,
+    addr: Arc<RwLock<PeerAddr>>,
     /// Unique per `PeerState`; receive state tagged with another generation is stale.
     pub generation: u64,
     /// Engine instance id the remote puts in its Pings and Pongs.  A different id from the
@@ -89,14 +89,14 @@ pub struct PeerState {
 
 impl PeerState {
     #[must_use]
-    pub fn new(addr: SocketAddr) -> Self {
+    pub fn new(addr: PeerAddr) -> Self {
         Self::with_addr(Arc::new(RwLock::new(addr)))
     }
 
     /// A fresh session state that keeps tracking the same live address handle, so a
     /// [`ZudpConn`](crate::ZudpConn) survives its peer being reset.
     #[must_use]
-    pub fn with_addr(addr: Arc<RwLock<SocketAddr>>) -> Self {
+    pub fn with_addr(addr: Arc<RwLock<PeerAddr>>) -> Self {
         let now = Instant::now();
         Self {
             addr,
@@ -134,17 +134,17 @@ impl PeerState {
     }
 
     /// Current remote address.
-    pub fn addr(&self) -> SocketAddr {
+    pub fn addr(&self) -> PeerAddr {
         *self.addr.read()
     }
 
     /// Shared handle to the live address so `ZudpConn` tracks migrations automatically.
-    pub fn addr_arc(&self) -> Arc<RwLock<SocketAddr>> {
+    pub fn addr_arc(&self) -> Arc<RwLock<PeerAddr>> {
         self.addr.clone()
     }
 
     /// Update the stored address after the remote migrates to a new network.
-    pub fn migrate_to(&self, new_addr: SocketAddr) {
+    pub fn migrate_to(&self, new_addr: PeerAddr) {
         *self.addr.write() = new_addr;
     }
 

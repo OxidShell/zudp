@@ -45,7 +45,7 @@ async fn sending_without_a_session_is_an_error() {
         .listen()
         .await
         .unwrap();
-    let nobody = "127.0.0.1:9".parse().unwrap();
+    let nobody: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
     let result = server.send(b"leak".to_vec(), nobody).await;
     assert!(matches!(result, Err(zudp::Error::NoSession { .. })));
     let result = server.send_unreliable(b"leak".to_vec(), nobody).await;
