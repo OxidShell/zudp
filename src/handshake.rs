@@ -119,10 +119,8 @@ fn remote_static(hs: &snow::HandshakeState) -> Option<[u8; 32]> {
 }
 
 fn pinned_key_ok(inner: &EngineInner, hs: &snow::HandshakeState) -> bool {
-    match &inner.config.remote_key {
-        None => true,
-        Some(expected) => hs.get_remote_static() == Some(expected.as_slice()),
-    }
+    let pinned = &inner.config.pinned_keys;
+    pinned.is_empty() || remote_static(hs).is_some_and(|key| pinned.contains(&key))
 }
 
 fn into_established(pending: Pending, finish_wire: Option<Bytes>) -> Result<Done, snow::Error> {

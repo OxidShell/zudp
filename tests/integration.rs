@@ -201,6 +201,8 @@ async fn key_pinning_correct_key_allowed() {
         .bind_ip(LOOPBACK)
         .port(0)
         .security(client_kp)
+        // Several pins: any of them is accepted.
+        .pin_remote_key(*Keypair::generate().public_key())
         .pin_remote_key(*server_kp.public_key())
         .connect::<Vec<u8>>(server_addr)
         .await

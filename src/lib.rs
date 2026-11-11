@@ -241,9 +241,10 @@ pub struct Config {
     /// Noise X25519 keypair; when set, all data frames are encrypted end-to-end.
     #[cfg(feature = "security")]
     pub(crate) security: Option<security::Keypair>,
-    /// Pinned remote static public key; handshakes presenting a different key are aborted.
+    /// Pinned remote static public keys; when non-empty, handshakes presenting any other
+    /// key are aborted.
     #[cfg(feature = "security")]
-    pub(crate) remote_key: Option<[u8; 32]>,
+    pub(crate) pinned_keys: Vec<[u8; 32]>,
     /// Maximum number of tracked peers.  New peers beyond this limit are handled
     /// ephemerally (not inserted into the peer table) to cap memory usage.
     pub(crate) max_peers: usize,
@@ -280,7 +281,7 @@ impl Default for Config {
             #[cfg(feature = "security")]
             security: None,
             #[cfg(feature = "security")]
-            remote_key: None,
+            pinned_keys: Vec::new(),
             max_peers: 1_024,
             max_pps_per_ip: 1_000.0,
             sent_buffer_frames: 1_024,
@@ -381,16 +382,22 @@ impl Zudp {
         self
     }
 
-    /// Require the remote peer's X25519 static key to equal `key`.
+    /// Only accept sessions with peers whose X25519 static key was pinned.
     ///
-    /// Pass `keypair.public_key()` from the server's [`Keypair`].  Without this,
-    /// any peer that completes a valid Noise XX handshake is accepted (opportunistic
-    /// encryption only).  Mismatched keys cause the handshake to be silently
-    /// aborted; [`connect`](Self::connect) will time out.
+    /// Pass `keypair.public_key()` from the remote's [`Keypair`].  Call it once per trusted
+    /// key: a relay client typically pins the relay node and every peer it reaches through
+    /// it.  Without any pinned key, any peer that completes a valid Noise XX handshake is
+    /// accepted (opportunistic encryption only).
+    ///
+    /// The pin covers every handshake on the socket, direct and relayed alike.  As the
+    /// initiator, [`connect`](Self::connect) fails with [`Error::KeyMismatch`]; as the
+    /// responder, the handshake is silently aborted.
     #[cfg(feature = "security")]
     #[must_use]
     pub fn pin_remote_key(mut self, key: [u8; 32]) -> Self {
-        self.config.remote_key = Some(key);
+        if !self.config.pinned_keys.contains(&key) {
+            self.config.pinned_keys.push(key);
+        }
         self
     }
 
