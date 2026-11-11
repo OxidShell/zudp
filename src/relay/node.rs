@@ -124,7 +124,7 @@ impl Default for RelayLimits {
             total_burst_packets: 10_000.0,
             total_bytes_per_sec: 50_000_000.0,
             total_burst_bytes: 10_000_000.0,
-            max_inner: 1_500,
+            max_inner: crate::frame::RELAYED_INNER_MAX,
             max_routes: 4_096,
             max_routes_per_client: 64,
             max_routes_per_ip: 256,
@@ -182,8 +182,9 @@ impl RelayLimits {
         self
     }
 
-    /// Largest inner frame relayed.  Relayed frames from zudp peers with the default MTU
-    /// stay below 1 400 bytes.
+    /// Largest inner frame relayed.  zudp peers never send relayed frames above 1 500 bytes
+    /// (the default), whatever their MTU; a smaller value drops their full-size fragments,
+    /// counted in `relay_dropped_oversize`.
     #[must_use]
     pub fn max_inner(mut self, bytes: usize) -> Self {
         self.max_inner = bytes;

@@ -95,6 +95,16 @@ const ADDR_V6: u8 = 0x01;
 #[cfg(feature = "security")]
 pub(crate) const VIA_OVERHEAD: usize = 33 + 17 + 16;
 
+/// Largest inner frame a relayed peer ever produces, and the default `max_inner` of a relay
+/// node, so default relays never drop a well-formed relayed frame.
+#[cfg(feature = "security")]
+pub(crate) const RELAYED_INNER_MAX: usize = 1_500;
+
+/// What a fragment of a secure session adds to its chunk: the Fragment header (19 bytes)
+/// and the Secure header and AEAD tag (17 + 16).
+#[cfg(feature = "security")]
+pub(crate) const SECURE_FRAGMENT_OVERHEAD: usize = 19 + 17 + 16;
+
 #[derive(Debug, Clone)]
 pub enum Frame {
     /// Unreliable fire-and-forget delivery.

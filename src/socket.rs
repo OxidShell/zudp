@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     net::SocketAddr,
     sync::{
         Arc,
@@ -28,14 +28,20 @@ pub struct RawSocket {
 /// Fault injection for tests: datagrams to or from these addresses are silently lost.
 #[derive(Default)]
 struct Blocklist {
-    /// Fast path: `false` while the set is empty, so normal traffic never takes the lock.
+    /// Fast path: `false` while the map is empty, so normal traffic never takes the lock.
     any: AtomicBool,
-    addrs: RwLock<HashSet<SocketAddr>>,
+    /// Blocked address → whether only datagrams *from* it are lost.
+    addrs: RwLock<HashMap<SocketAddr, bool>>,
 }
 
 impl Blocklist {
-    fn contains(&self, addr: SocketAddr) -> bool {
-        self.any.load(Ordering::Relaxed) && self.addrs.read().contains(&addr)
+    fn drops(&self, addr: SocketAddr, outgoing: bool) -> bool {
+        self.any.load(Ordering::Relaxed)
+            && self
+                .addrs
+                .read()
+                .get(&addr)
+                .is_some_and(|&inbound_only| !(outgoing && inbound_only))
     }
 }
 
@@ -73,11 +79,11 @@ impl RawSocket {
         self.blocked = other.blocked.clone();
     }
 
-    /// Start or stop losing every datagram to and from `addr`.
-    pub fn set_blocked(&self, addr: SocketAddr, blocked: bool) {
+    /// Start or stop losing datagrams from `addr`, and to it unless `inbound_only`.
+    pub fn set_blocked(&self, addr: SocketAddr, blocked: bool, inbound_only: bool) {
         let mut addrs = self.blocked.addrs.write();
         if blocked {
-            addrs.insert(addr);
+            addrs.insert(addr, inbound_only);
         } else {
             addrs.remove(&addr);
         }
@@ -86,7 +92,7 @@ impl RawSocket {
 
     #[inline]
     pub async fn send_to(&self, data: &[u8], addr: SocketAddr) -> Result<(), crate::Error> {
-        if self.blocked.contains(addr) {
+        if self.blocked.drops(addr, true) {
             return Ok(());
         }
         self.inner.send_to(data, addr).await?;
@@ -99,7 +105,7 @@ impl RawSocket {
         bufs: &[std::io::IoSlice<'_>],
         addr: SocketAddr,
     ) -> Result<(), crate::Error> {
-        if self.blocked.contains(addr) {
+        if self.blocked.drops(addr, true) {
             return Ok(());
         }
         let sock_addr = socket2::SockAddr::from(addr);
@@ -123,7 +129,7 @@ impl RawSocket {
         loop {
             let mut buf = BytesMut::with_capacity(RECV_BUF_LEN);
             let (_, addr) = self.inner.recv_buf_from(&mut buf).await?;
-            if !self.blocked.contains(addr) {
+            if !self.blocked.drops(addr, false) {
                 return Ok((buf, addr));
             }
         }

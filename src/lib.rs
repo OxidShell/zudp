@@ -704,7 +704,7 @@ impl Inner {
             #[cfg(feature = "security")]
             by_index: DashMap::new(),
             #[cfg(feature = "security")]
-            hint_limiter: parking_lot::Mutex::new(rate::RateLimiter::new(5.0, 5.0)),
+            hint_limiter: parking_lot::Mutex::new(rate::RateLimiter::<PeerAddr>::new(5.0, 5.0)),
             #[cfg(feature = "security")]
             by_key: DashMap::new(),
             #[cfg(feature = "security")]
@@ -858,11 +858,19 @@ impl Inner {
                 .map(|p| p.value().clone())
                 .filter(|p| p.has_channel())
                 .ok_or(Error::NoSession { peer: dest })?
+        } else if dest.is_relayed() {
+            // Relayed peers need security; don't leave a state behind that can never send.
+            return Err(Error::NoSession { peer: dest });
         } else {
             self.get_or_create_peer(dest)
         };
-        let mtu = if dest.is_relayed() {
-            relayed_mtu(self.config.mtu)
+        let mtu = if let PeerAddr::Relayed { relay, .. } = dest {
+            let relay_path = self
+                .engine
+                .peers
+                .get(&PeerAddr::Direct(relay))
+                .map_or(self.config.mtu, |r| r.effective_mtu_or(self.config.mtu));
+            relayed_mtu(relay_path.min(self.config.mtu))
         } else {
             peer.effective_mtu_or(self.config.mtu)
         };
@@ -955,12 +963,18 @@ impl Inner {
     }
 }
 
-/// Fragment size for a relayed peer: the relay hop adds [`frame::VIA_OVERHEAD`] bytes to
-/// every datagram, and its path may flip between direct and relayed at any time.
+/// Fragment size for a relayed peer whose relay path carries `mtu`: the relay hop adds
+/// [`frame::VIA_OVERHEAD`] bytes to every datagram, and the inner frame must stay within
+/// [`frame::RELAYED_INNER_MAX`] (the relays' default `max_inner`), whatever MTU was
+/// configured or discovered.  The path may flip between direct and relayed at any time, so
+/// the relayed size applies to punched sessions too.
 fn relayed_mtu(mtu: usize) -> usize {
     #[cfg(feature = "security")]
     {
-        mtu.saturating_sub(frame::VIA_OVERHEAD).max(64)
+        mtu.saturating_sub(frame::VIA_OVERHEAD).clamp(
+            64,
+            frame::RELAYED_INNER_MAX - frame::SECURE_FRAGMENT_OVERHEAD,
+        )
     }
     #[cfg(not(feature = "security"))]
     {
@@ -1208,7 +1222,20 @@ impl<M> ZudpSocket<M> {
     /// if the network path to it broke.  Not part of the stable API.
     #[doc(hidden)]
     pub fn debug_block_addr(&self, addr: SocketAddr, blocked: bool) {
-        self.inner.engine.get_socket().set_blocked(addr, blocked);
+        self.inner
+            .engine
+            .get_socket()
+            .set_blocked(addr, blocked, false);
+    }
+
+    /// Test hook: like [`debug_block_addr`](Self::debug_block_addr) for datagrams *from*
+    /// `addr` only, as if the path to it broke in one direction.
+    #[doc(hidden)]
+    pub fn debug_drop_from(&self, addr: SocketAddr, dropped: bool) {
+        self.inner
+            .engine
+            .get_socket()
+            .set_blocked(addr, dropped, true);
     }
 
     /// The remote peer's X25519 static public key as negotiated by the Noise
