@@ -19,6 +19,8 @@ bitcode = ["dep:bitcode"]
 serde = ["dep:serde", "dep:postcard"]
 discovery = []
 security = ["dep:snow"]
+# Lets a socket act as a public relay node for clients behind NAT.
+relay = ["security"]
 
 [dependencies]
 tokio = { version = "1", features = ["net", "sync", "rt-multi-thread", "macros", "time", "io-util"] }
@@ -46,6 +48,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "tim
 [[test]]
 name = "discovery"
 required-features = ["discovery"]
+
+[[test]]
+name = "relay"
+required-features = ["relay"]
 
 [[bench]]
 name = "zudp"

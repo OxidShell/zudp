@@ -11,7 +11,7 @@ use std::{fmt, net::SocketAddr};
 ///   peer: after a network migration ([`PeerEvent::Migrated`](crate::PeerEvent::Migrated))
 ///   the session is addressed by its new address.
 /// - [`Relayed`](Self::Relayed) peers are reached by their static public key through a relay
-///   node (see [`ZudpSocket::connect_via`](crate::ZudpSocket::connect_via)).  The handle is
+///   node (see `ZudpSocket::connect_via`, `security` feature).  The handle is
 ///   stable for the whole session, even when hole punching moves the traffic onto a direct
 ///   path ([`PeerEvent::PathChanged`](crate::PeerEvent::PathChanged)).
 ///

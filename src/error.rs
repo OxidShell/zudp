@@ -74,6 +74,14 @@ pub enum Error {
     /// Packet dropped — source IP exceeded configured rate limit.
     Throttled,
 
+    /// The relay node cannot deliver to the peer with static key `key`: it is not connected
+    /// to the relay, or the relay's policy does not let us reach it (the relay does not say
+    /// which).
+    #[cfg(feature = "security")]
+    Unreachable {
+        key: [u8; 32],
+    },
+
     /// Nothing was heard from `peer` for the configured peer timeout; its state was dropped.
     PeerTimeout {
         peer: PeerAddr,
@@ -137,6 +145,12 @@ impl fmt::Display for Error {
                 write!(f, "security: handshake with {peer} timed out")
             }
             Self::Throttled => f.write_str("packet dropped: rate limit exceeded"),
+            #[cfg(feature = "security")]
+            Self::Unreachable { key } => {
+                write!(f, "relay cannot reach peer ")?;
+                key[..4].iter().try_for_each(|b| write!(f, "{b:02x}"))?;
+                f.write_str("…")
+            }
             Self::NoSession { peer } => write!(f, "no secure session with {peer}"),
             Self::PeerTimeout { peer } => write!(f, "peer {peer} timed out"),
         }

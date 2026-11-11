@@ -42,6 +42,8 @@ mod mtu;
 mod peer;
 mod rate;
 #[cfg(feature = "security")]
+mod relay;
+#[cfg(feature = "security")]
 mod security;
 mod socket;
 
@@ -59,6 +61,11 @@ pub use discovery::{
 pub use error::Error;
 pub use event::{DisconnectReason, PeerEvent, PeerEvents};
 pub use frame::WIRE_VERSION;
+#[cfg(feature = "relay")]
+#[doc(hidden)]
+pub use relay::node::RelayTap;
+#[cfg(feature = "relay")]
+pub use relay::node::{RelayLimits, RelayPolicy};
 #[cfg(feature = "security")]
 pub use security::{Keypair, ReplayWindow};
 
@@ -120,6 +127,27 @@ impl ZudpSender {
             .await
     }
 
+    /// Open a session with a direct peer; see [`ZudpSocket::connect`].
+    ///
+    /// # Errors
+    /// As [`ZudpSocket::connect`].
+    pub async fn connect(&self, peer: SocketAddr) -> Result<PeerAddr, Error> {
+        Ok(*self.inner.connect(peer).await?.read())
+    }
+
+    /// Open a relayed session; see [`ZudpSocket::connect_via`].
+    ///
+    /// # Errors
+    /// As [`ZudpSocket::connect_via`].
+    #[cfg(feature = "security")]
+    pub async fn connect_via(
+        &self,
+        relay: SocketAddr,
+        target: [u8; 32],
+    ) -> Result<PeerAddr, Error> {
+        Ok(*self.inner.connect_via(relay, target).await?.read())
+    }
+
     /// Smoothed RTT to `peer` as measured by transport-level Ping/Pong.
     /// Returns `None` until the first Pong has been received.
     #[must_use]
@@ -158,6 +186,25 @@ pub struct EngineStats {
     pub dropped_peer_cap: u64,
     /// Plaintext data frames dropped because this socket requires encryption.
     pub dropped_unauthenticated: u64,
+    /// Relayed frames dropped because the relay attributed them to a peer other than the
+    /// one their end-to-end session authenticates.
+    pub dropped_forged: u64,
+    /// Relay node: frames forwarded between clients.
+    pub relay_forwarded_packets: u64,
+    /// Relay node: inner bytes forwarded between clients.
+    pub relay_forwarded_bytes: u64,
+    /// Relay node: frames dropped by a client's packet or byte rate limit.
+    pub relay_dropped_rate_limited: u64,
+    /// Relay node: frames dropped for exceeding the maximum inner size.
+    pub relay_dropped_oversize: u64,
+    /// Relay node: `Unreachable` answers sent (target offline, denied, or over the route cap).
+    pub relay_unreachable: u64,
+    /// Relay node: of those, the ones the policy denied.
+    pub relay_denied: u64,
+    /// Relay node: of those, the ones refused because the route cap was reached.
+    pub relay_routes_full: u64,
+    /// Relay node: client pairs introduced to each other for hole punching.
+    pub relay_introductions: u64,
 }
 
 /// A message received from a ZUDP socket, together with its origin and stream.
@@ -245,6 +292,15 @@ pub struct Config {
     /// key are aborted.
     #[cfg(feature = "security")]
     pub(crate) pinned_keys: Vec<[u8; 32]>,
+    /// Punch relayed sessions through to a direct path when NAT allows it.
+    #[cfg(feature = "security")]
+    pub(crate) punching: bool,
+    /// Relay node limits; `Some` makes this socket a relay node.
+    #[cfg(feature = "relay")]
+    pub(crate) relay: Option<RelayLimits>,
+    /// Initial relay policy; `None` lets every client reach every other.
+    #[cfg(feature = "relay")]
+    pub(crate) relay_policy: Option<Arc<dyn RelayPolicy>>,
     /// Maximum number of tracked peers.  New peers beyond this limit are handled
     /// ephemerally (not inserted into the peer table) to cap memory usage.
     pub(crate) max_peers: usize,
@@ -282,6 +338,12 @@ impl Default for Config {
             security: None,
             #[cfg(feature = "security")]
             pinned_keys: Vec::new(),
+            #[cfg(feature = "security")]
+            punching: true,
+            #[cfg(feature = "relay")]
+            relay: None,
+            #[cfg(feature = "relay")]
+            relay_policy: None,
             max_peers: 1_024,
             max_pps_per_ip: 1_000.0,
             sent_buffer_frames: 1_024,
@@ -401,6 +463,46 @@ impl Zudp {
         self
     }
 
+    /// Punch relayed sessions through to a direct path (default: `true`).
+    ///
+    /// When on, both ends of a session opened with
+    /// [`ZudpSocket::connect_via`] ask the relay for an introduction, probe each other's
+    /// public address with authenticated keepalives, and move the session onto the direct
+    /// path once one gets through ([`PeerEvent::PathChanged`]).  A direct path that goes
+    /// silent falls back to the relay.  Where NAT does not allow it (symmetric NAT on both
+    /// sides) the session simply stays on the relay.  When off, traffic always goes through
+    /// the relay and the relay never learns we would like to know the peer's address.
+    #[cfg(feature = "security")]
+    #[must_use]
+    pub fn punching(mut self, enabled: bool) -> Self {
+        self.config.punching = enabled;
+        self
+    }
+
+    /// Make this socket a relay node with the given abuse limits.
+    ///
+    /// A relay node forwards end-to-end encrypted frames between the clients connected to
+    /// it, addressed by their static public keys (see [`ZudpSocket::connect_via`]), and
+    /// introduces clients to each other for hole punching.  It never sees plaintext and
+    /// never sends to an address a client names, so it is safe to expose publicly.
+    /// Requires [`security`](Self::security).  Gate who may reach whom with
+    /// [`relay_policy`](Self::relay_policy).
+    #[cfg(feature = "relay")]
+    #[must_use]
+    pub fn relay_node(mut self, limits: RelayLimits) -> Self {
+        self.config.relay = Some(limits);
+        self
+    }
+
+    /// Who may reach whom through this relay node (default: everyone connected).
+    /// Replace it at runtime with [`ZudpSocket::set_relay_policy`].
+    #[cfg(feature = "relay")]
+    #[must_use]
+    pub fn relay_policy(mut self, policy: impl RelayPolicy + 'static) -> Self {
+        self.config.relay_policy = Some(Arc::new(policy));
+        self
+    }
+
     /// Maximum number of tracked peers (default: 1 024).
     ///
     /// Peers beyond this limit are still reachable but their state is not stored,
@@ -479,49 +581,45 @@ impl Zudp {
     ///   [`handshake_timeout`](Self::handshake_timeout).
     /// - [`Error::KeyMismatch`] if a key was pinned and the remote presented another one.
     pub async fn connect<M>(self, peer: SocketAddr) -> Result<ZudpConn<M>, Error> {
-        // Replies to 0.0.0.0 / :: come back from a concrete loopback address, which would
-        // never match the peer entry; talk to loopback explicitly instead.
-        let peer = match peer.ip() {
-            IpAddr::V4(ip) if ip.is_unspecified() => {
-                SocketAddr::new(Ipv4Addr::LOCALHOST.into(), peer.port())
-            }
-            IpAddr::V6(ip) if ip.is_unspecified() => {
-                SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), peer.port())
-            }
-            _ => peer,
-        };
         let socket = ZudpSocket::new(self.config).await?;
-        // Pre-create the peer entry so ZudpConn can share the live-address Arc.
-        let peer_state = socket.inner.get_or_create_peer(PeerAddr::Direct(peer));
-        let peer_addr = peer_state.addr_arc();
-        #[cfg(feature = "security")]
-        if socket.inner.config.security.is_some() {
-            handshake::initiate(
-                &Arc::downgrade(&socket.inner.engine),
-                PeerAddr::Direct(peer),
-            )
-            .await?;
+        let peer = socket.inner.connect(peer).await?;
+        Ok(ZudpConn::new(socket, peer))
+    }
+
+    /// Bind, connect to the relay node at `relay`, then open an end-to-end session through
+    /// it with the peer whose static public key is `target`.
+    ///
+    /// The returned [`ZudpConn`] talks to `target`; see [`ZudpSocket::connect_via`] for the
+    /// semantics and for reaching several peers through one relay from a single socket.
+    ///
+    /// # Errors
+    /// Everything [`connect`](Self::connect) can return for the relay, then
+    /// [`Error::Unreachable`] when the relay cannot reach `target`, and
+    /// [`Error::HandshakeTimeout`] / [`Error::KeyMismatch`] for the end-to-end handshake.
+    #[cfg(feature = "security")]
+    pub async fn connect_via<M>(
+        self,
+        relay: SocketAddr,
+        target: [u8; 32],
+    ) -> Result<ZudpConn<M>, Error> {
+        let socket = ZudpSocket::new(self.config).await?;
+        socket.inner.connect(relay).await?;
+        let peer = socket.inner.connect_via(relay, target).await?;
+        Ok(ZudpConn::new(socket, peer))
+    }
+}
+
+/// Replies to 0.0.0.0 / :: come back from a concrete loopback address, which would never
+/// match the peer entry; talk to loopback explicitly instead.
+fn reachable(peer: SocketAddr) -> SocketAddr {
+    match peer.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => {
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), peer.port())
         }
-        if !socket.inner.engine.secured()
-            && let Some(ping) = engine::ping_for(&socket.inner.engine, &peer_state)
-        {
-            // Announce our instance id first, so a server that still has state from a previous
-            // process on this address resets it before our first data frame.
-            socket
-                .inner
-                .engine
-                .get_socket()
-                .send_to(&ping, peer)
-                .await?;
+        IpAddr::V6(ip) if ip.is_unspecified() => {
+            SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), peer.port())
         }
-        // Probe path MTU in background; sends use config.mtu until discovery completes.
-        engine::spawn_mtu_probe(&socket.inner.engine, peer);
-        let events = socket.events();
-        Ok(ZudpConn {
-            socket,
-            peer: peer_addr,
-            events,
-        })
+        _ => peer,
     }
 }
 
@@ -560,6 +658,16 @@ impl Inner {
             by_index: DashMap::new(),
             #[cfg(feature = "security")]
             hint_limiter: parking_lot::Mutex::new(rate::RateLimiter::new(5.0, 5.0)),
+            #[cfg(feature = "security")]
+            by_key: DashMap::new(),
+            #[cfg(feature = "security")]
+            punched: DashMap::new(),
+            dropped_forged: AtomicU64::new(0),
+            #[cfg(feature = "relay")]
+            relay: config
+                .relay
+                .clone()
+                .map(|limits| relay::node::RelayNode::new(limits, config.relay_policy.clone())),
         });
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let rx = engine::spawn(engine.clone(), shutdown_rx);
@@ -575,6 +683,83 @@ impl Inner {
     fn events(&self) -> PeerEvents {
         PeerEvents {
             rx: self.engine.events.subscribe(),
+        }
+    }
+
+    /// Open a session with the direct peer at `peer`; returns its live handle.  A secure
+    /// session that is already up is reused.
+    async fn connect(&self, peer: SocketAddr) -> Result<Arc<RwLock<PeerAddr>>, Error> {
+        let peer = reachable(peer);
+        let handle = PeerAddr::Direct(peer);
+        #[cfg(feature = "security")]
+        if let Some(existing) = self.established(handle) {
+            return Ok(existing.addr_arc());
+        }
+        // Pre-create the peer entry so ZudpConn can share the live-address Arc.
+        let peer_state = self.get_or_create_peer(handle);
+        let live = peer_state.addr_arc();
+        #[cfg(feature = "security")]
+        if self.engine.secured() {
+            handshake::initiate(&Arc::downgrade(&self.engine), handle).await?;
+        }
+        if !self.engine.secured()
+            && let Some(ping) = engine::ping_for(&self.engine, &peer_state)
+        {
+            // Announce our instance id first, so a server that still has state from a previous
+            // process on this address resets it before our first data frame.
+            self.engine.get_socket().send_to(&ping, peer).await?;
+        }
+        // Probe path MTU in background; sends use config.mtu until discovery completes.
+        engine::spawn_mtu_probe(&self.engine, peer);
+        Ok(live)
+    }
+
+    /// The confirmed secure session with `peer`, if there is one.
+    #[cfg(feature = "security")]
+    fn established(&self, peer: PeerAddr) -> Option<Arc<PeerState>> {
+        self.engine
+            .peers
+            .get(&peer)
+            .map(|p| p.value().clone())
+            .filter(|p| p.has_channel() && p.is_confirmed())
+    }
+
+    /// Open an end-to-end session with `target` through the relay at `relay`.
+    #[cfg(feature = "security")]
+    async fn connect_via(
+        &self,
+        relay: SocketAddr,
+        target: [u8; 32],
+    ) -> Result<Arc<RwLock<PeerAddr>>, Error> {
+        let relay = reachable(relay);
+        if !self.engine.secured() || self.established(PeerAddr::Direct(relay)).is_none() {
+            return Err(Error::NoSession {
+                peer: PeerAddr::Direct(relay),
+            });
+        }
+        let handle = PeerAddr::Relayed { relay, key: target };
+        if self.established(handle).is_none() {
+            handshake::initiate(&Arc::downgrade(&self.engine), handle).await?;
+        }
+        self.engine
+            .peers
+            .get(&handle)
+            .map(|p| p.addr_arc())
+            .ok_or(Error::HandshakeTimeout { peer: handle })
+    }
+
+    fn peer_path(&self, peer: PeerAddr) -> Option<Path> {
+        let state = self.engine.peers.get(&peer)?.value().clone();
+        match peer {
+            PeerAddr::Direct(addr) => Some(Path::Direct(addr)),
+            PeerAddr::Relayed { relay, .. } => {
+                #[cfg(feature = "security")]
+                if let Some(direct) = state.direct_path() {
+                    return Some(Path::Direct(direct));
+                }
+                let _ = state;
+                Some(Path::Relayed(relay))
+            }
         }
     }
 
@@ -614,7 +799,11 @@ impl Inner {
         } else {
             self.get_or_create_peer(dest)
         };
-        let mtu = peer.effective_mtu_or(self.config.mtu);
+        let mtu = if dest.is_relayed() {
+            relayed_mtu(self.config.mtu)
+        } else {
+            peer.effective_mtu_or(self.config.mtu)
+        };
 
         if payload.len() <= mtu {
             self.send_single(payload, peer, reliable, stream_id).await
@@ -704,6 +893,19 @@ impl Inner {
     }
 }
 
+/// Fragment size for a relayed peer: the relay hop adds [`frame::VIA_OVERHEAD`] bytes to
+/// every datagram, and its path may flip between direct and relayed at any time.
+fn relayed_mtu(mtu: usize) -> usize {
+    #[cfg(feature = "security")]
+    {
+        mtu.saturating_sub(frame::VIA_OVERHEAD).max(64)
+    }
+    #[cfg(not(feature = "security"))]
+    {
+        mtu
+    }
+}
+
 /// Seal `plain` for `peer` (see [`engine::seal`]) and wrap it for the peer's current path.
 fn routed(
     engine: &EngineInner,
@@ -713,6 +915,28 @@ fn routed(
     engine::seal(engine, peer, plain)
         .and_then(|wire| engine.outbound(peer, wire))
         .ok_or(Error::NoSession { peer: peer.addr() })
+}
+
+/// The relay node counters of `engine`, all zero when it is not a relay node.
+#[cfg_attr(not(feature = "relay"), allow(clippy::needless_pass_by_value))]
+fn relay_stats(engine: &EngineInner) -> EngineStats {
+    #[cfg(feature = "relay")]
+    if let Some(node) = &engine.relay {
+        let c = &node.counters;
+        return EngineStats {
+            relay_forwarded_packets: c.forwarded_packets.load(Ordering::Relaxed),
+            relay_forwarded_bytes: c.forwarded_bytes.load(Ordering::Relaxed),
+            relay_dropped_rate_limited: c.dropped_rate_limited.load(Ordering::Relaxed),
+            relay_dropped_oversize: c.dropped_oversize.load(Ordering::Relaxed),
+            relay_unreachable: c.unreachable.load(Ordering::Relaxed),
+            relay_denied: c.denied.load(Ordering::Relaxed),
+            relay_routes_full: c.routes_full.load(Ordering::Relaxed),
+            relay_introductions: c.introductions.load(Ordering::Relaxed),
+            ..EngineStats::default()
+        };
+    }
+    let _ = engine;
+    EngineStats::default()
 }
 
 /// A ZUDP socket that sends and receives messages from any remote peer.
@@ -793,6 +1017,8 @@ impl<M> ZudpSocket<M> {
             dropped_rate_limited: e.dropped_rate_limited.load(Ordering::Relaxed),
             dropped_peer_cap: e.dropped_peer_cap.load(Ordering::Relaxed),
             dropped_unauthenticated: e.dropped_unauthenticated.load(Ordering::Relaxed),
+            dropped_forged: e.dropped_forged.load(Ordering::Relaxed),
+            ..relay_stats(e)
         }
     }
 
@@ -818,6 +1044,86 @@ impl<M> ZudpSocket<M> {
     #[must_use = "false means the peer was not known"]
     pub fn remove_peer(&self, peer: impl Into<PeerAddr>) -> bool {
         self.inner.engine.remove_peer(peer.into())
+    }
+
+    /// Open a session with the direct peer at `peer` from this socket and return its handle.
+    ///
+    /// Same as [`Zudp::connect`] without binding a new socket: with security on, the
+    /// handshake and one authenticated round trip complete before it returns, and a session
+    /// that is already up is reused.  Typically used to reach a relay node before
+    /// [`connect_via`](Self::connect_via).
+    ///
+    /// # Errors
+    /// `Error::HandshakeTimeout` or `Error::KeyMismatch` when the handshake fails;
+    /// [`Error::Io`] when the first datagram cannot be sent.
+    pub async fn connect(&self, peer: SocketAddr) -> Result<PeerAddr, Error> {
+        Ok(*self.inner.connect(peer).await?.read())
+    }
+
+    /// Open an end-to-end session with the peer whose static public key is `target`,
+    /// through the relay node at `relay`, and return its handle
+    /// ([`PeerAddr::Relayed`]).
+    ///
+    /// This socket must already hold a session with the relay (see
+    /// [`connect`](Self::connect)).  The Noise XX handshake with `target` runs through the
+    /// relay; the relay forwards it, and everything after it, as opaque bytes it cannot
+    /// decrypt or forge.  The session authenticates `target` itself — a relay that delivers
+    /// another key's handshake makes this fail with [`Error::KeyMismatch`] — and pinned keys
+    /// ([`Zudp::pin_remote_key`]) apply as for direct peers.  Relayed peers get the full
+    /// feature set: reliable streams, fragmentation (at an MTU reduced by the relay
+    /// overhead), congestion control, keepalives, timeouts and [`PeerEvent`]s.
+    ///
+    /// Unless [`Zudp::punching`] is off, both ends then try to punch a direct path and move
+    /// the session onto it ([`PeerEvent::PathChanged`]); the handle stays the same.
+    ///
+    /// The other end needs no call: an incoming relayed session shows up as
+    /// [`PeerEvent::Connected`] with a relayed handle, and its messages arrive in `recv`.
+    ///
+    /// # Errors
+    /// - [`Error::NoSession`] (naming the relay) without a secure session with the relay.
+    /// - [`Error::Unreachable`] when the relay cannot reach `target` — it is not connected
+    ///   to the relay or the relay's policy refuses; the relay does not say which.
+    /// - [`Error::HandshakeTimeout`] / [`Error::KeyMismatch`] as for [`Zudp::connect`].
+    #[cfg(feature = "security")]
+    pub async fn connect_via(
+        &self,
+        relay: SocketAddr,
+        target: [u8; 32],
+    ) -> Result<PeerAddr, Error> {
+        Ok(*self.inner.connect_via(relay, target).await?.read())
+    }
+
+    /// The path `peer`'s traffic takes right now: [`Path::Direct`] for direct peers and
+    /// punched relayed peers, [`Path::Relayed`] for relayed peers still on their relay.
+    /// `None` when the peer is unknown.
+    #[must_use]
+    pub fn peer_path(&self, peer: impl Into<PeerAddr>) -> Option<Path> {
+        self.inner.peer_path(peer.into())
+    }
+
+    /// Replace this relay node's policy at runtime; `None` lets every client reach every
+    /// other.  Does nothing on a socket that is not a relay node.
+    #[cfg(feature = "relay")]
+    pub fn set_relay_policy(&self, policy: Option<Arc<dyn RelayPolicy>>) {
+        if let Some(node) = &self.inner.engine.relay {
+            node.set_policy(policy);
+        }
+    }
+
+    /// Test hook: intercept what this relay node forwards; see [`RelayTap`].
+    #[cfg(feature = "relay")]
+    #[doc(hidden)]
+    pub fn set_relay_tap(&self, tap: Option<RelayTap>) {
+        if let Some(node) = &self.inner.engine.relay {
+            node.set_tap(tap);
+        }
+    }
+
+    /// Test hook: silently lose every datagram to and from `addr` (or stop doing so), as
+    /// if the network path to it broke.  Not part of the stable API.
+    #[doc(hidden)]
+    pub fn debug_block_addr(&self, addr: SocketAddr, blocked: bool) {
+        self.inner.engine.get_socket().set_blocked(addr, blocked);
     }
 
     /// The remote peer's X25519 static public key as negotiated by the Noise
@@ -932,6 +1238,21 @@ pub struct ZudpConn<M> {
 }
 
 impl<M> ZudpConn<M> {
+    fn new(socket: ZudpSocket<M>, peer: Arc<RwLock<PeerAddr>>) -> Self {
+        let events = socket.events();
+        Self {
+            socket,
+            peer,
+            events,
+        }
+    }
+
+    /// The path the bound peer's traffic currently takes; see [`ZudpSocket::peer_path`].
+    #[must_use]
+    pub fn path(&self) -> Option<Path> {
+        self.socket.peer_path(self.peer())
+    }
+
     /// Subscribe to peer lifecycle events; see [`PeerEvent`].
     #[must_use]
     pub fn events(&self) -> PeerEvents {

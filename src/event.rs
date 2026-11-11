@@ -2,7 +2,7 @@
 
 use tokio::sync::broadcast;
 
-use crate::{Error, PeerAddr};
+use crate::{Error, Path, PeerAddr};
 
 /// Events buffered per subscriber before the oldest are dropped.
 pub(crate) const EVENT_CAPACITY: usize = 256;
@@ -29,7 +29,13 @@ pub enum PeerEvent {
         key: Option<[u8; 32]>,
     },
     /// The same session is now reachable at `to` (NAT rebinding, Wi-Fi switch, new IP).
+    /// Only direct peers migrate; a relayed peer keeps its handle and reports
+    /// [`PathChanged`](Self::PathChanged) instead.
     Migrated { from: PeerAddr, to: PeerAddr },
+    /// The relayed peer `addr` now exchanges traffic over `path`: hole punching moved it to
+    /// a direct path, or a silent direct path fell back to the relay.  Same session, same
+    /// handle; nothing is lost.
+    PathChanged { addr: PeerAddr, path: Path },
     /// The peer at `addr` is gone and its state was dropped.
     Disconnected {
         addr: PeerAddr,
@@ -47,6 +53,9 @@ pub enum DisconnectReason {
     Removed,
     /// The peer table was full and this was the least recently seen peer.
     Evicted,
+    /// The relay node reported the relayed peer unreachable (it left the relay, or the
+    /// relay no longer lets us reach it) and there was no direct path to fall back on.
+    Unreachable,
 }
 
 /// A subscription to [`PeerEvent`]s.

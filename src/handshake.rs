@@ -63,6 +63,8 @@ pub(crate) enum Outcome {
         generation: u64,
     },
     KeyMismatch,
+    /// The relay could not deliver to the target.
+    Unreachable,
 }
 
 /// A handshake in progress with one remote address.
@@ -121,6 +123,15 @@ fn remote_static(hs: &snow::HandshakeState) -> Option<[u8; 32]> {
 fn pinned_key_ok(inner: &EngineInner, hs: &snow::HandshakeState) -> bool {
     let pinned = &inner.config.pinned_keys;
     pinned.is_empty() || remote_static(hs).is_some_and(|key| pinned.contains(&key))
+}
+
+/// A relayed handshake must authenticate the very key it is addressed by: the relay's
+/// sender claim (responder) or the target we asked for (initiator).
+fn claimed_key_ok(from: PeerAddr, hs: &snow::HandshakeState) -> bool {
+    match from {
+        PeerAddr::Direct(_) => true,
+        PeerAddr::Relayed { key, .. } => remote_static(hs) == Some(key),
+    }
 }
 
 fn into_established(pending: Pending, finish_wire: Option<Bytes>) -> Result<Done, snow::Error> {
@@ -261,7 +272,7 @@ fn finish_as_initiator(
         }
         return (None, None);
     };
-    if !pinned_key_ok(inner, &state.hs) {
+    if !pinned_key_ok(inner, &state.hs) || !claimed_key_ok(from, &state.hs) {
         tracing::warn!(target: "zudp::security", peer = %from, "handshake aborted — remote key does not match pinned key");
         if let Some(mut aborted) = pending.remove(&from)
             && let Some(waiter) = aborted.waiter.take()
@@ -324,6 +335,14 @@ fn finish_as_responder(
         tracing::debug!(target: "zudp::handshake", peer = %from, "invalid msg3: {e}");
         return (None, None);
     }
+    if !claimed_key_ok(from, &state.hs) {
+        tracing::warn!(target: "zudp::security", peer = %from, "relayed handshake aborted — the relay's sender claim does not match the authenticated key");
+        inner
+            .dropped_forged
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        pending.remove(&from);
+        return (None, None);
+    }
     if !pinned_key_ok(inner, &state.hs) {
         tracing::warn!(target: "zudp::security", peer = %from, "handshake aborted — remote key does not match pinned key");
         pending.remove(&from);
@@ -373,6 +392,19 @@ pub(crate) fn expire(inner: &EngineInner) {
     });
 }
 
+/// The relay says `peer` is unreachable: end the handshake with it, failing whoever waits.
+/// Returns `false` when no handshake with `peer` was in progress.
+pub(crate) fn fail_unreachable(inner: &EngineInner, peer: PeerAddr) -> bool {
+    let Some(mut pending) = inner.pending.lock().remove(&peer) else {
+        return false;
+    };
+    tracing::debug!(target: "zudp::handshake", %peer, "relay reports the target unreachable");
+    if let Some(waiter) = pending.waiter.take() {
+        let _ = waiter.send(Outcome::Unreachable);
+    }
+    true
+}
+
 /// `true` when `index` belongs to a handshake that has not finished on our side yet.
 pub(crate) fn is_pending_index(inner: &EngineInner, index: u64) -> bool {
     inner
@@ -412,6 +444,9 @@ pub(crate) async fn initiate(engine: &Weak<EngineInner>, peer: PeerAddr) -> Resu
     match outcome {
         Some(Outcome::Ready { generation }) => confirm(engine, peer, deadline, generation).await,
         Some(Outcome::KeyMismatch) => Err(Error::KeyMismatch),
+        Some(Outcome::Unreachable) => Err(Error::Unreachable {
+            key: peer.key().unwrap_or_default(),
+        }),
         None => {
             if let Some(inner) = engine.upgrade() {
                 inner.pending.lock().remove(&peer);

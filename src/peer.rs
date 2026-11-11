@@ -9,7 +9,7 @@ use std::{
 };
 
 #[cfg(feature = "security")]
-use std::sync::atomic::AtomicBool;
+use std::{net::SocketAddr, sync::atomic::AtomicBool};
 
 use tokio::sync::oneshot;
 
@@ -75,6 +75,13 @@ pub struct PeerState {
     /// new address, so a replayed old datagram cannot redirect it.
     #[cfg(feature = "security")]
     highest_nonce: AtomicU64,
+    /// For a relayed peer: the punched direct address now carrying its traffic, and when
+    /// an authenticated frame last arrived there.  `None` while traffic goes via the relay.
+    #[cfg(feature = "security")]
+    direct: Mutex<Option<(SocketAddr, Instant)>>,
+    /// For a relayed peer: when we last asked the relay for an introduction.
+    #[cfg(feature = "security")]
+    last_intro: Mutex<Option<Instant>>,
     /// Total bytes received from this peer (payload bytes, not wire bytes).
     pub rx_bytes: AtomicU64,
     /// Total bytes sent to this peer (payload bytes, not wire bytes).
@@ -125,6 +132,10 @@ impl PeerState {
             rehandshake_started: Mutex::new(None),
             #[cfg(feature = "security")]
             highest_nonce: AtomicU64::new(0),
+            #[cfg(feature = "security")]
+            direct: Mutex::new(None),
+            #[cfg(feature = "security")]
+            last_intro: Mutex::new(None),
             rx_bytes: AtomicU64::new(0),
             tx_bytes: AtomicU64::new(0),
             retransmit_count: AtomicU64::new(0),
@@ -320,6 +331,56 @@ impl PeerState {
     #[cfg(feature = "security")]
     pub fn advance_nonce(&self, nonce: u64) -> bool {
         self.highest_nonce.fetch_max(nonce, Ordering::AcqRel) < nonce
+    }
+
+    /// The punched direct address of a relayed peer, if its traffic currently goes there.
+    #[cfg(feature = "security")]
+    #[must_use]
+    pub fn direct_path(&self) -> Option<SocketAddr> {
+        self.direct.lock().map(|(addr, _)| addr)
+    }
+
+    /// Record an authenticated frame from the relayed peer at `addr`, which arrived
+    /// outside the relay.  Returns the previous direct address when the path changed.
+    #[cfg(feature = "security")]
+    pub fn touch_direct(&self, addr: SocketAddr, may_switch: bool) -> Option<Option<SocketAddr>> {
+        let mut direct = self.direct.lock();
+        match *direct {
+            Some((current, ref mut seen)) if current == addr => {
+                *seen = Instant::now();
+                None
+            }
+            previous if may_switch => {
+                *direct = Some((addr, Instant::now()));
+                Some(previous.map(|(old, _)| old))
+            }
+            _ => None,
+        }
+    }
+
+    /// Drop the direct path if nothing authenticated arrived on it for `timeout`.
+    /// Returns the address given up.
+    #[cfg(feature = "security")]
+    pub fn expire_direct(&self, timeout: Duration) -> Option<SocketAddr> {
+        let mut direct = self.direct.lock();
+        let (addr, seen) = (*direct)?;
+        if seen.elapsed() < timeout {
+            return None;
+        }
+        *direct = None;
+        Some(addr)
+    }
+
+    /// Claim the right to ask the relay for an introduction; `false` if one was asked for
+    /// within `cooldown`.
+    #[cfg(feature = "security")]
+    pub fn begin_intro(&self, cooldown: Duration) -> bool {
+        let mut last = self.last_intro.lock();
+        if last.is_some_and(|t| t.elapsed() < cooldown) {
+            return false;
+        }
+        *last = Some(Instant::now());
+        true
     }
 
     /// `true` once a Noise session is installed for this peer.

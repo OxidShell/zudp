@@ -1,3 +1,6 @@
+#[cfg(feature = "security")]
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
 use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::Error;
@@ -5,7 +8,9 @@ use crate::Error;
 /// Version of the session wire protocol, carried in every handshake message.
 ///
 /// 2: handshake frames carry step + version; Secure frames carry the receiver's session index.
-pub const WIRE_VERSION: u8 = 2;
+/// 3: the plaintext `Relay` frame is gone; relayed sessions travel as `Via` / `ViaFrom`
+///    inside Secure frames, with `Unreachable`, `IntroRequest` and `Intro` for hole punching.
+pub const WIRE_VERSION: u8 = 3;
 
 /// Maximum number of sequence numbers encoded in a single Nack frame.
 pub const MAX_NACK_SEQS: usize = 128;
@@ -30,6 +35,17 @@ pub const MAX_NACK_SEQS: usize = 128;
 /// SessionUnknown : [index: u64 BE][0x0D]                                          (9 bytes)
 /// ```
 ///
+/// Relay frames, only ever sent inside a `Secure` frame (a plaintext one is dropped):
+///
+/// ```text
+/// Via          : [inner][to: 32 bytes][0x06]                                      (33 bytes)
+/// ViaFrom      : [inner][from: 32 bytes][0x0E]                                    (33 bytes)
+/// Unreachable  : [to: 32 bytes][0x0F]                                             (33 bytes)
+/// IntroRequest : [peer: 32 bytes][0x10]                                           (33 bytes)
+/// Intro(v4)    : [port: u16 BE][ip: 4 bytes][0x00][peer: 32 bytes][0x11]          (40 bytes)
+/// Intro(v6)    : [port: u16 BE][ip: 16 bytes][0x01][peer: 32 bytes][0x11]         (52 bytes)
+/// ```
+///
 /// The frame type byte is always last, making parsing O(1) from the tail.
 pub(crate) const TYPE_DATAGRAM: u8 = 0x00;
 const TYPE_STREAM: u8 = 0x01;
@@ -37,6 +53,8 @@ const TYPE_NACK: u8 = 0x02;
 const TYPE_PING: u8 = 0x03;
 const TYPE_PONG: u8 = 0x04;
 const TYPE_FRAGMENT: u8 = 0x05;
+#[cfg(feature = "security")]
+const TYPE_VIA: u8 = 0x06;
 const TYPE_PROBE: u8 = 0x07;
 const TYPE_BEACON: u8 = 0x08;
 #[cfg(feature = "security")]
@@ -47,6 +65,24 @@ pub(crate) const TYPE_MTU_PROBE: u8 = 0x0B;
 const TYPE_MTU_ACK: u8 = 0x0C;
 #[cfg(feature = "security")]
 const TYPE_SESSION_UNKNOWN: u8 = 0x0D;
+#[cfg(feature = "security")]
+const TYPE_VIA_FROM: u8 = 0x0E;
+#[cfg(feature = "security")]
+const TYPE_UNREACHABLE: u8 = 0x0F;
+#[cfg(feature = "security")]
+const TYPE_INTRO_REQUEST: u8 = 0x10;
+#[cfg(feature = "security")]
+const TYPE_INTRO: u8 = 0x11;
+
+#[cfg(feature = "security")]
+const ADDR_V4: u8 = 0x00;
+#[cfg(feature = "security")]
+const ADDR_V6: u8 = 0x01;
+
+/// Bytes a relayed frame carries on top of a direct one: the `Via` / `ViaFrom` header
+/// (key + type) plus the relay session's `Secure` header and AEAD tag.
+#[cfg(feature = "security")]
+pub(crate) const VIA_OVERHEAD: usize = 33 + 17 + 16;
 
 #[derive(Debug, Clone)]
 pub enum Frame {
@@ -107,6 +143,22 @@ pub enum Frame {
     /// Unauthenticated, so it only ever prompts a re-handshake.
     #[cfg(feature = "security")]
     SessionUnknown { index: u64 },
+    /// Relay request: deliver `inner` to the relay client whose static key is `to`.
+    #[cfg(feature = "security")]
+    Via { to: [u8; 32], inner: Bytes },
+    /// Relay delivery: `inner` came from the relay client the relay says has key `from`.
+    /// The claim is only trusted once `inner`'s own end-to-end session proves it.
+    #[cfg(feature = "security")]
+    ViaFrom { from: [u8; 32], inner: Bytes },
+    /// The relay cannot deliver to `to` (offline, or not allowed — deliberately the same).
+    #[cfg(feature = "security")]
+    Unreachable { to: [u8; 32] },
+    /// Ask the relay to introduce us to `peer` for hole punching.
+    #[cfg(feature = "security")]
+    IntroRequest { peer: [u8; 32] },
+    /// The relay's answer to a mutual `IntroRequest`: `peer` is seen at `addr`.
+    #[cfg(feature = "security")]
+    Intro { peer: [u8; 32], addr: SocketAddr },
     /// PLPMTUD path-MTU probe.  `padding` zero bytes are prepended so the total
     /// datagram is `padding + 3` bytes — the size being probed.
     MtuProbe { probe_id: u16, padding: usize },
@@ -233,6 +285,32 @@ impl Frame {
                 let mut buf = BytesMut::with_capacity(9);
                 buf.put_u64(index);
                 buf.put_u8(TYPE_SESSION_UNKNOWN);
+                buf.freeze()
+            }
+            #[cfg(feature = "security")]
+            Frame::Via { to, inner } => keyed(&inner, &to, TYPE_VIA),
+            #[cfg(feature = "security")]
+            Frame::ViaFrom { from, inner } => keyed(&inner, &from, TYPE_VIA_FROM),
+            #[cfg(feature = "security")]
+            Frame::Unreachable { to } => keyed(&[], &to, TYPE_UNREACHABLE),
+            #[cfg(feature = "security")]
+            Frame::IntroRequest { peer } => keyed(&[], &peer, TYPE_INTRO_REQUEST),
+            #[cfg(feature = "security")]
+            Frame::Intro { peer, addr } => {
+                let mut buf = BytesMut::with_capacity(52);
+                buf.put_u16(addr.port());
+                match addr.ip() {
+                    IpAddr::V4(ip) => {
+                        buf.extend_from_slice(&ip.octets());
+                        buf.put_u8(ADDR_V4);
+                    }
+                    IpAddr::V6(ip) => {
+                        buf.extend_from_slice(&ip.octets());
+                        buf.put_u8(ADDR_V6);
+                    }
+                }
+                buf.extend_from_slice(&peer);
+                buf.put_u8(TYPE_INTRO);
                 buf.freeze()
             }
             Frame::MtuProbe { probe_id, padding } => {
@@ -428,6 +506,61 @@ impl Frame {
                 Ok(Frame::SessionUnknown { index })
             }
 
+            #[cfg(feature = "security")]
+            TYPE_VIA => {
+                let to = pop_key(&mut data, "via")?;
+                Ok(Frame::Via {
+                    to,
+                    inner: data.freeze(),
+                })
+            }
+
+            #[cfg(feature = "security")]
+            TYPE_VIA_FROM => {
+                let from = pop_key(&mut data, "via_from")?;
+                Ok(Frame::ViaFrom {
+                    from,
+                    inner: data.freeze(),
+                })
+            }
+
+            #[cfg(feature = "security")]
+            TYPE_UNREACHABLE => Ok(Frame::Unreachable {
+                to: pop_key(&mut data, "unreachable")?,
+            }),
+
+            #[cfg(feature = "security")]
+            TYPE_INTRO_REQUEST => Ok(Frame::IntroRequest {
+                peer: pop_key(&mut data, "intro_request")?,
+            }),
+
+            #[cfg(feature = "security")]
+            TYPE_INTRO => {
+                let peer = pop_key(&mut data, "intro")?;
+                let ip = match pop_u8(&mut data) {
+                    Some(ADDR_V4) => {
+                        pop_bytes::<4>(&mut data).map(|ip| IpAddr::from(Ipv4Addr::from(ip)))
+                    }
+                    Some(ADDR_V6) => {
+                        pop_bytes::<16>(&mut data).map(|ip| IpAddr::from(Ipv6Addr::from(ip)))
+                    }
+                    Some(tag) => return Err(Error::UnknownAddrTag { tag }),
+                    None => None,
+                };
+                let ip = ip.ok_or(Error::FrameTruncated {
+                    frame: "intro",
+                    field: "ip",
+                })?;
+                let port = pop_u16(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "intro",
+                    field: "port",
+                })?;
+                Ok(Frame::Intro {
+                    peer,
+                    addr: SocketAddr::new(ip, port),
+                })
+            }
+
             TYPE_MTU_PROBE => {
                 let probe_id = pop_u16(&mut data).ok_or(Error::FrameTruncated {
                     frame: "mtu_probe",
@@ -450,6 +583,16 @@ impl Frame {
             tag => Err(Error::UnknownFrameType { tag }),
         }
     }
+}
+
+/// `[body][key: 32 bytes][type]`, the shape of every relay frame but `Intro`.
+#[cfg(feature = "security")]
+fn keyed(body: &[u8], key: &[u8; 32], frame_type: u8) -> Bytes {
+    let mut buf = BytesMut::with_capacity(body.len() + 33);
+    buf.extend_from_slice(body);
+    buf.extend_from_slice(key);
+    buf.put_u8(frame_type);
+    buf.freeze()
 }
 
 // --- tail-pop helpers (all frames are encoded tail-first for O(1) type dispatch) ---
@@ -501,6 +644,22 @@ fn pop_u64(buf: &mut BytesMut) -> Option<u64> {
     ]);
     buf.truncate(len - 8);
     Some(v)
+}
+
+#[cfg(feature = "security")]
+fn pop_bytes<const N: usize>(buf: &mut BytesMut) -> Option<[u8; N]> {
+    let start = buf.len().checked_sub(N)?;
+    let out = buf[start..].try_into().ok()?;
+    buf.truncate(start);
+    Some(out)
+}
+
+#[cfg(feature = "security")]
+fn pop_key(buf: &mut BytesMut, frame: &'static str) -> Result<[u8; 32], Error> {
+    pop_bytes::<32>(buf).ok_or(Error::FrameTruncated {
+        frame,
+        field: "key",
+    })
 }
 
 #[cfg(test)]
@@ -685,6 +844,50 @@ mod tests {
             panic!("wrong variant");
         };
         assert_eq!(index, 99);
+    }
+
+    #[cfg(feature = "security")]
+    #[test]
+    fn relay_frames_roundtrip() {
+        let inner = Bytes::from_static(b"opaque inner");
+        let Frame::Via { to, inner: out } = roundtrip(Frame::Via {
+            to: [7; 32],
+            inner: inner.clone(),
+        }) else {
+            panic!("wrong variant");
+        };
+        assert_eq!((to, out), ([7; 32], inner.clone()));
+        let Frame::ViaFrom { from, inner: out } = roundtrip(Frame::ViaFrom {
+            from: [8; 32],
+            inner: inner.clone(),
+        }) else {
+            panic!("wrong variant");
+        };
+        assert_eq!((from, out), ([8; 32], inner));
+        let Frame::Unreachable { to } = roundtrip(Frame::Unreachable { to: [9; 32] }) else {
+            panic!("wrong variant");
+        };
+        assert_eq!(to, [9; 32]);
+        let Frame::IntroRequest { peer } = roundtrip(Frame::IntroRequest { peer: [1; 32] }) else {
+            panic!("wrong variant");
+        };
+        assert_eq!(peer, [1; 32]);
+        for addr in ["198.51.100.7:4000", "[2001:db8::1]:4001"] {
+            let addr: SocketAddr = addr.parse().unwrap();
+            let Frame::Intro { peer, addr: out } = roundtrip(Frame::Intro {
+                peer: [2; 32],
+                addr,
+            }) else {
+                panic!("wrong variant");
+            };
+            assert_eq!((peer, out), ([2; 32], addr));
+        }
+        let mut short = BytesMut::from(&[0u8; 10][..]);
+        short.put_u8(TYPE_VIA);
+        assert!(matches!(
+            Frame::decode(short),
+            Err(Error::FrameTruncated { .. })
+        ));
     }
 
     #[test]

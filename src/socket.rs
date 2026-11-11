@@ -1,6 +1,14 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use bytes::BytesMut;
+use parking_lot::RwLock;
 use tokio::{io::Interest, net::UdpSocket};
 
 const RECV_BUF_LEN: usize = 65_536;
@@ -14,6 +22,21 @@ const SOCK_BUF_SIZE: usize = 4 * 1024 * 1024;
 #[derive(Clone)]
 pub struct RawSocket {
     inner: Arc<UdpSocket>,
+    blocked: Arc<Blocklist>,
+}
+
+/// Fault injection for tests: datagrams to or from these addresses are silently lost.
+#[derive(Default)]
+struct Blocklist {
+    /// Fast path: `false` while the set is empty, so normal traffic never takes the lock.
+    any: AtomicBool,
+    addrs: RwLock<HashSet<SocketAddr>>,
+}
+
+impl Blocklist {
+    fn contains(&self, addr: SocketAddr) -> bool {
+        self.any.load(Ordering::Relaxed) && self.addrs.read().contains(&addr)
+    }
 }
 
 impl RawSocket {
@@ -41,11 +64,31 @@ impl RawSocket {
         let std_sock: std::net::UdpSocket = sock.into();
         Ok(Self {
             inner: Arc::new(UdpSocket::from_std(std_sock)?),
+            blocked: Arc::default(),
         })
+    }
+
+    /// Share `other`'s blocklist, so a rebound socket keeps the injected faults.
+    pub fn adopt_blocklist(&mut self, other: &RawSocket) {
+        self.blocked = other.blocked.clone();
+    }
+
+    /// Start or stop losing every datagram to and from `addr`.
+    pub fn set_blocked(&self, addr: SocketAddr, blocked: bool) {
+        let mut addrs = self.blocked.addrs.write();
+        if blocked {
+            addrs.insert(addr);
+        } else {
+            addrs.remove(&addr);
+        }
+        self.blocked.any.store(!addrs.is_empty(), Ordering::Relaxed);
     }
 
     #[inline]
     pub async fn send_to(&self, data: &[u8], addr: SocketAddr) -> Result<(), crate::Error> {
+        if self.blocked.contains(addr) {
+            return Ok(());
+        }
         self.inner.send_to(data, addr).await?;
         Ok(())
     }
@@ -56,6 +99,9 @@ impl RawSocket {
         bufs: &[std::io::IoSlice<'_>],
         addr: SocketAddr,
     ) -> Result<(), crate::Error> {
+        if self.blocked.contains(addr) {
+            return Ok(());
+        }
         let sock_addr = socket2::SockAddr::from(addr);
         loop {
             self.inner.writable().await?;
@@ -74,9 +120,13 @@ impl RawSocket {
     /// `recv_buf_from` uses `ReadBuf` internally, which writes only into uninit
     /// spare capacity and marks exactly the received bytes as initialised.
     pub async fn recv_from(&self) -> Result<(BytesMut, SocketAddr), std::io::Error> {
-        let mut buf = BytesMut::with_capacity(RECV_BUF_LEN);
-        let (_, addr) = self.inner.recv_buf_from(&mut buf).await?;
-        Ok((buf, addr))
+        loop {
+            let mut buf = BytesMut::with_capacity(RECV_BUF_LEN);
+            let (_, addr) = self.inner.recv_buf_from(&mut buf).await?;
+            if !self.blocked.contains(addr) {
+                return Ok((buf, addr));
+            }
+        }
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, crate::Error> {

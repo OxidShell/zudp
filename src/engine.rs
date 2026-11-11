@@ -96,6 +96,17 @@ pub(crate) struct EngineInner {
     /// Budget for `SessionUnknown` replies per source IP.
     #[cfg(feature = "security")]
     pub hint_limiter: Mutex<crate::rate::RateLimiter>,
+    /// Remote static key → direct session, so a relay node finds the client a key names.
+    #[cfg(feature = "security")]
+    pub by_key: DashMap<[u8; 32], Arc<PeerState>>,
+    /// Punched direct address → the relayed peer whose traffic now arrives from it.
+    #[cfg(feature = "security")]
+    pub punched: DashMap<SocketAddr, Arc<PeerState>>,
+    /// Relayed frames dropped because the relay's sender claim did not match the session.
+    pub dropped_forged: AtomicU64,
+    /// Relay node state; `Some` when built with [`crate::Zudp::relay_node`].
+    #[cfg(feature = "relay")]
+    pub relay: Option<crate::relay::node::RelayNode>,
 }
 
 impl EngineInner {
@@ -191,6 +202,15 @@ impl EngineInner {
         if let Some(id) = old.their_session_id() {
             self.sessions.remove_if(&id, |_, p| Arc::ptr_eq(p, old));
         }
+        #[cfg(feature = "security")]
+        {
+            if let Some(key) = old.remote_static_key() {
+                self.by_key.remove_if(&key, |_, p| Arc::ptr_eq(p, old));
+            }
+            if let Some(direct) = old.direct_path() {
+                self.punched.remove_if(&direct, |_, p| Arc::ptr_eq(p, old));
+            }
+        }
     }
 
     /// Publish a lifecycle event; nobody listening is fine.
@@ -222,6 +242,10 @@ impl EngineInner {
     /// The datagram that carries `wire` to `peer` along its current path, and where to
     /// send it.  `None` when the path is gone (a relayed peer whose relay session ended).
     pub fn outbound(&self, peer: &PeerState, wire: Bytes) -> Option<(Bytes, SocketAddr)> {
+        #[cfg(feature = "security")]
+        if let Some(direct) = peer.direct_path() {
+            return Some((wire, direct));
+        }
         self.outbound_to(peer.addr(), wire)
     }
 
@@ -229,6 +253,9 @@ impl EngineInner {
     pub fn outbound_to(&self, to: PeerAddr, wire: Bytes) -> Option<(Bytes, SocketAddr)> {
         match to {
             PeerAddr::Direct(addr) => Some((wire, addr)),
+            #[cfg(feature = "security")]
+            PeerAddr::Relayed { relay, key } => crate::relay::via(self, relay, key, wire),
+            #[cfg(not(feature = "security"))]
             PeerAddr::Relayed { .. } => None,
         }
     }
@@ -323,7 +350,8 @@ async fn run(
                         let trusted = inner
                             .peers
                             .get(&PeerAddr::Direct(from))
-                            .is_some_and(|p| p.has_channel());
+                            .is_some_and(|p| p.has_channel())
+                            || is_punched(&inner, from);
                         if inner.config.max_pps_per_ip > 0.0 && !trusted && !limiter.allow(from.ip()) {
                             tracing::trace!(target: "zudp::engine", %from, "rate limited");
                             inner.dropped_rate_limited.fetch_add(1, Ordering::Relaxed);
@@ -388,7 +416,8 @@ async fn run(
 /// On success, replaces `inner.socket` so future `send_to` calls use the new interface.
 async fn rebind_socket(inner: &Arc<EngineInner>) -> Result<RawSocket, crate::Error> {
     let old_local = inner.get_socket().local_addr()?;
-    let new_sock = RawSocket::bind(SocketAddr::new(old_local.ip(), 0)).await?;
+    let mut new_sock = RawSocket::bind(SocketAddr::new(old_local.ip(), 0)).await?;
+    new_sock.adopt_blocklist(&inner.get_socket());
     let new_addr = new_sock.local_addr()?;
     *inner.socket.write() = new_sock.clone();
     tracing::info!(target: "zudp::engine", old = %old_local, new = %new_addr, "socket rebound");
@@ -464,6 +493,10 @@ async fn handle_incoming(
             } => {
                 let Some((peer, inner_frame)) =
                     open_secure(inner, from, index, nonce, &ciphertext, recv_states).await
+                else {
+                    return;
+                };
+                let Some((peer, inner_frame)) = crate::relay::open(inner, peer, inner_frame).await
                 else {
                     return;
                 };
@@ -698,6 +731,15 @@ async fn dispatch_frame(
         }
 
         Frame::Probe { .. } | Frame::Beacon { .. } => {}
+
+        // Relay frames only mean something inside a session with a direct peer, where
+        // `relay::open` consumed them; plaintext ones are noise.
+        #[cfg(feature = "security")]
+        Frame::Via { .. }
+        | Frame::ViaFrom { .. }
+        | Frame::Unreachable { .. }
+        | Frame::IntroRequest { .. }
+        | Frame::Intro { .. } => {}
 
         // Handshake and Secure are handled before dispatch_frame is called.
         #[cfg(feature = "security")]
@@ -1008,6 +1050,8 @@ fn run_background(
             }
             continue;
         }
+        #[cfg(feature = "security")]
+        crate::relay::tick(inner, &peer);
         // Ping when we have been quiet, and also when they have: a peer that only receives
         // must still hear from us, and we must still hear from it, within the timeout.
         if peer.since_sent() >= keepalive_interval || peer.since_seen() >= keepalive_interval {
@@ -1051,6 +1095,10 @@ fn run_background(
 
     rate_limiter.tick_prune();
 
+    #[cfg(feature = "relay")]
+    if let Some(node) = &inner.relay {
+        node.prune();
+    }
     #[cfg(feature = "security")]
     crate::handshake::expire(inner);
     #[cfg(feature = "security")]
@@ -1065,7 +1113,7 @@ fn now_micros() -> u64 {
 
 /// Feed one handshake message to the driver, answer it, and install a finished session.
 #[cfg(feature = "security")]
-async fn handle_handshake(
+pub(crate) async fn handle_handshake(
     step: u8,
     version: u8,
     payload: &Bytes,
@@ -1104,6 +1152,13 @@ fn install_session(
         established.initiator,
     );
     inner.by_index.insert(local_index, peer.clone());
+    match (addr, key) {
+        (PeerAddr::Direct(_), Some(key)) => {
+            inner.by_key.insert(key, peer.clone());
+        }
+        (PeerAddr::Relayed { .. }, _) => crate::relay::request_intro(inner, &peer),
+        (PeerAddr::Direct(_), None) => {}
+    }
     peer.announce();
     inner.emit(if had_session {
         PeerEvent::Reset { addr, key }
@@ -1301,57 +1356,99 @@ async fn open_secure(
 ) -> Option<(Arc<PeerState>, Frame)> {
     let Some(peer) = inner.by_index.get(&index).map(|r| r.value().clone()) else {
         if !crate::handshake::is_pending_index(inner, index) {
-            send_session_unknown(inner, from, index).await;
+            send_session_unknown(inner, PeerAddr::Direct(from), index).await;
         }
         return None;
     };
-    let plain = {
-        let guard = peer.channel.read();
-        let channel = guard.as_ref()?;
-        match channel.decrypt(nonce, ciphertext) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(target: "zudp::engine", peer = %from, "decrypt failed: {e}");
-                return None;
-            }
-        }
-    };
+    // A relayed session only moves onto a direct path when punching is on.
+    let relayed = peer.addr().is_relayed();
+    if relayed && !inner.config.punching {
+        return None;
+    }
+    let plain = decrypt(&peer, nonce, ciphertext)?;
     let newest = peer.advance_nonce(nonce);
-    if peer.addr() != from && newest {
+    if relayed {
+        crate::relay::on_direct(inner, &peer, from, newest);
+    } else if peer.addr() != from && newest {
         migrate_peer(inner, &peer, PeerAddr::Direct(from), recv_states);
     }
     peer.mark_seen();
     peer.mark_confirmed();
-    match Frame::decode(BytesMut::from(plain.as_slice())) {
-        Ok(Frame::Handshake { .. } | Frame::Secure { .. } | Frame::SessionUnknown { .. }) => None,
-        Ok(frame) => Some((peer, frame)),
+    inner_frame(peer, &plain)
+}
+
+/// Decrypt a Secure frame in `peer`'s session; `None` when it does not authenticate or
+/// is a replay.
+#[cfg(feature = "security")]
+pub(crate) fn decrypt(peer: &PeerState, nonce: u64, ciphertext: &[u8]) -> Option<Vec<u8>> {
+    let guard = peer.channel.read();
+    match guard.as_ref()?.decrypt(nonce, ciphertext) {
+        Ok(plain) => Some(plain),
         Err(e) => {
-            tracing::warn!(target: "zudp::engine", peer = %from, "inner frame decode failed: {e}");
+            tracing::debug!(target: "zudp::engine", peer = %peer.addr(), "decrypt failed: {e}");
             None
         }
     }
 }
 
+/// Decode the plaintext of a Secure frame.  Session-layer frames never travel encrypted,
+/// so one found inside is dropped.
 #[cfg(feature = "security")]
-async fn send_session_unknown(inner: &Arc<EngineInner>, to: SocketAddr, index: u64) {
-    if !inner.hint_limiter.lock().allow(to.ip()) {
+pub(crate) fn inner_frame(peer: Arc<PeerState>, plain: &[u8]) -> Option<(Arc<PeerState>, Frame)> {
+    match Frame::decode(BytesMut::from(plain)) {
+        Ok(Frame::Handshake { .. } | Frame::Secure { .. } | Frame::SessionUnknown { .. }) => None,
+        Ok(frame) => Some((peer, frame)),
+        Err(e) => {
+            tracing::warn!(target: "zudp::engine", peer = %peer.addr(), "inner frame decode failed: {e}");
+            None
+        }
+    }
+}
+
+/// `true` when `addr` is the punched direct path of a relayed session.
+fn is_punched(inner: &EngineInner, addr: SocketAddr) -> bool {
+    #[cfg(feature = "security")]
+    {
+        inner.punched.contains_key(&addr)
+    }
+    #[cfg(not(feature = "security"))]
+    {
+        let _ = (inner, addr);
+        false
+    }
+}
+
+#[cfg(feature = "security")]
+pub(crate) async fn send_session_unknown(inner: &Arc<EngineInner>, to: PeerAddr, index: u64) {
+    let ip = match to {
+        PeerAddr::Direct(addr) | PeerAddr::Relayed { relay: addr, .. } => addr.ip(),
+    };
+    if !inner.hint_limiter.lock().allow(ip) {
         return;
     }
     tracing::debug!(target: "zudp::engine", peer = %to, index, "secure frame for an unknown session");
     let wire = Frame::SessionUnknown { index }.encode();
-    if let Err(e) = inner.get_socket().send_to(&wire, to).await {
-        tracing::debug!(target: "zudp::engine", peer = %to, "session-unknown send failed: {e}");
-    }
+    inner.send_to_addr(to, wire, "session-unknown").await;
 }
 
 /// The remote lost the session we initiated (it restarted): handshake again in the
 /// background.  The hint is unauthenticated, so it only ever starts a handshake — the old
 /// session stays until a new one replaces it.
 #[cfg(feature = "security")]
-fn on_session_unknown(inner: &Arc<EngineInner>, from: PeerAddr, index: u64) {
-    let Some(peer) = inner.peers.get(&from).map(|r| r.value().clone()) else {
+pub(crate) fn on_session_unknown(inner: &Arc<EngineInner>, from: PeerAddr, index: u64) {
+    let peer = inner
+        .peers
+        .get(&from)
+        .map(|r| r.value().clone())
+        .or_else(|| {
+            // A relayed peer we punched through answers from its direct address.
+            let addr = from.direct()?;
+            inner.punched.get(&addr).map(|r| r.value().clone())
+        });
+    let Some(peer) = peer else {
         return;
     };
+    let from = peer.addr();
     if !peer.is_initiator()
         || peer.remote_index() != Some(index)
         || !peer.begin_rehandshake(inner.config.handshake_timeout)
