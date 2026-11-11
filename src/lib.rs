@@ -158,6 +158,21 @@ impl ZudpSender {
         Ok(*self.inner.connect_via(relay, target).await?.read())
     }
 
+    /// Accept new relayed sessions from `relay`; see [`Zudp::accept_relayed_from`].
+    #[cfg(feature = "security")]
+    pub fn accept_relayed_from(&self, relay: SocketAddr) {
+        self.inner.accept_relayed_from(relay);
+    }
+
+    /// Approve hole punching to the relayed `peer`; see [`ZudpSocket::punch`].
+    ///
+    /// # Errors
+    /// As [`ZudpSocket::punch`].
+    #[cfg(feature = "security")]
+    pub fn punch(&self, peer: impl Into<PeerAddr>) -> Result<(), Error> {
+        relay::punch(&self.inner.engine, peer.into())
+    }
+
     /// Smoothed RTT to `peer` as measured by transport-level Ping/Pong.
     /// Returns `None` until the first Pong has been received.
     #[must_use]
@@ -199,6 +214,9 @@ pub struct EngineStats {
     /// Relayed frames dropped because the relay attributed them to a peer other than the
     /// one their end-to-end session authenticates.
     pub dropped_forged: u64,
+    /// Relayed frames dropped because their relay was neither accepted
+    /// ([`Zudp::accept_relayed_from`]) nor carrying a session we opened through it.
+    pub dropped_relay_unaccepted: u64,
     /// Relay node: frames forwarded between clients.
     pub relay_forwarded_packets: u64,
     /// Relay node: inner bytes forwarded between clients.
@@ -207,12 +225,14 @@ pub struct EngineStats {
     pub relay_dropped_rate_limited: u64,
     /// Relay node: frames dropped for exceeding the maximum inner size.
     pub relay_dropped_oversize: u64,
-    /// Relay node: `Unreachable` answers sent (target offline, denied, or over the route cap).
+    /// Relay node: `Unreachable` answers sent (target offline or denied).
     pub relay_unreachable: u64,
     /// Relay node: of those, the ones the policy denied.
     pub relay_denied: u64,
-    /// Relay node: of those, the ones refused because the route cap was reached.
-    pub relay_routes_full: u64,
+    /// Relay node: routes (client pairs) evicted to stay within the route caps.
+    pub relay_routes_evicted: u64,
+    /// Relay node: sessions evicted to keep a source network within its session cap.
+    pub relay_sessions_evicted: u64,
     /// Relay node: client pairs introduced to each other for hole punching.
     pub relay_introductions: u64,
 }
@@ -305,10 +325,13 @@ pub struct Config {
     /// Punch relayed sessions through to a direct path when NAT allows it.
     #[cfg(feature = "security")]
     pub(crate) punching: bool,
+    /// Relays allowed to deliver new inbound relayed sessions.
+    #[cfg(feature = "security")]
+    pub(crate) accept_relays: Vec<SocketAddr>,
     /// Relay node limits; `Some` makes this socket a relay node.
     #[cfg(feature = "relay")]
     pub(crate) relay: Option<RelayLimits>,
-    /// Initial relay policy; `None` lets every client reach every other.
+    /// Initial relay policy; `None` relays nothing.
     #[cfg(feature = "relay")]
     pub(crate) relay_policy: Option<Arc<dyn RelayPolicy>>,
     /// Maximum number of tracked peers.  New peers beyond this limit are handled
@@ -350,6 +373,8 @@ impl Default for Config {
             pinned_keys: Vec::new(),
             #[cfg(feature = "security")]
             punching: true,
+            #[cfg(feature = "security")]
+            accept_relays: Vec::new(),
             #[cfg(feature = "relay")]
             relay: None,
             #[cfg(feature = "relay")]
@@ -473,15 +498,17 @@ impl Zudp {
         self
     }
 
-    /// Punch relayed sessions through to a direct path (default: `true`).
+    /// Allow hole punching for relayed sessions (default: `true`).
     ///
-    /// When on, both ends of a session opened with
-    /// [`ZudpSocket::connect_via`] ask the relay for an introduction, probe each other's
-    /// public address with authenticated keepalives, and move the session onto the direct
-    /// path once one gets through ([`PeerEvent::PathChanged`]).  A direct path that goes
-    /// silent falls back to the relay.  Where NAT does not allow it (symmetric NAT on both
-    /// sides) the session simply stays on the relay.  When off, traffic always goes through
-    /// the relay and the relay never learns we would like to know the peer's address.
+    /// Punching asks the relay to exchange our public address with the peer's, so it only
+    /// starts for peers we trust: those whose key is pinned
+    /// ([`pin_remote_key`](Self::pin_remote_key)) and those the application approved with
+    /// [`ZudpSocket::punch`].  Both ends then probe each other's address with authenticated
+    /// keepalives, validate the path with an encrypted challenge, and move the session onto
+    /// it ([`PeerEvent::PathChanged`]).  A direct path that goes silent falls back to the
+    /// relay.  Where NAT does not allow it (symmetric NAT on both sides) the session stays
+    /// on the relay.  When off, traffic always goes through the relay and nothing about our
+    /// address is ever requested.
     #[cfg(feature = "security")]
     #[must_use]
     pub fn punching(mut self, enabled: bool) -> Self {
@@ -489,26 +516,36 @@ impl Zudp {
         self
     }
 
-    /// Make this socket a relay node with the given abuse limits.
+    /// Accept new relayed sessions delivered by the relay node at `relay` (repeatable).
+    ///
+    /// A device that waits for peers to reach it through its relay names that relay here
+    /// (or later with [`ZudpSocket::accept_relayed_from`]).  Without it, a relay may only
+    /// carry sessions we opened through it with [`ZudpSocket::connect_via`]; anything else
+    /// it delivers is dropped, so no direct peer can make itself our relay.
+    #[cfg(feature = "security")]
+    #[must_use]
+    pub fn accept_relayed_from(mut self, relay: SocketAddr) -> Self {
+        let relay = reachable(relay);
+        if !self.config.accept_relays.contains(&relay) {
+            self.config.accept_relays.push(relay);
+        }
+        self
+    }
+
+    /// Make this socket a relay node with the given abuse limits and policy.
     ///
     /// A relay node forwards end-to-end encrypted frames between the clients connected to
     /// it, addressed by their static public keys (see [`ZudpSocket::connect_via`]), and
     /// introduces clients to each other for hole punching.  It never sees plaintext and
-    /// never sends to an address a client names, so it is safe to expose publicly.
-    /// Requires [`security`](Self::security).  Gate who may reach whom with
-    /// [`relay_policy`](Self::relay_policy).
+    /// never sends to an address a client names.  Requires [`security`](Self::security).
+    ///
+    /// `policy` decides who may reach whom.  Choose it deliberately: whoever the policy
+    /// lets reach a client also learns whether that client is connected.  `|_, _| true`
+    /// makes an open relay.  Replace it at runtime with [`ZudpSocket::set_relay_policy`].
     #[cfg(feature = "relay")]
     #[must_use]
-    pub fn relay_node(mut self, limits: RelayLimits) -> Self {
+    pub fn relay_node(mut self, limits: RelayLimits, policy: impl RelayPolicy + 'static) -> Self {
         self.config.relay = Some(limits);
-        self
-    }
-
-    /// Who may reach whom through this relay node (default: everyone connected).
-    /// Replace it at runtime with [`ZudpSocket::set_relay_policy`].
-    #[cfg(feature = "relay")]
-    #[must_use]
-    pub fn relay_policy(mut self, policy: impl RelayPolicy + 'static) -> Self {
         self.config.relay_policy = Some(Arc::new(policy));
         self
     }
@@ -673,6 +710,16 @@ impl Inner {
             #[cfg(feature = "security")]
             punched: DashMap::new(),
             dropped_forged: AtomicU64::new(0),
+            dropped_relay_unaccepted: AtomicU64::new(0),
+            #[cfg(feature = "security")]
+            inbound_relays: RwLock::new(config.accept_relays.iter().copied().collect()),
+            #[cfg(feature = "security")]
+            punch_allowed: RwLock::new(std::collections::HashSet::new()),
+            #[cfg(feature = "security")]
+            relayed_hs_limiter: parking_lot::Mutex::new(rate::RateLimiter::new(
+                relay::RELAYED_HANDSHAKES_PER_SEC,
+                relay::RELAYED_HANDSHAKES_PER_SEC,
+            )),
             #[cfg(feature = "relay")]
             relay: config
                 .relay
@@ -756,6 +803,11 @@ impl Inner {
             .get(&handle)
             .map(|p| p.addr_arc())
             .ok_or(Error::HandshakeTimeout { peer: handle })
+    }
+
+    #[cfg(feature = "security")]
+    fn accept_relayed_from(&self, relay: SocketAddr) {
+        self.engine.inbound_relays.write().insert(reachable(relay));
     }
 
     fn peer_path(&self, peer: PeerAddr) -> Option<Path> {
@@ -940,7 +992,8 @@ fn relay_stats(engine: &EngineInner) -> EngineStats {
             relay_dropped_oversize: c.dropped_oversize.load(Ordering::Relaxed),
             relay_unreachable: c.unreachable.load(Ordering::Relaxed),
             relay_denied: c.denied.load(Ordering::Relaxed),
-            relay_routes_full: c.routes_full.load(Ordering::Relaxed),
+            relay_routes_evicted: c.routes_evicted.load(Ordering::Relaxed),
+            relay_sessions_evicted: c.sessions_evicted.load(Ordering::Relaxed),
             relay_introductions: c.introductions.load(Ordering::Relaxed),
             ..EngineStats::default()
         };
@@ -1028,6 +1081,7 @@ impl<M> ZudpSocket<M> {
             dropped_peer_cap: e.dropped_peer_cap.load(Ordering::Relaxed),
             dropped_unauthenticated: e.dropped_unauthenticated.load(Ordering::Relaxed),
             dropped_forged: e.dropped_forged.load(Ordering::Relaxed),
+            dropped_relay_unaccepted: e.dropped_relay_unaccepted.load(Ordering::Relaxed),
             ..relay_stats(e)
         }
     }
@@ -1111,8 +1165,29 @@ impl<M> ZudpSocket<M> {
         self.inner.peer_path(peer.into())
     }
 
-    /// Replace this relay node's policy at runtime; `None` lets every client reach every
-    /// other.  Does nothing on a socket that is not a relay node.
+    /// Accept new relayed sessions delivered by the relay at `relay`; see
+    /// [`Zudp::accept_relayed_from`].
+    #[cfg(feature = "security")]
+    pub fn accept_relayed_from(&self, relay: SocketAddr) {
+        self.inner.accept_relayed_from(relay);
+    }
+
+    /// Approve hole punching to the relayed `peer` and start it now.
+    ///
+    /// Punching exchanges public addresses through the relay, so it only starts on its own
+    /// for pinned keys; call this once the application trusts a peer.  The approval covers
+    /// later sessions with the same key as well.  The peer has to call it (or pin our key)
+    /// too: the relay only introduces two clients that both asked.
+    ///
+    /// # Errors
+    /// [`Error::NoSession`] when `peer` is not a relayed peer with an established session.
+    #[cfg(feature = "security")]
+    pub fn punch(&self, peer: impl Into<PeerAddr>) -> Result<(), Error> {
+        relay::punch(&self.inner.engine, peer.into())
+    }
+
+    /// Replace this relay node's policy at runtime; `None` relays nothing.  Does nothing on
+    /// a socket that is not a relay node.
     #[cfg(feature = "relay")]
     pub fn set_relay_policy(&self, policy: Option<Arc<dyn RelayPolicy>>) {
         if let Some(node) = &self.inner.engine.relay {

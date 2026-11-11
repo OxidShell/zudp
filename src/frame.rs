@@ -46,6 +46,13 @@ pub const MAX_NACK_SEQS: usize = 128;
 /// Intro(v6)    : [port: u16 BE][ip: 16 bytes][0x01][peer: 32 bytes][0x11]         (52 bytes)
 /// ```
 ///
+/// Path validation, only ever sent inside the end-to-end session of a relayed peer:
+///
+/// ```text
+/// PathChallenge : [token: u64 BE][0x12]                                           (9 bytes)
+/// PathResponse  : [token: u64 BE][0x13]                                           (9 bytes)
+/// ```
+///
 /// The frame type byte is always last, making parsing O(1) from the tail.
 pub(crate) const TYPE_DATAGRAM: u8 = 0x00;
 const TYPE_STREAM: u8 = 0x01;
@@ -73,6 +80,10 @@ const TYPE_UNREACHABLE: u8 = 0x0F;
 const TYPE_INTRO_REQUEST: u8 = 0x10;
 #[cfg(feature = "security")]
 const TYPE_INTRO: u8 = 0x11;
+#[cfg(feature = "security")]
+const TYPE_PATH_CHALLENGE: u8 = 0x12;
+#[cfg(feature = "security")]
+const TYPE_PATH_RESPONSE: u8 = 0x13;
 
 #[cfg(feature = "security")]
 const ADDR_V4: u8 = 0x00;
@@ -159,6 +170,13 @@ pub enum Frame {
     /// The relay's answer to a mutual `IntroRequest`: `peer` is seen at `addr`.
     #[cfg(feature = "security")]
     Intro { peer: [u8; 32], addr: SocketAddr },
+    /// "Answer me at the address this came from": sent straight to a candidate direct
+    /// address of a relayed peer before any traffic moves there.
+    #[cfg(feature = "security")]
+    PathChallenge { token: u64 },
+    /// Echo of a `PathChallenge`, sent back to the address the challenge came from.
+    #[cfg(feature = "security")]
+    PathResponse { token: u64 },
     /// PLPMTUD path-MTU probe.  `padding` zero bytes are prepended so the total
     /// datagram is `padding + 3` bytes — the size being probed.
     MtuProbe { probe_id: u16, padding: usize },
@@ -313,6 +331,10 @@ impl Frame {
                 buf.put_u8(TYPE_INTRO);
                 buf.freeze()
             }
+            #[cfg(feature = "security")]
+            Frame::PathChallenge { token } => token_frame(token, TYPE_PATH_CHALLENGE),
+            #[cfg(feature = "security")]
+            Frame::PathResponse { token } => token_frame(token, TYPE_PATH_RESPONSE),
             Frame::MtuProbe { probe_id, padding } => {
                 let total = padding + 3;
                 let mut buf = BytesMut::zeroed(total);
@@ -561,6 +583,22 @@ impl Frame {
                 })
             }
 
+            #[cfg(feature = "security")]
+            TYPE_PATH_CHALLENGE => Ok(Frame::PathChallenge {
+                token: pop_u64(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "path_challenge",
+                    field: "token",
+                })?,
+            }),
+
+            #[cfg(feature = "security")]
+            TYPE_PATH_RESPONSE => Ok(Frame::PathResponse {
+                token: pop_u64(&mut data).ok_or(Error::FrameTruncated {
+                    frame: "path_response",
+                    field: "token",
+                })?,
+            }),
+
             TYPE_MTU_PROBE => {
                 let probe_id = pop_u16(&mut data).ok_or(Error::FrameTruncated {
                     frame: "mtu_probe",
@@ -583,6 +621,15 @@ impl Frame {
             tag => Err(Error::UnknownFrameType { tag }),
         }
     }
+}
+
+/// `[token: u64][type]`, the shape of both path validation frames.
+#[cfg(feature = "security")]
+fn token_frame(token: u64, frame_type: u8) -> Bytes {
+    let mut buf = BytesMut::with_capacity(9);
+    buf.put_u64(token);
+    buf.put_u8(frame_type);
+    buf.freeze()
 }
 
 /// `[body][key: 32 bytes][type]`, the shape of every relay frame but `Intro`.
@@ -882,6 +929,14 @@ mod tests {
             };
             assert_eq!((peer, out), ([2; 32], addr));
         }
+        let Frame::PathChallenge { token } = roundtrip(Frame::PathChallenge { token: 77 }) else {
+            panic!("wrong variant");
+        };
+        assert_eq!(token, 77);
+        let Frame::PathResponse { token } = roundtrip(Frame::PathResponse { token: 78 }) else {
+            panic!("wrong variant");
+        };
+        assert_eq!(token, 78);
         let mut short = BytesMut::from(&[0u8; 10][..]);
         short.put_u8(TYPE_VIA);
         assert!(matches!(

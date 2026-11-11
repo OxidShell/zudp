@@ -82,6 +82,15 @@ pub struct PeerState {
     /// For a relayed peer: when we last asked the relay for an introduction.
     #[cfg(feature = "security")]
     last_intro: Mutex<Option<Instant>>,
+    /// For a relayed peer: an introduction we asked for and have not received yet.
+    #[cfg(feature = "security")]
+    intro_open: Mutex<Option<Instant>>,
+    /// For a relayed peer: a punch campaign is running.
+    #[cfg(feature = "security")]
+    punching: AtomicBool,
+    /// For a relayed peer: the outstanding path challenge — address, token, when sent.
+    #[cfg(feature = "security")]
+    challenge: Mutex<Option<(SocketAddr, u64, Instant)>>,
     /// Total bytes received from this peer (payload bytes, not wire bytes).
     pub rx_bytes: AtomicU64,
     /// Total bytes sent to this peer (payload bytes, not wire bytes).
@@ -136,6 +145,12 @@ impl PeerState {
             direct: Mutex::new(None),
             #[cfg(feature = "security")]
             last_intro: Mutex::new(None),
+            #[cfg(feature = "security")]
+            intro_open: Mutex::new(None),
+            #[cfg(feature = "security")]
+            punching: AtomicBool::new(false),
+            #[cfg(feature = "security")]
+            challenge: Mutex::new(None),
             rx_bytes: AtomicU64::new(0),
             tx_bytes: AtomicU64::new(0),
             retransmit_count: AtomicU64::new(0),
@@ -372,15 +387,62 @@ impl PeerState {
     }
 
     /// Claim the right to ask the relay for an introduction; `false` if one was asked for
-    /// within `cooldown`.
+    /// within `cooldown` (pass zero to ask regardless).
     #[cfg(feature = "security")]
     pub fn begin_intro(&self, cooldown: Duration) -> bool {
         let mut last = self.last_intro.lock();
         if last.is_some_and(|t| t.elapsed() < cooldown) {
             return false;
         }
-        *last = Some(Instant::now());
+        let now = Instant::now();
+        *last = Some(now);
+        *self.intro_open.lock() = Some(now);
         true
+    }
+
+    /// Consume the introduction we asked for; `false` when none was asked for within
+    /// `window` — an unsolicited introduction is ignored.
+    #[cfg(feature = "security")]
+    pub fn take_intro(&self, window: Duration) -> bool {
+        self.intro_open
+            .lock()
+            .take()
+            .is_some_and(|asked| asked.elapsed() < window)
+    }
+
+    /// Claim the single punch campaign of this peer; `false` while one is running.
+    #[cfg(feature = "security")]
+    pub fn begin_punch(&self) -> bool {
+        !self.punching.swap(true, Ordering::AcqRel)
+    }
+
+    #[cfg(feature = "security")]
+    pub fn end_punch(&self) {
+        self.punching.store(false, Ordering::Release);
+    }
+
+    /// A fresh challenge token for `addr`, or `None` when one went there within `retry`.
+    #[cfg(feature = "security")]
+    pub fn begin_challenge(&self, addr: SocketAddr, retry: Duration) -> Option<u64> {
+        let mut challenge = self.challenge.lock();
+        if challenge.is_some_and(|(a, _, sent)| a == addr && sent.elapsed() < retry) {
+            return None;
+        }
+        let token = random_u64();
+        *challenge = Some((addr, token, Instant::now()));
+        Some(token)
+    }
+
+    /// `true` (and the challenge is settled) when `token` answers the challenge sent to
+    /// `addr`.
+    #[cfg(feature = "security")]
+    pub fn answer_challenge(&self, addr: SocketAddr, token: u64) -> bool {
+        let mut challenge = self.challenge.lock();
+        if challenge.is_some_and(|(a, t, _)| a == addr && t == token) {
+            *challenge = None;
+            return true;
+        }
+        false
     }
 
     /// `true` once a Noise session is installed for this peer.

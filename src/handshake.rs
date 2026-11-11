@@ -200,7 +200,7 @@ fn respond(
             Role::Responder => {}
         }
     }
-    if !pending.contains_key(&from) && pending.len() >= inner.config.max_peers {
+    if !pending.contains_key(&from) && !pending_budget(inner, pending, from) {
         tracing::warn!(target: "zudp::handshake", peer = %from, "too many handshakes in progress — dropping msg1");
         return (None, None);
     }
@@ -247,6 +247,21 @@ fn respond(
         },
     );
     (Some(reply), None)
+}
+
+/// Room for one more half-open handshake with `from`?  Each relay gets its own budget, a
+/// quarter of `max_peers`, so a relay feeding fake msg1s cannot crowd out direct handshakes
+/// or another relay's; direct handshakes share the full `max_peers`.
+fn pending_budget(inner: &EngineInner, pending: &PendingMap, from: PeerAddr) -> bool {
+    let max = inner.config.max_peers;
+    match from {
+        PeerAddr::Direct(_) => pending.keys().filter(|k| !k.is_relayed()).count() < max,
+        PeerAddr::Relayed { relay, .. } => {
+            let same_relay =
+                |k: &&PeerAddr| matches!(k, PeerAddr::Relayed { relay: r, .. } if *r == relay);
+            pending.keys().filter(same_relay).count() < (max / 4).max(8)
+        }
+    }
 }
 
 fn finish_as_initiator(

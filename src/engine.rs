@@ -104,6 +104,17 @@ pub(crate) struct EngineInner {
     pub punched: DashMap<SocketAddr, Arc<PeerState>>,
     /// Relayed frames dropped because the relay's sender claim did not match the session.
     pub dropped_forged: AtomicU64,
+    /// Relayed frames dropped because they came through a relay we never accepted.
+    pub dropped_relay_unaccepted: AtomicU64,
+    /// Relays allowed to deliver new inbound relayed sessions to us.
+    #[cfg(feature = "security")]
+    pub inbound_relays: RwLock<std::collections::HashSet<SocketAddr>>,
+    /// Static keys of relayed peers the application approved for hole punching.
+    #[cfg(feature = "security")]
+    pub punch_allowed: RwLock<std::collections::HashSet<[u8; 32]>>,
+    /// Budget for relayed handshake initiations per relay IP.
+    #[cfg(feature = "security")]
+    pub relayed_hs_limiter: Mutex<crate::rate::RateLimiter>,
     /// Relay node state; `Some` when built with [`crate::Zudp::relay_node`].
     #[cfg(feature = "relay")]
     pub relay: Option<crate::relay::node::RelayNode>,
@@ -137,27 +148,7 @@ impl EngineInner {
         if let Some(p) = self.peers.get(&addr) {
             return (p.value().clone(), false);
         }
-        if self.peers.len() >= self.config.max_peers {
-            let evict_addr = self
-                .peers
-                .iter()
-                .min_by_key(|r| *r.value().last_seen.lock())
-                .map(|r| *r.key());
-            if let Some(evict) = evict_addr {
-                tracing::warn!(
-                    target: "zudp::engine",
-                    evicted = %evict,
-                    new = %addr,
-                    "peer table full — evicting least-recently-seen peer"
-                );
-                self.forget_peer(evict);
-                self.emit(PeerEvent::Disconnected {
-                    addr: evict,
-                    reason: DisconnectReason::Evicted,
-                });
-            }
-            self.dropped_peer_cap.fetch_add(1, Ordering::Relaxed);
-        }
+        self.make_room(addr);
         let mut created = false;
         let peer = self
             .peers
@@ -177,6 +168,9 @@ impl EngineInner {
     /// the session-id index all belong to one remote incarnation; reusing them across a
     /// restart makes the new incarnation's frames look stale.
     pub fn replace_peer(&self, addr: PeerAddr) -> Arc<PeerState> {
+        if !self.peers.contains_key(&addr) {
+            self.make_room(addr);
+        }
         let fresh = Arc::new(match self.peers.get(&addr) {
             Some(old) => PeerState::with_addr(old.addr_arc()),
             None => PeerState::new(addr),
@@ -185,6 +179,43 @@ impl EngineInner {
             self.unindex(&old);
         }
         fresh
+    }
+
+    /// Keep the peer table under `max_peers` before `new` is added: evict the least
+    /// recently seen peer when it is full.
+    fn make_room(&self, new: PeerAddr) {
+        if self.evict_lru(new, self.config.max_peers, |_| true) {
+            self.dropped_peer_cap.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// When at least `cap` peers match `pred`, evict the least recently seen of them to make
+    /// room for `new`.  Returns `true` when a peer was evicted.
+    pub fn evict_lru(&self, new: PeerAddr, cap: usize, pred: impl Fn(&PeerAddr) -> bool) -> bool {
+        if self.peers.iter().filter(|r| pred(r.key())).count() < cap.max(1) {
+            return false;
+        }
+        let Some(evict) = self
+            .peers
+            .iter()
+            .filter(|r| pred(r.key()) && *r.key() != new)
+            .min_by_key(|r| *r.value().last_seen.lock())
+            .map(|r| *r.key())
+        else {
+            return false;
+        };
+        tracing::warn!(
+            target: "zudp::engine",
+            evicted = %evict,
+            %new,
+            "peer cap reached — evicting least-recently-seen peer"
+        );
+        self.forget_peer(evict);
+        self.emit(PeerEvent::Disconnected {
+            addr: evict,
+            reason: DisconnectReason::Evicted,
+        });
+        true
     }
 
     /// Remove `addr` and every index entry pointing at it.  Returns the removed state.
@@ -204,8 +235,16 @@ impl EngineInner {
         }
         #[cfg(feature = "security")]
         {
-            if let Some(key) = old.remote_static_key() {
-                self.by_key.remove_if(&key, |_, p| Arc::ptr_eq(p, old));
+            if let Some(key) = old.remote_static_key()
+                && self
+                    .by_key
+                    .remove_if(&key, |_, p| Arc::ptr_eq(p, old))
+                    .is_some()
+            {
+                #[cfg(feature = "relay")]
+                if let Some(node) = &self.relay {
+                    node.forget_client(&key);
+                }
             }
             if let Some(direct) = old.direct_path() {
                 self.punched.remove_if(&direct, |_, p| Arc::ptr_eq(p, old));
@@ -734,12 +773,15 @@ async fn dispatch_frame(
 
         // Relay frames only mean something inside a session with a direct peer, where
         // `relay::open` consumed them; plaintext ones are noise.
+        // Path validation is handled where a relayed peer's direct frames are opened.
         #[cfg(feature = "security")]
         Frame::Via { .. }
         | Frame::ViaFrom { .. }
         | Frame::Unreachable { .. }
         | Frame::IntroRequest { .. }
-        | Frame::Intro { .. } => {}
+        | Frame::Intro { .. }
+        | Frame::PathChallenge { .. }
+        | Frame::PathResponse { .. } => {}
 
         // Handshake and Secure are handled before dispatch_frame is called.
         #[cfg(feature = "security")]
@@ -1102,7 +1144,10 @@ fn run_background(
     #[cfg(feature = "security")]
     crate::handshake::expire(inner);
     #[cfg(feature = "security")]
-    inner.hint_limiter.lock().tick_prune();
+    {
+        inner.hint_limiter.lock().tick_prune();
+        inner.relayed_hs_limiter.lock().tick_prune();
+    }
 }
 
 fn now_micros() -> u64 {
@@ -1143,6 +1188,9 @@ fn install_session(
 ) -> Arc<PeerState> {
     let had_session = inner.peers.get(&addr).is_some_and(|p| p.has_channel());
     let key = established.remote_static;
+    if !inner.peers.contains_key(&addr) {
+        limit_sessions(inner, addr);
+    }
     let peer = inner.replace_peer(addr);
     let local_index = established.channel.local_index();
     peer.set_channel(
@@ -1156,7 +1204,7 @@ fn install_session(
         (PeerAddr::Direct(_), Some(key)) => {
             inner.by_key.insert(key, peer.clone());
         }
-        (PeerAddr::Relayed { .. }, _) => crate::relay::request_intro(inner, &peer),
+        (PeerAddr::Relayed { .. }, _) => crate::relay::auto_punch(inner, &peer),
         (PeerAddr::Direct(_), None) => {}
     }
     peer.announce();
@@ -1167,6 +1215,38 @@ fn install_session(
     });
     tracing::info!(target: "zudp::engine", peer = %addr, initiator = established.initiator, "Noise XX handshake complete");
     peer
+}
+
+/// Bound what one source can make us hold before a new session at `addr` is installed:
+/// sessions through one relay may take at most half of `max_peers`, and a relay node keeps
+/// at most `max_sessions_per_ip` sessions per source network.  Over the bound, that
+/// source's least recently seen session makes room.
+#[cfg(feature = "security")]
+fn limit_sessions(inner: &EngineInner, addr: PeerAddr) {
+    match addr {
+        PeerAddr::Relayed { relay, .. } => {
+            let cap = inner.config.max_peers / 2;
+            inner.evict_lru(
+                addr,
+                cap,
+                |p| matches!(p, PeerAddr::Relayed { relay: r, .. } if *r == relay),
+            );
+        }
+        PeerAddr::Direct(direct) => {
+            #[cfg(not(feature = "relay"))]
+            let _ = direct;
+            #[cfg(feature = "relay")]
+            if let Some(node) = &inner.relay {
+                use crate::relay::node::network_of;
+                let network = network_of(direct.ip());
+                let same_network =
+                    |p: &PeerAddr| p.direct().is_some_and(|a| network_of(a.ip()) == network);
+                if inner.evict_lru(addr, node.max_sessions_per_ip(), same_network) {
+                    node.session_evicted();
+                }
+            }
+        }
+    }
 }
 
 /// A keepalive Ping for `peer`, encrypted when a session exists.
@@ -1367,13 +1447,15 @@ async fn open_secure(
     }
     let plain = decrypt(&peer, nonce, ciphertext)?;
     let newest = peer.advance_nonce(nonce);
-    if relayed {
-        crate::relay::on_direct(inner, &peer, from, newest);
-    } else if peer.addr() != from && newest {
-        migrate_peer(inner, &peer, PeerAddr::Direct(from), recv_states);
-    }
     peer.mark_seen();
     peer.mark_confirmed();
+    if relayed {
+        let (peer, frame) = inner_frame(peer, &plain)?;
+        return crate::relay::on_direct(inner, peer, from, newest, frame).await;
+    }
+    if peer.addr() != from && newest {
+        migrate_peer(inner, &peer, PeerAddr::Direct(from), recv_states);
+    }
     inner_frame(peer, &plain)
 }
 
