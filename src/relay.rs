@@ -51,6 +51,9 @@ const PUNCH_INTERVAL: Duration = Duration::from_millis(100);
 const INTRO_ACCEPT: Duration = Duration::from_secs(10);
 /// A path challenge to the same address is not repeated sooner than this.
 const CHALLENGE_RETRY: Duration = Duration::from_millis(250);
+/// How long a challenge token is honoured: answers on paths with a round trip up to this
+/// long still validate.
+const CHALLENGE_LIFETIME: Duration = Duration::from_secs(5);
 /// Relayed handshake initiations accepted per second from one relay.
 pub(crate) const RELAYED_HANDSHAKES_PER_SEC: f64 = 20.0;
 
@@ -441,7 +444,15 @@ pub(crate) async fn on_direct(
     }
     if peer.direct_path() == Some(from) {
         peer.touch_direct(from, false);
-    } else if newest && let Some(token) = peer.begin_challenge(from, CHALLENGE_RETRY) {
+    } else if let Frame::PathResponse { token } = frame {
+        // An answer settles its challenge; it never starts a new one.
+        if peer.answer_challenge(from, token) {
+            switch_direct(engine, &peer, from);
+        }
+        return None;
+    } else if newest
+        && let Some(token) = peer.begin_challenge(from, CHALLENGE_RETRY, CHALLENGE_LIFETIME)
+    {
         send_direct(engine, &peer, Frame::PathChallenge { token }, from).await;
     }
     match frame {
@@ -449,12 +460,7 @@ pub(crate) async fn on_direct(
             send_direct(engine, &peer, Frame::PathResponse { token }, from).await;
             None
         }
-        Frame::PathResponse { token } => {
-            if peer.answer_challenge(from, token) {
-                switch_direct(engine, &peer, from);
-            }
-            None
-        }
+        Frame::PathResponse { .. } => None,
         frame => Some((peer, frame)),
     }
 }

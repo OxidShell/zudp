@@ -25,23 +25,36 @@ pub struct RawSocket {
     blocked: Arc<Blocklist>,
 }
 
-/// Fault injection for tests: datagrams to or from these addresses are silently lost.
+/// A fault injected for one remote address (tests only).
+#[derive(Clone, Copy)]
+pub enum Fault {
+    /// Datagrams from it are lost, and to it unless `inbound_only`.
+    Lost { inbound_only: bool },
+    /// Datagrams to it leave this long late.
+    Delayed(std::time::Duration),
+}
+
+/// Fault injection for tests, per remote address.
 #[derive(Default)]
 struct Blocklist {
     /// Fast path: `false` while the map is empty, so normal traffic never takes the lock.
     any: AtomicBool,
-    /// Blocked address → whether only datagrams *from* it are lost.
-    addrs: RwLock<HashMap<SocketAddr, bool>>,
+    addrs: RwLock<HashMap<SocketAddr, Fault>>,
 }
 
 impl Blocklist {
+    fn fault(&self, addr: SocketAddr) -> Option<Fault> {
+        if !self.any.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.addrs.read().get(&addr).copied()
+    }
+
     fn drops(&self, addr: SocketAddr, outgoing: bool) -> bool {
-        self.any.load(Ordering::Relaxed)
-            && self
-                .addrs
-                .read()
-                .get(&addr)
-                .is_some_and(|&inbound_only| !(outgoing && inbound_only))
+        matches!(
+            self.fault(addr),
+            Some(Fault::Lost { inbound_only }) if !(outgoing && inbound_only)
+        )
     }
 }
 
@@ -81,19 +94,34 @@ impl RawSocket {
 
     /// Start or stop losing datagrams from `addr`, and to it unless `inbound_only`.
     pub fn set_blocked(&self, addr: SocketAddr, blocked: bool, inbound_only: bool) {
+        self.set_fault(addr, blocked.then_some(Fault::Lost { inbound_only }));
+    }
+
+    /// Inject `fault` for `addr`, or clear it.
+    pub fn set_fault(&self, addr: SocketAddr, fault: Option<Fault>) {
         let mut addrs = self.blocked.addrs.write();
-        if blocked {
-            addrs.insert(addr, inbound_only);
-        } else {
-            addrs.remove(&addr);
-        }
+        match fault {
+            Some(fault) => addrs.insert(addr, fault),
+            None => addrs.remove(&addr),
+        };
         self.blocked.any.store(!addrs.is_empty(), Ordering::Relaxed);
     }
 
     #[inline]
     pub async fn send_to(&self, data: &[u8], addr: SocketAddr) -> Result<(), crate::Error> {
-        if self.blocked.drops(addr, true) {
-            return Ok(());
+        match self.blocked.fault(addr) {
+            Some(Fault::Lost {
+                inbound_only: false,
+            }) => return Ok(()),
+            Some(Fault::Delayed(delay)) => {
+                let (sock, data) = (self.inner.clone(), data.to_vec());
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = sock.send_to(&data, addr).await;
+                });
+                return Ok(());
+            }
+            Some(Fault::Lost { inbound_only: true }) | None => {}
         }
         self.inner.send_to(data, addr).await?;
         Ok(())

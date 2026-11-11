@@ -88,9 +88,9 @@ pub struct PeerState {
     /// For a relayed peer: a punch campaign is running.
     #[cfg(feature = "security")]
     punching: AtomicBool,
-    /// For a relayed peer: the outstanding path challenge — address, token, when sent.
+    /// For a relayed peer: outstanding path challenges per candidate address.
     #[cfg(feature = "security")]
-    challenge: Mutex<Option<(SocketAddr, u64, Instant)>>,
+    challenges: Mutex<HashMap<SocketAddr, Challenge>>,
     /// Total bytes received from this peer (payload bytes, not wire bytes).
     pub rx_bytes: AtomicU64,
     /// Total bytes sent to this peer (payload bytes, not wire bytes).
@@ -150,7 +150,7 @@ impl PeerState {
             #[cfg(feature = "security")]
             punching: AtomicBool::new(false),
             #[cfg(feature = "security")]
-            challenge: Mutex::new(None),
+            challenges: Mutex::new(HashMap::new()),
             rx_bytes: AtomicU64::new(0),
             tx_bytes: AtomicU64::new(0),
             retransmit_count: AtomicU64::new(0),
@@ -421,25 +421,50 @@ impl PeerState {
         self.punching.store(false, Ordering::Release);
     }
 
-    /// A fresh challenge token for `addr`, or `None` when one went there within `retry`.
+    /// The challenge token to (re)send to the candidate address `addr`, or `None` when it
+    /// went there less than `retry` ago.  A token stays the same for `lifetime`, so an
+    /// answer that takes longer than `retry` (a long path) still matches; each candidate has
+    /// its own challenge, so one address cannot overwrite another's.  At most
+    /// [`MAX_PATH_CANDIDATES`] candidates are tracked; more are ignored until one expires.
     #[cfg(feature = "security")]
-    pub fn begin_challenge(&self, addr: SocketAddr, retry: Duration) -> Option<u64> {
-        let mut challenge = self.challenge.lock();
-        if challenge.is_some_and(|(a, _, sent)| a == addr && sent.elapsed() < retry) {
+    pub fn begin_challenge(
+        &self,
+        addr: SocketAddr,
+        retry: Duration,
+        lifetime: Duration,
+    ) -> Option<u64> {
+        let mut challenges = self.challenges.lock();
+        challenges.retain(|_, c| c.issued.elapsed() < lifetime);
+        if let Some(c) = challenges.get_mut(&addr) {
+            if c.sent.elapsed() < retry {
+                return None;
+            }
+            c.sent = Instant::now();
+            return Some(c.token);
+        }
+        if challenges.len() >= MAX_PATH_CANDIDATES {
             return None;
         }
+        let now = Instant::now();
         let token = random_u64();
-        *challenge = Some((addr, token, Instant::now()));
+        challenges.insert(
+            addr,
+            Challenge {
+                token,
+                issued: now,
+                sent: now,
+            },
+        );
         Some(token)
     }
 
-    /// `true` (and the challenge is settled) when `token` answers the challenge sent to
+    /// `true` (and every challenge is settled) when `token` answers the challenge sent to
     /// `addr`.
     #[cfg(feature = "security")]
     pub fn answer_challenge(&self, addr: SocketAddr, token: u64) -> bool {
-        let mut challenge = self.challenge.lock();
-        if challenge.is_some_and(|(a, t, _)| a == addr && t == token) {
-            *challenge = None;
+        let mut challenges = self.challenges.lock();
+        if challenges.get(&addr).is_some_and(|c| c.token == token) {
+            challenges.clear();
             return true;
         }
         false
@@ -483,6 +508,20 @@ impl PeerState {
     pub fn clear_finish_wire(&self) {
         self.finish_wire.lock().take();
     }
+}
+
+/// Candidate direct addresses of one relayed peer validated at the same time.
+#[cfg(feature = "security")]
+pub const MAX_PATH_CANDIDATES: usize = 4;
+
+/// An outstanding path challenge to one candidate address.
+#[cfg(feature = "security")]
+struct Challenge {
+    token: u64,
+    /// When the token was made; it is honoured for the challenge lifetime from here.
+    issued: Instant,
+    /// When it was last sent.
+    sent: Instant,
 }
 
 /// A random, non-cryptographic `u64` (session ids and session indices).
@@ -620,6 +659,40 @@ mod tests {
 
     fn drain(recv: &mut RecvState) -> usize {
         std::iter::from_fn(|| recv.pop_ready()).count()
+    }
+
+    #[cfg(feature = "security")]
+    #[test]
+    fn path_challenges_survive_slow_answers_and_other_candidates() {
+        let peer = PeerState::new(PeerAddr::Direct("127.0.0.1:1".parse().unwrap()));
+        let (x, y): (SocketAddr, SocketAddr) = (
+            "192.0.2.1:1".parse().unwrap(),
+            "192.0.2.2:1".parse().unwrap(),
+        );
+        let retry = Duration::from_millis(10);
+        let life = Duration::from_secs(5);
+        let token = peer.begin_challenge(x, retry, life).unwrap();
+        assert_eq!(
+            peer.begin_challenge(x, retry, life),
+            None,
+            "resent too soon"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            peer.begin_challenge(x, retry, life),
+            Some(token),
+            "token rotated"
+        );
+        assert!(peer.begin_challenge(y, retry, life).is_some());
+        assert!(
+            peer.answer_challenge(x, token),
+            "another candidate clobbered x"
+        );
+        for port in 0..10u16 {
+            let candidate = SocketAddr::new(x.ip(), 1000 + port);
+            let _ = peer.begin_challenge(candidate, retry, life);
+        }
+        assert!(peer.challenges.lock().len() <= MAX_PATH_CANDIDATES);
     }
 
     #[test]

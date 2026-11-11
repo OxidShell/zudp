@@ -15,7 +15,7 @@ use std::{
     collections::HashMap,
     fmt,
     hash::Hash,
-    net::{IpAddr, Ipv6Addr},
+    net::IpAddr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -28,14 +28,21 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::{PeerAddr, engine::EngineInner, frame::Frame, peer::PeerState};
 
-/// A relay route (pair of clients) unused for this long is forgotten.
-const ROUTE_IDLE: Duration = Duration::from_mins(1);
+pub(crate) use crate::rate::network_of;
+
 /// How long an introduction request waits for the other side's matching request.
 const INTRO_WINDOW: Duration = Duration::from_secs(10);
 /// Rate buckets are forgotten after this long without traffic.
 const CLIENT_IDLE: Duration = Duration::from_mins(1);
-/// Pending introduction requests one client may have at a time.
+/// Pending introduction requests one client may have at a time; a new one evicts its own
+/// oldest.
 const MAX_INTROS_PER_CLIENT: usize = 16;
+/// Pending introduction requests one source network may have; a new one evicts that
+/// network's oldest.
+const MAX_INTROS_PER_NETWORK: usize = 64;
+/// Pending introduction requests in total; beyond it new requests are refused (the client
+/// asks again in 30 s), so no network can push out another's.
+const MAX_PENDING_INTROS: usize = 4_096;
 
 /// Decides who may reach whom through a relay node.
 ///
@@ -94,22 +101,19 @@ pub struct RelayLimits {
     pub total_burst_bytes: f64,
     /// Largest inner frame relayed; bigger ones are dropped.
     pub max_inner: usize,
-    /// Client pairs tracked at once.  A new pair beyond it evicts the least recently used.
-    pub max_routes: usize,
-    /// Client pairs one client key takes part in; a new one evicts that client's oldest.
-    pub max_routes_per_client: usize,
-    /// Client pairs opened from one source network; a new one evicts that network's oldest.
-    pub max_routes_per_ip: usize,
-    /// Secure sessions from one source network; a new one evicts that network's least
-    /// recently seen session.
+    /// Secure sessions from one source network (IPv4 address or IPv6 /64); a new one
+    /// evicts that network's least recently seen session.
     pub max_sessions_per_ip: usize,
+    /// Secure sessions from one IPv6 /48; a new one evicts that prefix's least recently
+    /// seen session.  (IPv4 is accounted per address only.)
+    pub max_sessions_per_prefix: usize,
 }
 
 impl Default for RelayLimits {
     /// Per key 2 000 frames/s (burst 400) and 4 MB/s (burst 1 MB); per network 4 000
     /// frames/s (burst 800) and 8 MB/s (burst 2 MB); in total 50 000 frames/s (burst
-    /// 10 000) and 50 MB/s (burst 10 MB); 1 500 B inner frames; 4 096 routes, 64 per key,
-    /// 256 per network; 64 sessions per network.
+    /// 10 000) and 50 MB/s (burst 10 MB); 1 500 B inner frames; 64 sessions per network,
+    /// 256 per IPv6 /48.
     fn default() -> Self {
         Self {
             packets_per_sec: 2_000.0,
@@ -125,10 +129,8 @@ impl Default for RelayLimits {
             total_bytes_per_sec: 50_000_000.0,
             total_burst_bytes: 10_000_000.0,
             max_inner: crate::frame::RELAYED_INNER_MAX,
-            max_routes: 4_096,
-            max_routes_per_client: 64,
-            max_routes_per_ip: 256,
             max_sessions_per_ip: 64,
+            max_sessions_per_prefix: 256,
         }
     }
 }
@@ -191,19 +193,11 @@ impl RelayLimits {
         self
     }
 
-    /// Client pairs tracked at once, in total, per client key and per source network.
+    /// Secure sessions accepted from one source network and from one IPv6 /48.
     #[must_use]
-    pub fn max_routes(mut self, total: usize, per_client: usize, per_ip: usize) -> Self {
-        self.max_routes = total;
-        self.max_routes_per_client = per_client;
-        self.max_routes_per_ip = per_ip;
-        self
-    }
-
-    /// Secure sessions accepted from one source network.
-    #[must_use]
-    pub fn max_sessions_per_ip(mut self, sessions: usize) -> Self {
-        self.max_sessions_per_ip = sessions;
+    pub fn max_sessions_per_ip(mut self, per_network: usize, per_prefix: usize) -> Self {
+        self.max_sessions_per_ip = per_network;
+        self.max_sessions_per_prefix = per_prefix;
         self
     }
 }
@@ -227,24 +221,8 @@ pub(crate) struct RelayCounters {
     pub dropped_oversize: AtomicU64,
     pub unreachable: AtomicU64,
     pub denied: AtomicU64,
-    pub routes_evicted: AtomicU64,
     pub sessions_evicted: AtomicU64,
     pub introductions: AtomicU64,
-}
-
-/// The network a source address is accounted to: the IPv4 address itself, or the /64 of
-/// an IPv6 address (one subscriber usually holds a whole /64).
-pub(crate) fn network_of(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V4(_) => ip,
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None => {
-                let bits = u128::from(v6) & !u128::from(u64::MAX);
-                IpAddr::V6(Ipv6Addr::from(bits))
-            }
-        },
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -311,12 +289,6 @@ struct Budgets {
 /// Two client static keys.
 type KeyPair = ([u8; 32], [u8; 32]);
 
-struct Route {
-    used: Instant,
-    /// Source network of the client that opened the route.
-    network: IpAddr,
-}
-
 struct IntroRequest {
     asked: Instant,
     network: IpAddr,
@@ -328,8 +300,6 @@ pub(crate) struct RelayNode {
     policy: RwLock<Option<Arc<dyn RelayPolicy>>>,
     tap: RwLock<Option<RelayTap>>,
     budgets: Mutex<Budgets>,
-    /// Client pairs (smaller key first) that relayed recently.
-    routes: Mutex<HashMap<KeyPair, Route>>,
     /// Introduction requests `(from, to)` waiting for the matching `(to, from)`.
     intros: Mutex<HashMap<KeyPair, IntroRequest>>,
     pub counters: RelayCounters,
@@ -369,7 +339,6 @@ impl RelayNode {
             policy: RwLock::new(policy),
             tap: RwLock::new(None),
             budgets: Mutex::new(Budgets::default()),
-            routes: Mutex::new(HashMap::new()),
             intros: Mutex::new(HashMap::new()),
             counters: RelayCounters::default(),
         }
@@ -383,8 +352,12 @@ impl RelayNode {
         *self.tap.write() = tap;
     }
 
-    pub fn max_sessions_per_ip(&self) -> usize {
-        self.limits.max_sessions_per_ip
+    /// Session caps: per source network, per IPv6 /48.
+    pub fn session_caps(&self) -> (usize, usize) {
+        (
+            self.limits.max_sessions_per_ip,
+            self.limits.max_sessions_per_prefix,
+        )
     }
 
     /// Default-deny: without a policy nothing is relayed.
@@ -455,32 +428,6 @@ impl RelayNode {
             .filter(|p| p.has_channel() && engine.peers.contains_key(&p.addr()))
     }
 
-    /// Record a relayed exchange `from` → `to` opened from `network`.  A new pair beyond a
-    /// cap evicts the least recently used pair of the client, then of its network, then of
-    /// the node — never refusing, so a flood of throwaway pairs cannot lock others out.
-    fn route(&self, from: [u8; 32], to: [u8; 32], network: IpAddr) {
-        let pair = if from <= to { (from, to) } else { (to, from) };
-        let now = Instant::now();
-        let mut routes = self.routes.lock();
-        if let Some(route) = routes.get_mut(&pair) {
-            route.used = now;
-            return;
-        }
-        let l = &self.limits;
-        let used = |r: &Route| r.used;
-        let mut evicted = evict_lru(&mut routes, l.max_routes_per_client, used, |p, _| {
-            p.0 == from || p.1 == from
-        });
-        evicted |= evict_lru(&mut routes, l.max_routes_per_ip, used, |_, r| {
-            r.network == network
-        });
-        evicted |= evict_lru(&mut routes, l.max_routes, used, |_, _| true);
-        if evicted {
-            self.counters.routes_evicted.fetch_add(1, Ordering::Relaxed);
-        }
-        routes.insert(pair, Route { used: now, network });
-    }
-
     /// Relay `inner` from `client` to the client with key `to`.
     pub async fn forward(
         &self,
@@ -520,7 +467,6 @@ impl RelayNode {
             }
             return;
         };
-        self.route(from, to, network);
         let tap = self.tap.read().clone();
         let deliveries = match tap {
             Some(tap) => tap(&from, &to, &inner),
@@ -581,8 +527,9 @@ impl RelayNode {
     }
 
     /// Record that `from` asked to be introduced to `to`; `true` when `to` already asked for
-    /// `from` (both requests are consumed).  Unmatched requests are bounded per client, per
-    /// network and in total, each overflow evicting that scope's oldest request.
+    /// `from` (both requests are consumed).  Unmatched requests are bounded per client and
+    /// per network, each overflow evicting that scope's own oldest request, and in total,
+    /// where a new request is refused rather than pushing out someone else's.
     fn match_intro(&self, from: [u8; 32], to: [u8; 32], network: IpAddr) -> bool {
         let mut intros = self.intros.lock();
         if intros
@@ -595,10 +542,12 @@ impl RelayNode {
         evict_lru(&mut intros, MAX_INTROS_PER_CLIENT, asked, |k, _| {
             k.0 == from
         });
-        evict_lru(&mut intros, self.limits.max_routes_per_ip, asked, |_, i| {
+        evict_lru(&mut intros, MAX_INTROS_PER_NETWORK, asked, |_, i| {
             i.network == network
         });
-        evict_lru(&mut intros, self.limits.max_routes, asked, |_, _| true);
+        if intros.len() >= MAX_PENDING_INTROS {
+            return false;
+        }
         intros.insert(
             (from, to),
             IntroRequest {
@@ -609,24 +558,20 @@ impl RelayNode {
         false
     }
 
-    /// The session of the client with `key` ended: release its routes and introductions.
+    /// The session of the client with `key` ended: release its introduction requests.
     pub fn forget_client(&self, key: &[u8; 32]) {
-        self.routes.lock().retain(|(a, b), _| a != key && b != key);
         self.intros.lock().retain(|(a, b), _| a != key && b != key);
     }
 
-    /// Count one session evicted to keep a network under `max_sessions_per_ip`.
+    /// Count one session evicted to keep a source within its session caps.
     pub fn session_evicted(&self) {
         self.counters
             .sessions_evicted
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Forget idle routes, stale introduction requests and idle rate state.
+    /// Forget stale introduction requests and idle rate state.
     pub fn prune(&self) {
-        self.routes
-            .lock()
-            .retain(|_, r| r.used.elapsed() < ROUTE_IDLE);
         self.intros
             .lock()
             .retain(|_, i| i.asked.elapsed() < INTRO_WINDOW);
@@ -636,59 +581,11 @@ impl RelayNode {
         b.networks
             .retain(|_, c| c.packets.last.elapsed() < CLIENT_IDLE);
     }
-
-    #[cfg(test)]
-    fn routes(&self) -> usize {
-        self.routes.lock().len()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ipv6_networks_are_per_64() {
-        let a: IpAddr = "2001:db8:1:2:aaaa::1".parse().unwrap();
-        let b: IpAddr = "2001:db8:1:2:bbbb::2".parse().unwrap();
-        let c: IpAddr = "2001:db8:1:3::1".parse().unwrap();
-        assert_eq!(network_of(a), network_of(b));
-        assert_ne!(network_of(a), network_of(c));
-        let mapped: IpAddr = "::ffff:198.51.100.7".parse().unwrap();
-        assert_eq!(
-            network_of(mapped),
-            "198.51.100.7".parse::<IpAddr>().unwrap()
-        );
-    }
-
-    #[test]
-    fn route_floods_only_evict_their_own() {
-        let node = RelayNode::new(RelayLimits::default().max_routes(8, 4, 6), None);
-        let legit: IpAddr = "198.51.100.1".parse().unwrap();
-        let attacker: IpAddr = "203.0.113.1".parse().unwrap();
-        node.route([1; 32], [2; 32], legit);
-        for i in 0..100u8 {
-            node.route([200; 32], [i; 32], attacker);
-            node.route([100 + (i % 50); 32], [255; 32], attacker);
-        }
-        let routes = node.routes.lock();
-        assert!(
-            routes.contains_key(&([1; 32], [2; 32])),
-            "legit route evicted"
-        );
-        assert!(routes.len() <= 8);
-        assert!(routes.values().filter(|r| r.network == attacker).count() <= 6);
-        assert!(
-            routes
-                .keys()
-                .filter(|(a, b)| *a == [200; 32] || *b == [200; 32])
-                .count()
-                <= 4
-        );
-        drop(routes);
-        node.forget_client(&[1; 32]);
-        assert!(node.routes() <= 6, "routes of a gone client were kept");
-    }
 
     #[test]
     fn pending_introductions_are_capped_per_client() {
@@ -711,6 +608,40 @@ mod tests {
         assert!(
             node.match_intro([1; 32], [9; 32], other),
             "a flood by one client displaced another client's request"
+        );
+    }
+
+    #[test]
+    fn pending_introductions_never_push_out_other_networks() {
+        let node = RelayNode::new(RelayLimits::default(), None);
+        let legit: IpAddr = "198.51.100.1".parse().unwrap();
+        assert!(!node.match_intro([9; 32], [1; 32], legit));
+        // Many clients in one network only displace each other.
+        let attacker: IpAddr = "203.0.113.1".parse().unwrap();
+        for i in 0..=255u8 {
+            node.match_intro([i; 32], [200; 32], attacker);
+        }
+        assert_eq!(
+            node.intros
+                .lock()
+                .values()
+                .filter(|i| i.network == attacker)
+                .count(),
+            MAX_INTROS_PER_NETWORK
+        );
+        // Filling the whole table from many networks refuses newcomers instead of evicting.
+        for i in 0..MAX_PENDING_INTROS {
+            let bytes = u32::try_from(i).unwrap().to_be_bytes();
+            let net = IpAddr::from([10, bytes[1], bytes[2], bytes[3]]);
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&bytes);
+            key[4] = 0xee;
+            node.match_intro(key, [201; 32], net);
+        }
+        assert!(node.intros.lock().len() <= MAX_PENDING_INTROS);
+        assert!(
+            node.match_intro([1; 32], [9; 32], "192.0.2.1".parse().unwrap()),
+            "a full table evicted another network's request"
         );
     }
 

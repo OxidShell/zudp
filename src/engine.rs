@@ -22,6 +22,11 @@ use crate::{
     socket::{self, RawSocket},
 };
 
+/// Most `SessionUnknown` budgets tracked at once (relayed peers' keys are chosen by the
+/// relay, so the map must not grow with them).
+#[cfg(feature = "security")]
+pub(crate) const MAX_HINT_KEYS: usize = 4_096;
+
 /// Maximum concurrent NACK retransmit tasks across the engine.
 ///
 /// Each task handles one NACK batch (one peer, one burst of missing seqs).  Capping
@@ -414,7 +419,14 @@ async fn run(
                             .get(&PeerAddr::Direct(from))
                             .is_some_and(|p| p.has_channel())
                             || is_punched(&inner, from);
-                        if inner.config.max_pps_per_ip > 0.0 && !trusted && !limiter.allow(from.ip()) {
+                        // Handshakes are budgeted per network (an IPv6 /64), so rotating
+                        // addresses inside one allocation buys nothing.
+                        let key = if is_handshake(&data) {
+                            crate::rate::network_of(from.ip())
+                        } else {
+                            from.ip()
+                        };
+                        if inner.config.max_pps_per_ip > 0.0 && !trusted && !limiter.allow(key) {
                             tracing::trace!(target: "zudp::engine", %from, "rate limited");
                             inner.dropped_rate_limited.fetch_add(1, Ordering::Relaxed);
                             continue;
@@ -1264,8 +1276,10 @@ fn install_session(
 
 /// Bound what one source can make us hold before a new session at `addr` is installed:
 /// sessions through one relay may take at most half of `max_peers`, and a relay node keeps
-/// at most `max_sessions_per_ip` sessions per source network.  Over the bound, that
-/// source's least recently seen session makes room.
+/// at most `max_sessions_per_ip` sessions per source network and `max_sessions_per_prefix`
+/// per IPv6 /48.  Over a bound, that source's least recently seen session makes room.  A
+/// relay node whose table is full makes room in its heaviest prefix, never at the expense
+/// of a lighter one, so a flood from one allocation only ever displaces itself.
 #[cfg(feature = "security")]
 fn limit_sessions(inner: &EngineInner, addr: PeerAddr) {
     match addr {
@@ -1282,16 +1296,51 @@ fn limit_sessions(inner: &EngineInner, addr: PeerAddr) {
             let _ = direct;
             #[cfg(feature = "relay")]
             if let Some(node) = &inner.relay {
-                use crate::relay::node::network_of;
+                use crate::rate::{network_of, prefix_of};
+                let (per_network, per_prefix) = node.session_caps();
                 let network = network_of(direct.ip());
-                let same_network =
+                let prefix = prefix_of(direct.ip());
+                let in_network =
                     |p: &PeerAddr| p.direct().is_some_and(|a| network_of(a.ip()) == network);
-                if inner.evict_lru(addr, node.max_sessions_per_ip(), same_network) {
+                let in_prefix =
+                    |p: &PeerAddr| p.direct().is_some_and(|a| prefix_of(a.ip()) == prefix);
+                let mut evicted = inner.evict_lru(addr, per_network, in_network);
+                evicted |= inner.evict_lru(addr, per_prefix, in_prefix);
+                if inner.peers.len() >= inner.config.max_peers {
+                    let heaviest = heaviest_prefix(
+                        inner.peers.iter().filter_map(|r| r.key().direct()),
+                        prefix,
+                    );
+                    let in_heaviest =
+                        |p: &PeerAddr| p.direct().is_some_and(|a| prefix_of(a.ip()) == heaviest);
+                    evicted |= inner.evict_lru(addr, 1, in_heaviest);
+                }
+                if evicted {
                     node.session_evicted();
                 }
             }
         }
     }
+}
+
+/// The prefix ([`crate::rate::prefix_of`]) holding the most of `sessions`; `newcomer`'s
+/// prefix wins a tie, so a full table makes a prefix that is as heavy as any other pay for
+/// its own growth.
+#[cfg(feature = "relay")]
+fn heaviest_prefix(
+    sessions: impl Iterator<Item = SocketAddr>,
+    newcomer: std::net::IpAddr,
+) -> std::net::IpAddr {
+    let mut counts: HashMap<std::net::IpAddr, usize> = HashMap::new();
+    for addr in sessions {
+        *counts.entry(crate::rate::prefix_of(addr.ip())).or_default() += 1;
+    }
+    let own = counts.get(&newcomer).copied().unwrap_or(0);
+    counts
+        .into_iter()
+        .filter(|&(_, n)| n > own)
+        .max_by_key(|&(_, n)| n)
+        .map_or(newcomer, |(prefix, _)| prefix)
 }
 
 /// A keepalive Ping for `peer`, encrypted when a session exists.
@@ -1547,14 +1596,22 @@ fn is_punched(inner: &EngineInner, addr: SocketAddr) -> bool {
 
 #[cfg(feature = "security")]
 pub(crate) async fn send_session_unknown(inner: &Arc<EngineInner>, to: PeerAddr, index: u64) {
-    // Per source IP for direct peers; per peer for relayed ones, so every peer behind one
-    // relay gets its own budget.
-    let budget = match to {
-        PeerAddr::Direct(addr) => PeerAddr::Direct(SocketAddr::new(addr.ip(), 0)),
-        relayed @ PeerAddr::Relayed { .. } => relayed,
-    };
-    if !inner.hint_limiter.lock().allow(budget) {
-        return;
+    // Per source IP for direct peers.  Relayed peers get their own budget each, so peers
+    // behind one relay do not starve each other, under an aggregate per relay, because the
+    // relay chooses the keys.  Port 0 / 1 keep the direct and the aggregate keys apart.
+    {
+        let mut limiter = inner.hint_limiter.lock();
+        let allowed = match to {
+            PeerAddr::Direct(addr) => {
+                limiter.allow(PeerAddr::Direct(SocketAddr::new(addr.ip(), 0)))
+            }
+            PeerAddr::Relayed { relay, .. } => {
+                limiter.allow(PeerAddr::Direct(SocketAddr::new(relay.ip(), 1))) && limiter.allow(to)
+            }
+        };
+        if !allowed {
+            return;
+        }
     }
     tracing::debug!(target: "zudp::engine", peer = %to, index, "secure frame for an unknown session");
     let wire = Frame::SessionUnknown { index }.encode();
@@ -1566,16 +1623,17 @@ pub(crate) async fn send_session_unknown(inner: &Arc<EngineInner>, to: PeerAddr,
 /// session stays until a new one replaces it.
 #[cfg(feature = "security")]
 pub(crate) fn on_session_unknown(inner: &Arc<EngineInner>, from: PeerAddr, index: u64) {
-    let peer = inner
-        .peers
-        .get(&from)
-        .map(|r| r.value().clone())
-        .or_else(|| {
-            // A relayed peer we punched through answers from its direct address.
-            let addr = from.direct()?;
-            inner.punched.get(&addr).map(|r| r.value().clone())
-        });
-    let Some(peer) = peer else {
+    // The session at `from` itself, or a relayed peer we punched through that answers from
+    // the same address — both can exist at once; the index tells which one was lost.
+    let direct = inner.peers.get(&from).map(|r| r.value().clone());
+    let punched = from
+        .direct()
+        .and_then(|addr| inner.punched.get(&addr).map(|r| r.value().clone()));
+    let Some(peer) = [direct, punched]
+        .into_iter()
+        .flatten()
+        .find(|p| p.remote_index() == Some(index))
+    else {
         return;
     };
     let from = peer.addr();

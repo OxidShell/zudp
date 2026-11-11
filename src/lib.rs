@@ -229,9 +229,8 @@ pub struct EngineStats {
     pub relay_unreachable: u64,
     /// Relay node: of those, the ones the policy denied.
     pub relay_denied: u64,
-    /// Relay node: routes (client pairs) evicted to stay within the route caps.
-    pub relay_routes_evicted: u64,
-    /// Relay node: sessions evicted to keep a source network within its session cap.
+    /// Relay node: sessions evicted to keep a source network or prefix within its session
+    /// caps, or to make room in a full table at the expense of its heaviest prefix.
     pub relay_sessions_evicted: u64,
     /// Relay node: client pairs introduced to each other for hole punching.
     pub relay_introductions: u64,
@@ -704,7 +703,9 @@ impl Inner {
             #[cfg(feature = "security")]
             by_index: DashMap::new(),
             #[cfg(feature = "security")]
-            hint_limiter: parking_lot::Mutex::new(rate::RateLimiter::<PeerAddr>::new(5.0, 5.0)),
+            hint_limiter: parking_lot::Mutex::new(
+                rate::RateLimiter::<PeerAddr>::new(5.0, 5.0).capped(engine::MAX_HINT_KEYS),
+            ),
             #[cfg(feature = "security")]
             by_key: DashMap::new(),
             #[cfg(feature = "security")]
@@ -1006,7 +1007,6 @@ fn relay_stats(engine: &EngineInner) -> EngineStats {
             relay_dropped_oversize: c.dropped_oversize.load(Ordering::Relaxed),
             relay_unreachable: c.unreachable.load(Ordering::Relaxed),
             relay_denied: c.denied.load(Ordering::Relaxed),
-            relay_routes_evicted: c.routes_evicted.load(Ordering::Relaxed),
             relay_sessions_evicted: c.sessions_evicted.load(Ordering::Relaxed),
             relay_introductions: c.introductions.load(Ordering::Relaxed),
             ..EngineStats::default()
@@ -1226,6 +1226,16 @@ impl<M> ZudpSocket<M> {
             .engine
             .get_socket()
             .set_blocked(addr, blocked, false);
+    }
+
+    /// Test hook: delay every datagram sent to `addr` by `delay` (`None` stops it), as if
+    /// the path to it were long.  Not part of the stable API.
+    #[doc(hidden)]
+    pub fn debug_delay_to(&self, addr: SocketAddr, delay: Option<Duration>) {
+        self.inner
+            .engine
+            .get_socket()
+            .set_fault(addr, delay.map(socket::Fault::Delayed));
     }
 
     /// Test hook: like [`debug_block_addr`](Self::debug_block_addr) for datagrams *from*
