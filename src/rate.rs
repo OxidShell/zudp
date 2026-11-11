@@ -22,6 +22,31 @@ pub(crate) fn prefix_of(ip: IpAddr) -> IpAddr {
     masked(ip, 48)
 }
 
+/// The prefixes a full table makes room in when `newcomer`'s prefix wants a slot, given
+/// the prefix of every entry: `newcomer`'s own when it is at least as heavy as any other
+/// (it pays for its own growth), otherwise every prefix tied for the most entries — the
+/// caller then evicts the least recently used entry among them, so ties never fall on a
+/// long-lived entry at random.
+#[cfg(any(feature = "relay", test))]
+pub(crate) fn heaviest_prefixes(
+    entries: impl Iterator<Item = IpAddr>,
+    newcomer: IpAddr,
+) -> Vec<IpAddr> {
+    let mut counts: HashMap<IpAddr, usize> = HashMap::new();
+    for prefix in entries {
+        *counts.entry(prefix).or_default() += 1;
+    }
+    let max = counts.values().copied().max().unwrap_or(0);
+    if counts.get(&newcomer).copied().unwrap_or(0) >= max {
+        return vec![newcomer];
+    }
+    counts
+        .into_iter()
+        .filter(|&(_, n)| n == max)
+        .map(|(prefix, _)| prefix)
+        .collect()
+}
+
 fn masked(ip: IpAddr, bits: u32) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
@@ -42,7 +67,7 @@ pub(crate) struct RateLimiter<K = IpAddr> {
     buckets: HashMap<K, (Instant, f64)>,
     max_pps: f64,
     burst: f64,
-    /// Most keys tracked; a new key beyond it is refused until idle ones are pruned.
+    /// Most keys tracked; a new key beyond it replaces the least recently used one.
     max_keys: usize,
     /// Monotonic tick counter; prune runs every `PRUNE_INTERVAL_TICKS` ticks.
     ticks: u32,
@@ -54,7 +79,7 @@ pub(crate) struct RateLimiter<K = IpAddr> {
 /// 48 ticks ≈ 60 s — matches the idle-bucket threshold.
 const PRUNE_INTERVAL_TICKS: u32 = 48;
 
-impl<K: Hash + Eq> RateLimiter<K> {
+impl<K: Hash + Eq + Clone> RateLimiter<K> {
     pub(crate) fn new(max_pps: f64, burst: f64) -> Self {
         Self {
             buckets: HashMap::new(),
@@ -75,8 +100,17 @@ impl<K: Hash + Eq> RateLimiter<K> {
     /// Returns `true` if the packet from `key` is allowed, `false` if throttled.
     pub(crate) fn allow(&mut self, key: K) -> bool {
         let now = Instant::now();
-        if self.buckets.len() >= self.max_keys && !self.buckets.contains_key(&key) {
-            return false;
+        if self.buckets.len() >= self.max_keys
+            && !self.buckets.contains_key(&key)
+            && let Some(oldest) = self
+                .buckets
+                .iter()
+                .min_by_key(|(_, (last, _))| *last)
+                .map(|(k, _)| k.clone())
+        {
+            // A forgotten key restarts with a full bucket: being evicted only ever makes a
+            // source more welcome, so filling the map cannot lock anyone out.
+            self.buckets.remove(&oldest);
         }
         let (last, tokens) = self.buckets.entry(key).or_insert((now, self.burst));
         let elapsed = now.duration_since(*last).as_secs_f64();
@@ -123,11 +157,34 @@ mod tests {
     }
 
     #[test]
-    fn a_capped_limiter_refuses_new_keys_when_full() {
-        let mut limiter = RateLimiter::<u32>::new(1.0, 1.0).capped(2);
+    fn a_full_capped_limiter_forgets_its_oldest_key() {
+        let mut limiter = RateLimiter::<u32>::new(0.0, 1.0).capped(2);
         assert!(limiter.allow(1));
         assert!(limiter.allow(2));
-        assert!(!limiter.allow(3), "a third key");
-        assert!(!limiter.allow(1), "known keys keep their own budget");
+        assert!(!limiter.allow(2), "known keys keep their own budget");
+        assert!(
+            limiter.allow(3),
+            "a new key is never locked out by a full map"
+        );
+        assert_eq!(limiter.buckets.len(), 2);
+        assert!(
+            !limiter.buckets.contains_key(&1),
+            "the oldest key made room"
+        );
+    }
+
+    #[test]
+    fn heaviest_prefixes_break_ties_together() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let (a, b, c) = (ip("192.0.2.1"), ip("192.0.2.2"), ip("192.0.2.3"));
+        assert_eq!(heaviest_prefixes([a, a, b].into_iter(), c), vec![a]);
+        assert_eq!(
+            heaviest_prefixes([a, a, b].into_iter(), a),
+            vec![a],
+            "pays itself"
+        );
+        let mut tied = heaviest_prefixes([a, a, b, b, c].into_iter(), c);
+        tied.sort();
+        assert_eq!(tied, vec![a, b]);
     }
 }

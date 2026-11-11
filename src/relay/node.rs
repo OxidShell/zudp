@@ -40,8 +40,11 @@ const MAX_INTROS_PER_CLIENT: usize = 16;
 /// Pending introduction requests one source network may have; a new one evicts that
 /// network's oldest.
 const MAX_INTROS_PER_NETWORK: usize = 64;
-/// Pending introduction requests in total; beyond it new requests are refused (the client
-/// asks again in 30 s), so no network can push out another's.
+/// Pending introduction requests one IPv6 /48 (or IPv4 address) may have; a new one
+/// evicts that prefix's oldest.
+const MAX_INTROS_PER_PREFIX: usize = 256;
+/// Pending introduction requests in total; when full, a new request makes room in the
+/// heaviest prefix (see [`crate::rate::heaviest_prefixes`]).
 const MAX_PENDING_INTROS: usize = 4_096;
 
 /// Decides who may reach whom through a relay node.
@@ -292,6 +295,8 @@ type KeyPair = ([u8; 32], [u8; 32]);
 struct IntroRequest {
     asked: Instant,
     network: IpAddr,
+    /// IPv6 /48 (or IPv4 address) of the asking client.
+    prefix: IpAddr,
 }
 
 /// State of a socket built with [`Zudp::relay_node`](crate::Zudp::relay_node).
@@ -538,6 +543,12 @@ impl RelayNode {
         {
             return true;
         }
+        if let Some(pending) = intros.get_mut(&(from, to)) {
+            // Asking again only refreshes the request; it never needs a new slot.
+            pending.asked = Instant::now();
+            return false;
+        }
+        let prefix = crate::rate::prefix_of(network);
         let asked = |i: &IntroRequest| i.asked;
         evict_lru(&mut intros, MAX_INTROS_PER_CLIENT, asked, |k, _| {
             k.0 == from
@@ -545,14 +556,20 @@ impl RelayNode {
         evict_lru(&mut intros, MAX_INTROS_PER_NETWORK, asked, |_, i| {
             i.network == network
         });
+        evict_lru(&mut intros, MAX_INTROS_PER_PREFIX, asked, |_, i| {
+            i.prefix == prefix
+        });
         if intros.len() >= MAX_PENDING_INTROS {
-            return false;
+            let heaviest =
+                crate::rate::heaviest_prefixes(intros.values().map(|i| i.prefix), prefix);
+            evict_lru(&mut intros, 1, asked, |_, i| heaviest.contains(&i.prefix));
         }
         intros.insert(
             (from, to),
             IntroRequest {
                 asked: Instant::now(),
                 network,
+                prefix,
             },
         );
         false
@@ -629,19 +646,56 @@ mod tests {
                 .count(),
             MAX_INTROS_PER_NETWORK
         );
-        // Filling the whole table from many networks refuses newcomers instead of evicting.
-        for i in 0..MAX_PENDING_INTROS {
-            let bytes = u32::try_from(i).unwrap().to_be_bytes();
-            let net = IpAddr::from([10, bytes[1], bytes[2], bytes[3]]);
+        // One /48 cycling through many /64s and keys stays within its prefix cap...
+        for i in 0..4_096u16 {
+            let net = IpAddr::from([0x2001, 0xdb8, 1, i, 0, 0, 0, 1]);
             let mut key = [0u8; 32];
-            key[..4].copy_from_slice(&bytes);
-            key[4] = 0xee;
+            key[..2].copy_from_slice(&i.to_be_bytes());
+            key[2] = 0xee;
             node.match_intro(key, [201; 32], net);
         }
-        assert!(node.intros.lock().len() <= MAX_PENDING_INTROS);
+        let in_prefix = node
+            .intros
+            .lock()
+            .values()
+            .filter(|i| i.prefix == crate::rate::prefix_of("2001:db8:1::1".parse().unwrap()))
+            .count();
+        assert!(in_prefix <= MAX_INTROS_PER_PREFIX, "{in_prefix}");
+        // ...so other requests survive, and new ones and repeats still get in.
+        assert!(!node.match_intro([2; 32], [3; 32], "192.0.2.2".parse().unwrap()));
+        assert!(!node.match_intro([2; 32], [3; 32], "192.0.2.2".parse().unwrap()));
+        assert!(node.match_intro([3; 32], [2; 32], "192.0.2.3".parse().unwrap()));
         assert!(
             node.match_intro([1; 32], [9; 32], "192.0.2.1".parse().unwrap()),
-            "a full table evicted another network's request"
+            "another prefix's request was pushed out"
+        );
+    }
+
+    #[test]
+    fn a_full_intro_table_makes_room_in_the_heaviest_prefix() {
+        let node = RelayNode::new(RelayLimits::default(), None);
+        let legit: IpAddr = "198.51.100.1".parse().unwrap();
+        assert!(!node.match_intro([9; 32], [1; 32], legit));
+        // Fill the table from 16 /48s at their per-prefix cap.
+        for p in 0..16u16 {
+            for i in 0..MAX_INTROS_PER_PREFIX {
+                let i = u16::try_from(i).unwrap();
+                let net = IpAddr::from([0x2001, p, 0, i, 0, 0, 0, 1]);
+                let mut key = [0u8; 32];
+                key[..2].copy_from_slice(&p.to_be_bytes());
+                key[2..4].copy_from_slice(&i.to_be_bytes());
+                node.match_intro(key, [201; 32], net);
+            }
+        }
+        assert!(node.intros.lock().len() <= MAX_PENDING_INTROS);
+        assert!(!node.match_intro([4; 32], [5; 32], "192.0.2.4".parse().unwrap()));
+        assert!(
+            node.intros.lock().contains_key(&([4; 32], [5; 32])),
+            "a newcomer was refused by a full table"
+        );
+        assert!(
+            node.match_intro([1; 32], [9; 32], "192.0.2.1".parse().unwrap()),
+            "a light prefix paid for the heavy ones"
         );
     }
 

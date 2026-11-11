@@ -1307,12 +1307,18 @@ fn limit_sessions(inner: &EngineInner, addr: PeerAddr) {
                 let mut evicted = inner.evict_lru(addr, per_network, in_network);
                 evicted |= inner.evict_lru(addr, per_prefix, in_prefix);
                 if inner.peers.len() >= inner.config.max_peers {
-                    let heaviest = heaviest_prefix(
-                        inner.peers.iter().filter_map(|r| r.key().direct()),
+                    let heaviest = crate::rate::heaviest_prefixes(
+                        inner
+                            .peers
+                            .iter()
+                            .filter_map(|r| r.key().direct())
+                            .map(|a| prefix_of(a.ip())),
                         prefix,
                     );
-                    let in_heaviest =
-                        |p: &PeerAddr| p.direct().is_some_and(|a| prefix_of(a.ip()) == heaviest);
+                    let in_heaviest = |p: &PeerAddr| {
+                        p.direct()
+                            .is_some_and(|a| heaviest.contains(&prefix_of(a.ip())))
+                    };
                     evicted |= inner.evict_lru(addr, 1, in_heaviest);
                 }
                 if evicted {
@@ -1321,26 +1327,6 @@ fn limit_sessions(inner: &EngineInner, addr: PeerAddr) {
             }
         }
     }
-}
-
-/// The prefix ([`crate::rate::prefix_of`]) holding the most of `sessions`; `newcomer`'s
-/// prefix wins a tie, so a full table makes a prefix that is as heavy as any other pay for
-/// its own growth.
-#[cfg(feature = "relay")]
-fn heaviest_prefix(
-    sessions: impl Iterator<Item = SocketAddr>,
-    newcomer: std::net::IpAddr,
-) -> std::net::IpAddr {
-    let mut counts: HashMap<std::net::IpAddr, usize> = HashMap::new();
-    for addr in sessions {
-        *counts.entry(crate::rate::prefix_of(addr.ip())).or_default() += 1;
-    }
-    let own = counts.get(&newcomer).copied().unwrap_or(0);
-    counts
-        .into_iter()
-        .filter(|&(_, n)| n > own)
-        .max_by_key(|&(_, n)| n)
-        .map_or(newcomer, |(prefix, _)| prefix)
 }
 
 /// A keepalive Ping for `peer`, encrypted when a session exists.
@@ -1596,15 +1582,16 @@ fn is_punched(inner: &EngineInner, addr: SocketAddr) -> bool {
 
 #[cfg(feature = "security")]
 pub(crate) async fn send_session_unknown(inner: &Arc<EngineInner>, to: PeerAddr, index: u64) {
-    // Per source IP for direct peers.  Relayed peers get their own budget each, so peers
+    // Per source network (an IPv6 /64) for direct peers.  Relayed peers get their own budget each, so peers
     // behind one relay do not starve each other, under an aggregate per relay, because the
     // relay chooses the keys.  Port 0 / 1 keep the direct and the aggregate keys apart.
     {
         let mut limiter = inner.hint_limiter.lock();
         let allowed = match to {
-            PeerAddr::Direct(addr) => {
-                limiter.allow(PeerAddr::Direct(SocketAddr::new(addr.ip(), 0)))
-            }
+            PeerAddr::Direct(addr) => limiter.allow(PeerAddr::Direct(SocketAddr::new(
+                crate::rate::network_of(addr.ip()),
+                0,
+            ))),
             PeerAddr::Relayed { relay, .. } => {
                 limiter.allow(PeerAddr::Direct(SocketAddr::new(relay.ip(), 1))) && limiter.allow(to)
             }
