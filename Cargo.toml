@@ -13,7 +13,9 @@ keywords = ["udp", "networking", "gamedev", "relay", "protocol"]
 categories = ["network-programming", "game-development", "asynchronous"]
 
 [features]
-default = ["wincode"]
+# No message codec by default: pick one below, implement `Encode` and
+# `Decode` by hand, or send `RawBytes`.
+default = []
 # Wire codec for message types: bincode 2 `standard()` layout (varint
 # integers, little endian), no serde.
 wincode = ["dep:wincode"]
@@ -43,6 +45,9 @@ dashmap = "6"
 windows-sys = { version = "0.60", features = ["Win32_Networking_WinSock", "Win32_System_IO"] }
 
 [dev-dependencies]
+# No codec is on by default: tests, examples, benches and doc tests use
+# wincode. A path-only dev-dependency is dropped on publish.
+zudp = { path = ".", features = ["wincode"] }
 snow = "0.9"
 anyhow = "1"
 tracing-subscriber = "0.3"

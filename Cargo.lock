@@ -1755,4 +1755,5 @@ dependencies = [
  "tracing-subscriber",
  "wincode",
  "windows-sys 0.60.2",
+ "zudp",
 ]
