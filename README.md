@@ -5,10 +5,11 @@ Minimal UDP protocol for real-time applications. NACK-based reliability, automat
 ## Quick start
 
 ```rust
-use zudp::rkyv::{Archive, Deserialize, Serialize};
+use zudp::wincode::{SchemaRead, SchemaWrite};
 use zudp::Zudp;
 
-#[derive(Archive, Serialize, Deserialize)]
+#[derive(SchemaWrite, SchemaRead)]
+#[wincode(crate = "zudp::wincode")]
 enum Msg { Ping, Pong }
 
 // listener — accepts any peer

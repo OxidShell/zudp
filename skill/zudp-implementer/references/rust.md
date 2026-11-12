@@ -10,12 +10,13 @@ implementing the wire protocol; that is in `SKILL.md` and `PROTOCOL.md`.
 
 ```toml
 [dependencies]
-zudp = "0.3"                                                        # rkyv codec (default)
-zudp = { version = "0.3", features = ["security"] }                 # + Noise XX encryption
-zudp = { version = "0.3", features = ["discovery"] }                # + LAN peer discovery
-zudp = { version = "0.3", features = ["security", "discovery"] }    # both
-zudp = { version = "0.3", default-features = false, features = ["serde"] }   # postcard codec
-zudp = { version = "0.3", default-features = false, features = ["bitcode"] } # bitcode codec
+zudp = "0.5"                                                        # wincode codec (default)
+zudp = { version = "0.5", features = ["security"] }                 # + Noise XX encryption
+zudp = { version = "0.5", features = ["discovery"] }                # + LAN peer discovery
+zudp = { version = "0.5", features = ["security", "discovery"] }    # both
+zudp = { version = "0.5", default-features = false, features = ["serde"] }   # postcard codec
+zudp = { version = "0.5", default-features = false, features = ["bitcode"] } # bitcode codec
+zudp = { version = "0.5", default-features = false, features = ["rkyv"] }    # rkyv codec
 ```
 
 ---
@@ -23,12 +24,14 @@ zudp = { version = "0.3", default-features = false, features = ["bitcode"] } # b
 ## Message types
 
 Every message type must implement `zudp::Encode` + `zudp::Decode`.
-With the default `rkyv` feature, derive the three rkyv traits:
+With the default `wincode` feature, derive its two traits through the
+re-export:
 
 ```rust
-use zudp::rkyv::{Archive, Deserialize, Serialize};
+use zudp::wincode::{SchemaRead, SchemaWrite};
 
-#[derive(Archive, Serialize, Deserialize)]
+#[derive(SchemaWrite, SchemaRead)]
+#[wincode(crate = "zudp::wincode")]
 enum Msg {
     Ping,
     Pong,

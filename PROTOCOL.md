@@ -689,12 +689,13 @@ The application message is encoded/decoded by an interchangeable codec layer. Th
 
 | Cargo feature | Encoder | Decoder | Encode error | Decode error |
 |---|---|---|---|---|
-| `rkyv` (default) | `rkyv::to_bytes` | `rkyv::from_bytes` (validated) | `rancor::Error` | `rancor::Error` |
+| `wincode` (default) | `wincode::config::serialize`, bincode 2 `standard()` layout | `wincode::config::deserialize_exact`, claims capped at 4 MiB | `Box<dyn Error>` | `Box<dyn Error>` |
+| `rkyv` | `rkyv::to_bytes` | `rkyv::from_bytes` (validated) | `Box<dyn Error>` | `Box<dyn Error>` |
 | `bitcode` | `bitcode::encode` (infallible) | `bitcode::decode` | — | `bitcode::Error` |
 | `serde` | `postcard::to_allocvec` | `postcard::from_bytes` | `postcard::Error` | `postcard::Error` |
 | `serde` + any | postcard | postcard | `Box<dyn Error>` | `Box<dyn Error>` |
 | none | user-supplied `Encode`/`Decode` impls | same | `Box<dyn Error>` | `Box<dyn Error>` |
 
-Priority when multiple features are active: `serde` > `rkyv` > `bitcode`.
+Priority when multiple features are active: `serde` > `rkyv` > `wincode` > `bitcode`.
 
 Custom codecs are supported by manually implementing the `Encode` and `Decode` traits.
