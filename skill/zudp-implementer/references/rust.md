@@ -10,13 +10,13 @@ implementing the wire protocol; that is in `SKILL.md` and `PROTOCOL.md`.
 
 ```toml
 [dependencies]
-zudp = "0.5"                                                        # wincode codec (default)
-zudp = { version = "0.5", features = ["security"] }                 # + Noise XX encryption
-zudp = { version = "0.5", features = ["discovery"] }                # + LAN peer discovery
-zudp = { version = "0.5", features = ["security", "discovery"] }    # both
-zudp = { version = "0.5", default-features = false, features = ["serde"] }   # postcard codec
-zudp = { version = "0.5", default-features = false, features = ["bitcode"] } # bitcode codec
-zudp = { version = "0.5", default-features = false, features = ["rkyv"] }    # rkyv codec
+zudp = "0.4"                                              # no codec: RawBytes or your own Encode/Decode
+zudp = { version = "0.4", features = ["wincode"] }        # wincode codec (bincode 2 layout)
+zudp = { version = "0.4", features = ["serde"] }          # postcard codec
+zudp = { version = "0.4", features = ["bitcode"] }        # bitcode codec
+zudp = { version = "0.4", features = ["rkyv"] }           # rkyv codec
+zudp = { version = "0.4", features = ["wincode", "security"] }               # + Noise XX encryption
+zudp = { version = "0.4", features = ["wincode", "security", "discovery"] }  # + LAN peer discovery
 ```
 
 ---
@@ -24,8 +24,8 @@ zudp = { version = "0.5", default-features = false, features = ["rkyv"] }    # r
 ## Message types
 
 Every message type must implement `zudp::Encode` + `zudp::Decode`.
-With the default `wincode` feature, derive its two traits through the
-re-export:
+No codec is on by default. With the `wincode` feature, derive its two
+traits through the re-export:
 
 ```rust
 use zudp::wincode::{SchemaRead, SchemaWrite};

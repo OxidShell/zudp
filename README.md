@@ -4,6 +4,12 @@ Minimal UDP protocol for real-time applications. NACK-based reliability, automat
 
 ## Quick start
 
+No message codec is on by default. Pick one with a feature (`wincode`, `serde`, `bitcode` or `rkyv`), send `zudp::RawBytes`, or implement `Encode`/`Decode` yourself:
+
+```toml
+zudp = { version = "0.4", features = ["wincode"] }
+```
+
 ```rust
 use zudp::wincode::{SchemaRead, SchemaWrite};
 use zudp::Zudp;
