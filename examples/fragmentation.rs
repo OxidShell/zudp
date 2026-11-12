@@ -4,10 +4,11 @@
 
 use std::net::SocketAddr;
 
-use zudp::rkyv::{Archive, Deserialize, Serialize};
+use zudp::wincode::{SchemaRead, SchemaWrite};
 use zudp::{Zudp, ZudpSocket};
 
-#[derive(Debug, Archive, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, SchemaWrite, SchemaRead, PartialEq)]
+#[wincode(crate = "zudp::wincode")]
 #[cfg_attr(
     feature = "serde",
     derive(zudp::serde::Serialize, zudp::serde::Deserialize)

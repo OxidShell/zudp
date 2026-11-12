@@ -13,7 +13,10 @@ keywords = ["udp", "networking", "gamedev", "relay", "protocol"]
 categories = ["network-programming", "game-development", "asynchronous"]
 
 [features]
-default = ["rkyv"]
+default = ["wincode"]
+# Wire codec for message types: bincode 2 `standard()` layout (varint
+# integers, little endian), no serde.
+wincode = ["dep:wincode"]
 rkyv = ["dep:rkyv"]
 bitcode = ["dep:bitcode"]
 serde = ["dep:serde", "dep:postcard"]
@@ -25,6 +28,7 @@ relay = ["security"]
 [dependencies]
 tokio = { version = "1", features = ["net", "sync", "rt-multi-thread", "macros", "time", "io-util"] }
 bytes = "1"
+wincode = { version = "0.6", default-features = false, features = ["derive", "std"], optional = true }
 rkyv = { version = "0.8", features = ["bytecheck"], optional = true }
 bitcode = { version = "0.6", features = ["derive"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }

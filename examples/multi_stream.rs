@@ -13,12 +13,13 @@
 use std::{net::SocketAddr, time::Duration};
 
 use zudp::Zudp;
-use zudp::rkyv::{Archive, Deserialize, Serialize};
+use zudp::wincode::{SchemaRead, SchemaWrite};
 
 const STREAM_COMMANDS: u16 = 0;
 const STREAM_STATE: u16 = 1;
 
-#[derive(Debug, Archive, Serialize, Deserialize)]
+#[derive(Debug, SchemaWrite, SchemaRead)]
+#[wincode(crate = "zudp::wincode")]
 #[cfg_attr(
     feature = "serde",
     derive(zudp::serde::Serialize, zudp::serde::Deserialize)
@@ -29,7 +30,8 @@ enum Command {
     Respawn,
 }
 
-#[derive(Debug, Archive, Serialize, Deserialize)]
+#[derive(Debug, SchemaWrite, SchemaRead)]
+#[wincode(crate = "zudp::wincode")]
 #[cfg_attr(
     feature = "serde",
     derive(zudp::serde::Serialize, zudp::serde::Deserialize)
@@ -39,7 +41,8 @@ enum StateSnapshot {
 }
 
 // The server uses a single enum to receive from both streams.
-#[derive(Debug, Archive, Serialize, Deserialize)]
+#[derive(Debug, SchemaWrite, SchemaRead)]
+#[wincode(crate = "zudp::wincode")]
 #[cfg_attr(
     feature = "serde",
     derive(zudp::serde::Serialize, zudp::serde::Deserialize)

@@ -14,14 +14,24 @@ pub trait Decode: Sized + Send + 'static {
 
 // encode is infallible for bitcode; decode carries a concrete bitcode::Error.
 
-#[cfg(all(feature = "bitcode", not(feature = "serde"), not(feature = "rkyv")))]
+#[cfg(all(
+    feature = "bitcode",
+    not(feature = "serde"),
+    not(feature = "rkyv"),
+    not(feature = "wincode")
+))]
 impl<T: bitcode::Encode + Send + 'static> Encode for T {
     fn encode_to_bytes(&self) -> Result<Vec<u8>, crate::Error> {
         Ok(bitcode::encode(self))
     }
 }
 
-#[cfg(all(feature = "bitcode", not(feature = "serde"), not(feature = "rkyv")))]
+#[cfg(all(
+    feature = "bitcode",
+    not(feature = "serde"),
+    not(feature = "rkyv"),
+    not(feature = "wincode")
+))]
 impl<T: for<'de> bitcode::Decode<'de> + Send + 'static> Decode for T {
     fn decode_from_bytes(bytes: &[u8]) -> Result<Self, crate::Error> {
         bitcode::decode(bytes).map_err(crate::Error::Decode)
@@ -62,6 +72,44 @@ where
     }
 }
 
+// wincode wins over bitcode and yields to rkyv and serde; both directions
+// carry a boxed wincode error.
+
+/// Layout of [`Encode`]/[`Decode`] with the `wincode` feature: bincode 2's
+/// `standard()` (varint integers, little endian, varint lengths), with no
+/// claimed length allowed to preallocate past 4 MiB.
+#[cfg(all(feature = "wincode", not(feature = "serde"), not(feature = "rkyv")))]
+pub type WincodeConfig = wincode::config::Configuration<
+    true,
+    { wincode::config::DEFAULT_PREALLOCATION_SIZE_LIMIT },
+    wincode::len::BincodeLen,
+    wincode::int_encoding::LittleEndian,
+    wincode::int_encoding::VarInt,
+    u32,
+>;
+
+#[cfg(all(feature = "wincode", not(feature = "serde"), not(feature = "rkyv")))]
+impl<T> Encode for T
+where
+    T: wincode::SchemaWrite<WincodeConfig, Src = T> + Send + 'static,
+{
+    fn encode_to_bytes(&self) -> Result<Vec<u8>, crate::Error> {
+        wincode::config::serialize(self, WincodeConfig::new())
+            .map_err(|e| crate::Error::Encode(Box::new(e)))
+    }
+}
+
+#[cfg(all(feature = "wincode", not(feature = "serde"), not(feature = "rkyv")))]
+impl<T> Decode for T
+where
+    T: wincode::SchemaReadOwned<WincodeConfig, Dst = T> + Send + 'static,
+{
+    fn decode_from_bytes(bytes: &[u8]) -> Result<Self, crate::Error> {
+        wincode::config::deserialize_exact(bytes, WincodeConfig::new())
+            .map_err(|e| crate::Error::Decode(Box::new(e)))
+    }
+}
+
 // postcard is used; both directions carry a concrete postcard::Error.
 
 #[cfg(all(feature = "serde", not(feature = "bitcode")))]
@@ -91,5 +139,35 @@ impl<T: serde::Serialize + Send + 'static> Encode for T {
 impl<T: serde::de::DeserializeOwned + Send + 'static> Decode for T {
     fn decode_from_bytes(bytes: &[u8]) -> Result<Self, crate::Error> {
         postcard::from_bytes(bytes).map_err(|e| crate::Error::Decode(Box::new(e)))
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "wincode",
+    not(feature = "serde"),
+    not(feature = "rkyv")
+))]
+mod wincode_tests {
+    use super::{Decode, Encode};
+
+    #[test]
+    fn messages_use_the_bincode_standard_layout() {
+        assert_eq!(250_u32.encode_to_bytes().unwrap(), [250]);
+        assert_eq!(251_u32.encode_to_bytes().unwrap(), [251, 251, 0]);
+        let bytes = vec![1_u8, 2, 3].encode_to_bytes().unwrap();
+        assert_eq!(bytes, [3, 1, 2, 3]);
+        assert_eq!(Vec::<u8>::decode_from_bytes(&bytes).unwrap(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn a_forged_length_or_trailing_bytes_are_refused() {
+        // Nine bytes claiming a vector of 2^56 elements.
+        let mut forged = vec![0xfd];
+        forged.extend_from_slice(&(1_u64 << 56).to_le_bytes());
+        assert!(Vec::<u64>::decode_from_bytes(&forged).is_err());
+        let mut long = 7_u32.encode_to_bytes().unwrap();
+        long.push(0);
+        assert!(u32::decode_from_bytes(&long).is_err());
     }
 }

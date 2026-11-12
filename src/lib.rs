@@ -6,10 +6,11 @@
 //! ## Quick start
 //!
 //! ```rust,no_run
-//! use zudp::rkyv::{Archive, Deserialize, Serialize};
+//! use zudp::wincode::{SchemaRead, SchemaWrite};
 //! use zudp::Zudp;
 //!
-//! #[derive(Archive, Serialize, Deserialize)]
+//! #[derive(SchemaWrite, SchemaRead)]
+//! #[wincode(crate = "zudp::wincode")]
 //! enum Msg { Ping, Pong, Data(Vec<u8>) }
 //!
 //! #[tokio::main]
@@ -62,6 +63,8 @@ mod socket;
 pub const DEFAULT_STREAM: u16 = 0;
 
 pub use addr::{Path, PeerAddr};
+#[cfg(all(feature = "wincode", not(feature = "serde"), not(feature = "rkyv")))]
+pub use codec::WincodeConfig;
 pub use codec::{Decode, Encode};
 #[cfg(feature = "discovery")]
 pub use discovery::{
@@ -242,8 +245,8 @@ pub struct EngineStats {
 ///
 /// ```rust,no_run
 /// # use zudp::{Zudp, Packet};
-/// # use zudp::rkyv::{Archive, Deserialize, Serialize};
-/// # #[derive(Archive, Serialize, Deserialize)] enum Msg { Hi }
+/// # use zudp::wincode::{SchemaRead, SchemaWrite};
+/// # #[derive(zudp::wincode::SchemaWrite, zudp::wincode::SchemaRead)] #[wincode(crate = "zudp::wincode")] enum Msg { Hi }
 /// # async fn f() -> Result<(), zudp::Error> {
 /// # let mut socket = Zudp::default().port(0).listen::<Msg>().await?;
 /// // field access
@@ -277,6 +280,10 @@ pub use ::rkyv;
 /// Re-exported so users can derive `Serialize`/`Deserialize` without a direct `serde` dependency.
 #[cfg(feature = "serde")]
 pub use ::serde;
+/// Re-exported so users can derive `SchemaWrite`/`SchemaRead` without a direct `wincode` dependency
+/// (add `#[wincode(crate = "zudp::wincode")]` next to the derive).
+#[cfg(feature = "wincode")]
+pub use ::wincode;
 
 use std::{
     marker::PhantomData,
@@ -394,7 +401,7 @@ impl Default for Config {
 ///
 /// ```rust,no_run
 /// # use zudp::{Zudp, ZudpSocket};
-/// # #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)] enum Msg { Hi }
+/// # #[derive(zudp::wincode::SchemaWrite, zudp::wincode::SchemaRead)] #[wincode(crate = "zudp::wincode")] enum Msg { Hi }
 /// # async fn f() -> Result<(), zudp::Error> {
 /// // turbofish on the terminal call
 /// let socket = Zudp::default().port(1234).listen::<Msg>().await?;

@@ -119,9 +119,9 @@ impl<M> DiscoveryConfig<M> {
     /// the typestate pattern:
     ///
     /// ```rust,no_run
-    /// # use zudp::rkyv::{Archive, Serialize, Deserialize};
+    /// # use zudp::wincode::{SchemaRead, SchemaWrite};
     /// # use zudp::DiscoveryConfig;
-    /// # #[derive(Archive, Serialize, Deserialize, Clone)] struct GameInfo { name: String }
+    /// # #[derive(zudp::wincode::SchemaWrite, zudp::wincode::SchemaRead, Clone)] #[wincode(crate = "zudp::wincode")] struct GameInfo { name: String }
     /// let cfg = DiscoveryConfig::new("my-game", 7700)
     ///     .meta(GameInfo { name: "Alice".into() });
     /// ```

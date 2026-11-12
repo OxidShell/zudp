@@ -8,10 +8,11 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use zudp::rkyv::{Archive, Deserialize, Serialize};
+use zudp::wincode::{SchemaRead, SchemaWrite};
 use zudp::{Keypair, Zudp};
 
-#[derive(Debug, Archive, Serialize, Deserialize)]
+#[derive(Debug, SchemaWrite, SchemaRead)]
+#[wincode(crate = "zudp::wincode")]
 #[cfg_attr(
     feature = "serde",
     derive(zudp::serde::Serialize, zudp::serde::Deserialize)
