@@ -206,8 +206,9 @@ let peer = stream.next().await?;
 // connect to peer.data_addr via Zudp::connect
 ```
 
-`DiscoveryConfig` builder: `.discovery_port(u16)`, `.probe_interval(Duration)`, `.peer_ttl(Duration)`.
-`ScanStream::next_event()` yields `DiscoveryEvent::{Found, Updated, Lost}`: a peer that restarts (new `instance`) or changes its metadata is reported again, and one that stops answering for `peer_ttl` is reported lost.
+`DiscoveryConfig` builder: `.discovery_port(u16)`, `.probe_interval(Duration)`, `.peer_ttl(Duration)`, `.probe_loopback(bool)`, `.probe_interfaces(bool)`, `.probe_targets(addrs)`.
+Scans probe `255.255.255.255`, `127.0.0.1` and each interface's directed broadcast, plus any extra targets: same-host apps are found even where the OS blocks LAN broadcast (macOS Local Network privacy), and hosts on networks that drop broadcast can be asked by unicast.
+`ScanStream::next_event()` yields `DiscoveryEvent::{Found, Updated, Lost, ProbeFailed}`: a peer that restarts (new `instance`) or changes its metadata is reported again, one that stops answering for `peer_ttl` is reported lost, and a probe target that cannot be sent to is reported once without ending the scan.
 `AppId` is derived from the app name string via a stable FNV-1a hash.
 
 ## Relay and NAT traversal

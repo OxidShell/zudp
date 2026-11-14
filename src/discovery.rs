@@ -90,7 +90,26 @@ pub struct DiscoveryConfig<M = ()> {
     pub(crate) probe_interval: Duration,
     pub(crate) broadcast_addr: Ipv4Addr,
     pub(crate) peer_ttl: Option<Duration>,
+    pub(crate) probes: ProbePlan,
     pub(crate) meta: M,
+}
+
+/// Where a scan sends its probes besides `broadcast_addr`.
+#[derive(Debug, Clone)]
+pub(crate) struct ProbePlan {
+    pub(crate) loopback: bool,
+    pub(crate) interfaces: bool,
+    pub(crate) extra: Vec<SocketAddr>,
+}
+
+impl Default for ProbePlan {
+    fn default() -> Self {
+        Self {
+            loopback: true,
+            interfaces: true,
+            extra: Vec::new(),
+        }
+    }
 }
 
 impl DiscoveryConfig<()> {
@@ -107,6 +126,7 @@ impl DiscoveryConfig<()> {
             probe_interval: Duration::from_secs(5),
             broadcast_addr: Ipv4Addr::BROADCAST,
             peer_ttl: None,
+            probes: ProbePlan::default(),
             meta: (),
         }
     }
@@ -133,6 +153,7 @@ impl<M> DiscoveryConfig<M> {
             probe_interval: self.probe_interval,
             broadcast_addr: self.broadcast_addr,
             peer_ttl: self.peer_ttl,
+            probes: self.probes,
             meta,
         }
     }
@@ -167,6 +188,35 @@ impl<M> DiscoveryConfig<M> {
     #[must_use]
     pub fn broadcast_addr(mut self, addr: Ipv4Addr) -> Self {
         self.broadcast_addr = addr;
+        self
+    }
+
+    /// Whether scans also probe `127.0.0.1` (default: on).
+    ///
+    /// Advertisers on the same machine then answer even where the OS blocks
+    /// LAN broadcast, such as macOS without the Local Network permission.
+    #[must_use]
+    pub fn probe_loopback(mut self, enabled: bool) -> Self {
+        self.probes.loopback = enabled;
+        self
+    }
+
+    /// Whether scans also probe the directed broadcast address of every IPv4
+    /// interface, e.g. `192.168.1.255` (default: on).
+    ///
+    /// Reaches the LAN when the route for `255.255.255.255` points elsewhere,
+    /// such as a VPN tunnel on macOS.
+    #[must_use]
+    pub fn probe_interfaces(mut self, enabled: bool) -> Self {
+        self.probes.interfaces = enabled;
+        self
+    }
+
+    /// Extra addresses every scan round probes too: hosts to ask directly by
+    /// unicast, or other broadcast addresses, for networks that drop broadcast.
+    #[must_use]
+    pub fn probe_targets(mut self, targets: impl IntoIterator<Item = SocketAddr>) -> Self {
+        self.probes.extra.extend(targets);
         self
     }
 }
@@ -227,6 +277,14 @@ pub enum DiscoveryEvent<M> {
     Updated(DiscoveredPeer<M>),
     /// No beacon from `data_addr` for the configured peer TTL.
     Lost { data_addr: SocketAddr },
+    /// Sending a probe to `target` failed, e.g. macOS refusing LAN broadcast
+    /// without the Local Network permission (`EHOSTUNREACH`). Reported once
+    /// per target until a probe to it succeeds again; the scan keeps running
+    /// and peers reachable through other targets are still found.
+    ProbeFailed {
+        target: SocketAddr,
+        error: Arc<std::io::Error>,
+    },
 }
 
 struct Seen {
@@ -244,10 +302,18 @@ pub struct ScanStream<M> {
     socket: Arc<UdpSocket>,
     app_id: u64,
     broadcast_addr: SocketAddr,
+    probes: ProbePlan,
     ticker: time::Interval,
     peer_ttl: Duration,
     seen: HashMap<SocketAddr, Seen>,
+    /// Data address each advertiser instance was first seen at. One machine
+    /// answers loopback and broadcast probes from different source addresses;
+    /// it is still one peer.
+    instances: HashMap<u64, SocketAddr>,
     lost: VecDeque<SocketAddr>,
+    /// Targets whose last probe failed, so a failure is reported once.
+    failing: HashSet<SocketAddr>,
+    failed: VecDeque<(SocketAddr, Arc<std::io::Error>)>,
     _phantom: PhantomData<fn() -> M>,
 }
 
@@ -263,12 +329,13 @@ impl<M: Decode> ScanStream<M> {
         loop {
             match self.next_event().await? {
                 DiscoveryEvent::Found(peer) | DiscoveryEvent::Updated(peer) => return Ok(peer),
-                DiscoveryEvent::Lost { .. } => {}
+                DiscoveryEvent::Lost { .. } | DiscoveryEvent::ProbeFailed { .. } => {}
             }
         }
     }
 
-    /// Wait for the next change: a peer found, updated or lost.
+    /// Wait for the next change: a peer found, updated or lost, or a probe
+    /// target that started failing.
     ///
     /// Malformed or foreign datagrams are skipped, never returned as errors.
     ///
@@ -276,6 +343,9 @@ impl<M: Decode> ScanStream<M> {
     /// Returns `Err` only if the scan socket itself fails.
     pub async fn next_event(&mut self) -> Result<DiscoveryEvent<M>, Error> {
         loop {
+            if let Some((target, error)) = self.failed.pop_front() {
+                return Ok(DiscoveryEvent::ProbeFailed { target, error });
+            }
             if let Some(data_addr) = self.lost.pop_front() {
                 return Ok(DiscoveryEvent::Lost { data_addr });
             }
@@ -296,12 +366,50 @@ impl<M: Decode> ScanStream<M> {
                 Some(Err(e)) => return Err(e.into()),
                 None => {
                     self.expire();
-                    let probe = Frame::Probe {
-                        app_id: self.app_id,
-                        proto_ver: PROTO_VER,
+                    self.probe().await;
+                }
+            }
+        }
+    }
+
+    /// Every address this round probes: the broadcast address, then
+    /// loopback, each interface's directed broadcast and the extra targets.
+    /// Interfaces are listed again each round, so a network switch is seen.
+    fn targets(&self) -> Vec<SocketAddr> {
+        let port = self.broadcast_addr.port();
+        let mut targets = vec![self.broadcast_addr];
+        if self.probes.loopback {
+            targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+        }
+        if self.probes.interfaces {
+            targets
+                .extend(interface_broadcasts().map(|addr| SocketAddr::new(IpAddr::V4(addr), port)));
+        }
+        targets.extend(self.probes.extra.iter().copied());
+        let mut seen = HashSet::new();
+        targets.retain(|target| seen.insert(*target));
+        targets
+    }
+
+    /// Sends one probe to every target. A target that fails is queued as
+    /// [`DiscoveryEvent::ProbeFailed`] once; it is reported again only after a
+    /// probe to it succeeded in between.
+    async fn probe(&mut self) {
+        let probe = Frame::Probe {
+            app_id: self.app_id,
+            proto_ver: PROTO_VER,
+        }
+        .encode();
+        for target in self.targets() {
+            match self.socket.send_to(&probe, target).await {
+                Ok(_) => {
+                    self.failing.remove(&target);
+                }
+                Err(error) => {
+                    tracing::debug!(target: "zudp::discovery", %target, "probe failed: {error}");
+                    if self.failing.insert(target) {
+                        self.failed.push_back((target, Arc::new(error)));
                     }
-                    .encode();
-                    let _ = self.socket.send_to(&probe, self.broadcast_addr).await;
                 }
             }
         }
@@ -317,6 +425,8 @@ impl<M: Decode> ScanStream<M> {
             }
             keep
         });
+        let seen = &self.seen;
+        self.instances.retain(|_, addr| seen.contains_key(addr));
     }
 
     /// Turn one beacon into an event, if it changes anything.
@@ -336,10 +446,24 @@ impl<M: Decode> ScanStream<M> {
         }
         let data_addr = SocketAddr::new(from.ip(), data_port);
         let now = Instant::now();
+        // The same advertiser answering through another probe target (loopback
+        // and a LAN broadcast reach one local app from two addresses).
+        if let Some(&known) = self.instances.get(&instance)
+            && known != data_addr
+        {
+            if let Some(seen) = self.seen.get_mut(&known) {
+                seen.last = now;
+            }
+            return None;
+        }
+        self.instances.insert(instance, data_addr);
         let found = if let Some(seen) = self.seen.get_mut(&data_addr) {
             seen.last = now;
             if seen.instance == instance && seen.meta == meta {
                 return None;
+            }
+            if seen.instance != instance {
+                self.instances.remove(&seen.instance);
             }
             seen.instance = instance;
             seen.meta = meta.clone();
@@ -417,11 +541,15 @@ impl Discovery {
 
     /// Open a continuous scan for peers with a matching app ID.
     ///
-    /// Sends an initial broadcast probe then returns a [`ScanStream`] that
+    /// Sends an initial round of probes then returns a [`ScanStream`] that
     /// yields each newly-seen peer exactly once, re-probing at `probe_interval`.
     ///
+    /// A probe that cannot be sent does not end the scan: it is reported as
+    /// [`DiscoveryEvent::ProbeFailed`] by [`ScanStream::next_event`], and the
+    /// other targets (loopback, interface broadcasts, extra targets) still run.
+    ///
     /// # Errors
-    /// Returns `Err` if binding or the initial probe broadcast fails.
+    /// Returns `Err` only if the scan socket cannot be bound.
     pub async fn scan_stream<M>(
         config: impl Into<DiscoveryConfig<()>>,
     ) -> Result<ScanStream<M>, Error>
@@ -436,27 +564,26 @@ impl Discovery {
         let socket = Arc::new(bind_discovery_socket(0)?);
         let broadcast_addr = SocketAddr::new(IpAddr::V4(cfg.broadcast_addr), cfg.discovery_port);
 
-        let probe = Frame::Probe {
-            app_id: cfg.app_id.raw(),
-            proto_ver: PROTO_VER,
-        }
-        .encode();
-        socket.send_to(&probe, broadcast_addr).await?;
-
         let mut ticker = time::interval(cfg.probe_interval);
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         ticker.tick().await; // discard immediate first tick
 
-        Ok(ScanStream {
+        let mut scan = ScanStream {
             socket,
             app_id: cfg.app_id.raw(),
             broadcast_addr,
+            probes: cfg.probes,
             ticker,
             peer_ttl: cfg.peer_ttl.unwrap_or(cfg.probe_interval * 3),
             seen: HashMap::new(),
+            instances: HashMap::new(),
             lost: VecDeque::new(),
+            failing: HashSet::new(),
+            failed: VecDeque::new(),
             _phantom: PhantomData,
-        })
+        };
+        scan.probe().await;
+        Ok(scan)
     }
 
     /// Scan once and collect all peers that respond within `timeout`.
@@ -575,4 +702,17 @@ async fn run_advertise<M: Encode + Send + Sync + 'static>(
             tracing::warn!(target: "zudp::discovery", %from, "beacon send failed: {e}");
         }
     }
+}
+
+/// Directed broadcast address of every IPv4 interface that has one, loopback
+/// excluded. Empty when the interfaces cannot be listed.
+fn interface_broadcasts() -> impl Iterator<Item = Ipv4Addr> {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|interface| !interface.is_loopback())
+        .filter_map(|interface| match interface.addr {
+            if_addrs::IfAddr::V4(v4) => v4.broadcast,
+            if_addrs::IfAddr::V6(_) => None,
+        })
 }

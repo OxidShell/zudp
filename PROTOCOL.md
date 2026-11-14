@@ -247,7 +247,7 @@ Path-MTU discovery acknowledgement.  Always exactly 3 bytes.
 
 ### Probe — `0x07` *(feature: `discovery`)*
 
-LAN discovery broadcast. Sent to the broadcast address `255.255.255.255` on the discovery port. Any node that is advertising the same `app_id` and `proto_ver` must reply with a Beacon.
+LAN discovery probe. Sent to the broadcast address `255.255.255.255` on the discovery port, and by default also to `127.0.0.1` and to the directed broadcast address of every IPv4 interface; applications can add unicast or broadcast targets. The frame is the same whatever the destination. Any node that is advertising the same `app_id` and `proto_ver` must reply with a Beacon.
 
 ```
 [app_id: u64] [proto_ver: u16] [0x07]
@@ -375,10 +375,10 @@ The discovery protocol version (`proto_ver`) is a separate `u16` field in both P
 ### Probe flow
 
 1. Scanner binds a UDP socket on the discovery port (default `7701`) with `SO_BROADCAST` and `SO_REUSEPORT`.
-2. Scanner sends a Probe to `255.255.255.255:discovery_port`.
-3. Every advertising node listening on the same port receives the broadcast.
+2. Scanner sends a Probe to every target on `discovery_port`: `255.255.255.255`, `127.0.0.1` (advertisers on the same host, even where the OS blocks LAN broadcast), the directed broadcast of each IPv4 interface (when the route for `255.255.255.255` points elsewhere, e.g. a VPN), and any extra targets the application configured (unicast hosts on networks that drop broadcast).
+3. Every advertising node listening on the same port receives a probe. A target that cannot be sent to is reported once as `ProbeFailed` and does not stop the scan.
 4. Each advertiser validates `app_id` and `proto_ver`; if both match, it sends a unicast Beacon back to the probe's source address.
-5. The scanner receives the Beacon, decodes the meta, and records the peer (deduped by `data_addr`).
+5. The scanner receives the Beacon, decodes the meta, and records the peer, deduped by `data_addr` and by `instance`: one advertiser answering several targets from different source addresses is one peer.
 6. The scanner re-probes at `probe_interval` (default 5 s) to catch peers that join later.
 
 ### Advertise task

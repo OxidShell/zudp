@@ -126,3 +126,84 @@ async fn advertiser_survives_garbage() {
         .unwrap();
     assert_eq!(peers.len(), 1, "advertiser died on a malformed datagram");
 }
+
+/// A scan whose broadcast reaches nobody (TEST-NET-1 is never routed to a
+/// host), so only the other probe targets can find peers.
+fn scan_without_broadcast(discovery_port: u16) -> DiscoveryConfig {
+    DiscoveryConfig::new("zudp-test", 0)
+        .discovery_port(discovery_port)
+        .broadcast_addr(Ipv4Addr::new(192, 0, 2, 1))
+        .probe_interfaces(false)
+        .probe_interval(Duration::from_millis(150))
+}
+
+#[tokio::test]
+async fn loopback_probe_finds_a_local_peer_without_broadcast() {
+    let port = free_udp_port();
+    let _handle = advertise(port, "local");
+    let peers =
+        Discovery::scan_once::<Info>(scan_without_broadcast(port), Duration::from_millis(500))
+            .await
+            .unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].meta.name, "local");
+}
+
+/// The address this host uses to reach the LAN, if it has one. Connecting a
+/// UDP socket sends nothing; it only picks the route.
+fn lan_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect(("192.0.2.1", 9)).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+}
+
+#[tokio::test]
+async fn a_peer_reached_through_two_targets_is_reported_once() {
+    let Some(lan) = lan_ip() else {
+        eprintln!("no LAN address; skipping");
+        return;
+    };
+    let port = free_udp_port();
+    let _handle = advertise(port, "twice");
+    let scan = scan_without_broadcast(port).probe_targets([std::net::SocketAddr::new(lan, port)]);
+    let peers = Discovery::scan_once::<Info>(scan, Duration::from_millis(500))
+        .await
+        .unwrap();
+    assert_eq!(
+        peers.len(),
+        1,
+        "loopback and LAN answers were two peers: {peers:?}"
+    );
+}
+
+// Linux refuses to send UDP to port 0 (`EINVAL`), a target that always fails.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_failing_target_is_reported_once_and_the_scan_goes_on() {
+    let port = free_udp_port();
+    let _handle = advertise(port, "still-found");
+    let broken = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut scan =
+        Discovery::scan_stream::<Info>(scan_without_broadcast(port).probe_targets([broken]))
+            .await
+            .unwrap();
+    let mut failures = 0;
+    let mut found = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(700);
+    while let Ok(event) = tokio::time::timeout_at(deadline, scan.next_event()).await {
+        match event.unwrap() {
+            zudp::DiscoveryEvent::ProbeFailed { target, .. } => {
+                assert_eq!(target, broken);
+                failures += 1;
+            }
+            zudp::DiscoveryEvent::Found(peer) => found = peer.meta.name == "still-found",
+            _ => {}
+        }
+    }
+    assert_eq!(
+        failures, 1,
+        "a failing target must be reported once, not every round"
+    );
+    assert!(found, "the scan stopped after a probe failed");
+}

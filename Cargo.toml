@@ -22,7 +22,7 @@ wincode = ["dep:wincode"]
 rkyv = ["dep:rkyv"]
 bitcode = ["dep:bitcode"]
 serde = ["dep:serde", "dep:postcard"]
-discovery = []
+discovery = ["dep:if-addrs"]
 security = ["dep:snow"]
 # Lets a socket act as a public relay node for clients behind NAT.
 relay = ["security"]
@@ -40,6 +40,8 @@ tracing = "0.1"
 socket2 = { version = "0.5", features = ["all"] }
 parking_lot = "0.12"
 dashmap = "6"
+# Directed broadcast address of each interface, for discovery probes.
+if-addrs = { version = "0.15", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = ["Win32_Networking_WinSock", "Win32_System_IO"] }
